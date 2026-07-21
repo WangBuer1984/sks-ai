@@ -37,7 +37,14 @@ class Settings(BaseSettings):
     ALIYUN_ASR_KEY: str = ""
 
     # TikHub 数据 API（拆账号/拆视频取数）。
+    # 主域名 api.tikhub.io 被墙，国内必须用 api.tikhub.dev（计划强约束，不可改）。
     TIKHUB_API_KEY: str = ""
+    TIKHUB_BASE_URL: str = "https://api.tikhub.dev"
+
+    # 阿里云 ISI 录音文件识别（长音频异步批量，与短音频 dashscope 一句话识别不同 API）。
+    # AccessKey ID/Secret 用于 AcsClient 鉴权；AppKey 是 NLS 项目维度，联调期在控制台获取。
+    # 未配置时 transcribe 懒初始化失败，per-request 报错（不阻断 import）。
+    ALIYUN_ASR_APP_KEY: str = ""
 
 
 settings = Settings()
