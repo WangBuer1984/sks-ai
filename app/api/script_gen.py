@@ -10,7 +10,7 @@ from __future__ import annotations
 from typing import Any
 
 from fastapi import APIRouter, Depends
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.api.deps import verify_service_token
 from app.skills.script_gen.graph import generate_script
@@ -29,19 +29,15 @@ class TopicRequest(BaseModel):
 class ScriptGenRequest(BaseModel):
     user_id: int
     topic: TopicRequest
-    profile: dict[str, Any] = {}
+    profile: dict[str, Any] = Field(default_factory=dict)
     platform: str = "douyin"
-
-
-class SectionSentences(BaseModel):
-    sentences: list[dict[str, Any]] = []
 
 
 class ScriptGenResponse(BaseModel):
     hook: dict[str, Any] | None = None
     body: dict[str, Any] | None = None
     cta: dict[str, Any] | None = None
-    cited_card_ids: list[int] = []
+    cited_card_ids: list[int] = Field(default_factory=list)
     blocked: bool = False
 
 
@@ -61,8 +57,8 @@ async def post_script_gen(req: ScriptGenRequest) -> ScriptGenResponse:
 class RewriteSentenceRequest(BaseModel):
     sentence: str
     section: str
-    full_script: dict[str, Any] = {}
-    profile: dict[str, Any] = {}
+    full_script: dict[str, Any] = Field(default_factory=dict)
+    profile: dict[str, Any] = Field(default_factory=dict)
 
 
 class RewriteSentenceResponse(BaseModel):

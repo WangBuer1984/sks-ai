@@ -15,6 +15,7 @@ testcontainers 在 Colima 环境下无法启动容器（Docker socket 挂载问�
 
 import inspect
 import json
+import os
 
 import pytest
 
@@ -118,9 +119,19 @@ def _find_pgvector_dsn() -> str | None:
 
 @pytest.fixture(scope="module")
 def pg_dsn():
-    """同步 fixture：探测运行中的 pgvector 容器，返回 DSN 或 skip。"""
+    """同步 fixture：探测运行中的 pgvector 容器，返回 DSN。
+
+    - SKS_REQUIRE_REAL_DB 未设置（本地默认）：无容器则 skip（SQL 字符串断言仍通过）。
+    - SKS_REQUIRE_REAL_DB=1/true/yes（CI 强制）：无容器则 **fail**——跨用户隔离
+      不变量必须在动态 DB 测试中证明，不能被 skip 掉。
+    """
     dsn = _find_pgvector_dsn()
     if dsn is None:
+        if os.environ.get("SKS_REQUIRE_REAL_DB", "").lower() in ("1", "true", "yes"):
+            pytest.fail(
+                "SKS_REQUIRE_REAL_DB set but no pgvector container available — "
+                "cross-user isolation invariant not proven"
+            )
         pytest.skip("无运行中的 pgvector 容器——跳过真实 DB 测试（SQL 字符串断言仍通过）")
     return dsn
 
