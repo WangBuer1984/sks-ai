@@ -337,6 +337,12 @@ async def interview_step(
     首次调用（无 checkpoint）传 materials → guess_generate 猜人设。
     后续调用传 user_reply → 从 checkpoint 恢复并推进一轮。
     UGC（materials/user_reply）命中安全 → {blocked:true}，不推进。
+
+    幂等终态约定：图跑完（END）后再次 /step 必须幂等返回同一终态响应，
+    绝不在同 thread_id 上重启访谈——无论是 summarize 成功（profile 已产出）
+    还是 summarize LLM 产出命中安全（state.blocked=True，profile=None）。
+    后者曾导致 bug：done 分支只匹配 profile-is-not-None 的成功路径，
+    blocked-done 落到 `ainvoke` 重启分支，丢失全部 Q&A 与人设状态。
     """
     thread_id = f"{user_id}:{session_id}"
     config = {"configurable": {"thread_id": thread_id}}
@@ -356,10 +362,13 @@ async def interview_step(
         # paused at interrupt → resume with user_reply
         await _graph.ainvoke(Command(resume=user_reply), config=config)
     else:
-        # 已完成（summarize done）→ 幂等返回当前，不再推进
-        if sv is not None and sv.values and sv.values.get("profile") is not None:
+        # 已完成（summarize done，成功或 blocked）→ 幂等返回当前，不再推进
+        vals = sv.values if (sv is not None and sv.values) else {}
+        if vals.get("profile") is not None or vals.get("blocked"):
+            # 成功（profile 产出）或 summarize-blocked（LLM 产出命中安全）：
+            # 都是 thread 的终态，重试 /step 必须幂等返回，禁止重启
             return _build_response(sv)
-        # 首次调用 → guess_generate
+        # 首次调用（无 checkpoint） → guess_generate
         await _graph.ainvoke(
             {"user_id": user_id, "materials": materials or ""}, config=config
         )

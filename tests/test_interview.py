@@ -218,6 +218,157 @@ async def test_summarize_shape(monkeypatch):
     assert pd["a_cards"][0]["card_type"] == "定位"
 
 
+# ---- I-1: summarize-blocked 幂等（不重启访谈） -----------------------------
+
+@pytest.mark.asyncio
+async def test_summarize_blocked_does_not_restart_on_retry(monkeypatch):
+    """I-1: summarize LLM 产出命中安全 → {blocked:True}；重试 /step 必须幂等返回
+    blocked，绝不能在同 thread_id 上从头重启访谈（丢失 Q&A 与人设状态）。
+    """
+    call_n = {"n": 0}
+
+    async def _chat(skill, messages, json_schema=None, **kwargs):
+        call_n["n"] += 1
+        if json_schema is SUMMARIZE_SCHEMA:
+            # 含 BLOCKME 标记 → _profile_text 拼出的文本会被 check 判违禁
+            return {
+                "profile": {
+                    "人设": "BLOCKME 职场博主", "人群": "a", "差异化": "d",
+                    "变现": "m", "红线": "r", "支柱配比": "1:1",
+                },
+                "a_cards": [{"card_type": "定位", "title": "t", "content": {"x": 1}}],
+            }
+        if call_n["n"] == 1:
+            return {"persona": {"人设": "x"}, "question": "q?"}
+        return {"question": f"问题 {call_n['n'] - 1}"}
+
+    async def _check(text):
+        # 只有 summarize 产出含 BLOCKME → 命中安全；其余 UGC/问题全过
+        return "BLOCKME" not in str(text)
+
+    monkeypatch.setattr("app.skills.interview.graph.chat", _chat)
+    monkeypatch.setattr("app.skills.interview.graph.check", _check)
+
+    sid = "blk-sum"
+    # 1: materials → guess → await_feedback
+    r1 = await interview_step(user_id=1, session_id=sid, materials="素材")
+    assert r1["stage"] == "await_feedback"
+    # 2: feedback → ask round 1
+    r2 = await interview_step(user_id=1, session_id=sid, user_reply="对")
+    assert r2["stage"] == "ask"
+    # 3..7: 回答满 MAX_ROUNDS=5 触发 summarize（blocked）
+    from app.skills.interview.graph import MAX_ROUNDS
+    r_last = None
+    for i in range(MAX_ROUNDS):
+        r_last = await interview_step(user_id=1, session_id=sid, user_reply=f"答{i}")
+    # 最后一次应触发 summarize → {blocked:True}（图到达 END，state.blocked=True，profile=None）
+    assert r_last.get("blocked") is True, f"expected blocked summarize, got {r_last}"
+
+    chat_before = call_n["n"]
+    # 重试同一 thread_id（无 user_reply/materials）→ 必须幂等返回 blocked，不能重启
+    r_retry = await interview_step(user_id=1, session_id=sid)
+    assert r_retry.get("blocked") is True, (
+        f"retry after summarize-blocked must be idempotent blocked, got {r_retry}"
+    )
+    # chat 调用数不应增加（重启会重新调 guess_generate 的 chat）
+    assert call_n["n"] == chat_before, (
+        f"graph restarted on retry: chat count {chat_before} -> {call_n['n']} "
+        f"(should stay idempotent)"
+    )
+    # 状态未回退到 await_feedback/ask/guess
+    assert r_retry.get("stage") not in {"await_feedback", "ask", "guess_persona"}, (
+        f"stage regressed on retry: {r_retry}"
+    )
+
+
+# ---- M-2: blocked 后重试重生成功（ask 路径） --------------------------------
+
+@pytest.mark.asyncio
+async def test_retry_after_blocked_llm_succeeds(monkeypatch):
+    """M-2: ask 轮 LLM 生成违禁问题 → {blocked:True}；再次 /step 应重生成本轮
+    新问题并推进，证明 resume → 重生成 路径有效。
+    """
+    chat_n = {"n": 0}
+
+    async def _chat(skill, messages, json_schema=None, **kwargs):
+        chat_n["n"] += 1
+        if json_schema is SUMMARIZE_SCHEMA:
+            return {"profile": {}, "a_cards": []}
+        if chat_n["n"] == 1:
+            return {"persona": {"人设": "x"}, "question": "guess q?"}
+        # 第 2 次 chat = ask 轮 1 首次生成（违禁）；之后 = 重生成（安全）
+        if chat_n["n"] == 2:
+            return {"question": "违禁问题1"}
+        return {"question": f"安全问题{chat_n['n']}"}
+
+    check_n = {"n": 0}
+
+    async def _check(text):
+        check_n["n"] += 1
+        # call1=materials(safe), 2=guess q(safe), 3=user_reply "对"(safe),
+        # 4=ask "违禁问题1"(unsafe), 5=user_reply "答X"(safe), 6=ask "安全问题3"(safe)
+        return check_n["n"] != 4
+
+    monkeypatch.setattr("app.skills.interview.graph.chat", _chat)
+    monkeypatch.setattr("app.skills.interview.graph.check", _check)
+
+    sid = "retry-ask"
+    # 1: guess → await_feedback
+    r1 = await interview_step(user_id=1, session_id=sid, materials="素材")
+    assert r1["stage"] == "await_feedback"
+    # 2: feedback → ask_generate 生成违禁问题 → blocked（不推进 answers）
+    r2 = await interview_step(user_id=1, session_id=sid, user_reply="对")
+    assert r2.get("blocked") is True, f"expected blocked ask, got {r2}"
+    # 3: 再次 /step（带正常 user_reply）→ resume ask_answer(unsafe) → 重生成新问题 → ask
+    r3 = await interview_step(user_id=1, session_id=sid, user_reply="答X")
+    assert r3.get("stage") == "ask", f"expected re-ask after blocked, got {r3}"
+    assert r3.get("question") not in (None, "", "违禁问题1"), (
+        f"expected a NEW question regenerated after blocked, got {r3}"
+    )
+
+
+# ---- M-2: guess-blocked 不推进 + 重生成 ------------------------------------
+
+@pytest.mark.asyncio
+async def test_guess_blocked_returns_blocked_without_advancing(monkeypatch):
+    """M-2: guess_generate 产出违禁问题 → {blocked:True}，未推进到 await_feedback；
+    再次 /step 应重生成 guess 并回到 await_feedback（resume → 重猜 路径有效）。
+    """
+    chat_n = {"n": 0}
+
+    async def _chat(skill, messages, json_schema=None, **kwargs):
+        chat_n["n"] += 1
+        if json_schema is SUMMARIZE_SCHEMA:
+            return {"profile": {}, "a_cards": []}
+        # 第 1 次 guess = 违禁；重生成（第 2 次）= 安全
+        if chat_n["n"] == 1:
+            return {"persona": {"人设": "x"}, "question": "违禁guess"}
+        return {"persona": {"人设": "x"}, "question": "安全guess"}
+
+    async def _check(text):
+        return "违禁" not in str(text)
+
+    monkeypatch.setattr("app.skills.interview.graph.chat", _chat)
+    monkeypatch.setattr("app.skills.interview.graph.check", _check)
+
+    sid = "blk-guess"
+    # 1: materials → guess_generate 生成违禁问题 → blocked（未推进到 await_feedback）
+    r1 = await interview_step(user_id=1, session_id=sid, materials="素材")
+    assert r1.get("blocked") is True, f"expected blocked guess, got {r1}"
+    assert r1.get("stage") != "await_feedback", (
+        f"guess-blocked must not advance to await_feedback, got {r1}"
+    )
+
+    # 2: 再次 /step（带正常 user_reply）→ resume guess_feedback(unsafe) → 重猜 → await_feedback
+    r2 = await interview_step(user_id=1, session_id=sid, user_reply="对")
+    assert r2.get("stage") == "await_feedback", (
+        f"expected re-guess → await_feedback after blocked, got {r2}"
+    )
+    assert r2.get("question") == "安全guess", (
+        f"expected regenerated safe guess question, got {r2}"
+    )
+
+
 # ---- /ai/interview/result 只读 ---------------------------------------------
 
 @pytest.mark.asyncio
