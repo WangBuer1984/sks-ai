@@ -1,11 +1,33 @@
-"""FastAPI 入口：随口说 Python AI 服务。
+"""FastAPI 入口：随口说 Python AI 服务（仅内网，不暴露公网）。
 
-P0 仅提供 /health 健康检查端点；后续 task 在此挂载各 skill 路由。
+/health 免鉴权（内网健康检查）；/ai/* 全部以 verify_service_token 守卫
+（Java→Python 唯一出口带 X-Service-Token）。后续 skill 路由按 task 逐步挂载。
 """
+
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-app = FastAPI(title="sks-ai", version="0.1.0")
+from app.api.embed import router as embed_router
+from app.api.safety import router as safety_router
+from app.db import close_pool, init_pool
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # startup：建 asyncpg 池 + 注册 pgvector（懒初始化兜底，真实环境由本处显式起池）
+    try:
+        await init_pool()
+    except Exception:  # noqa: BLE001 — DB 不可达不应阻断 /health 与 /ai/* 鉴权层启动
+        pass
+    yield
+    # shutdown：关池
+    await close_pool()
+
+
+app = FastAPI(title="sks-ai", version="0.1.0", lifespan=lifespan)
+app.include_router(embed_router)
+app.include_router(safety_router)
 
 
 @app.get("/health")
