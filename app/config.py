@@ -32,6 +32,9 @@ class Settings(BaseSettings):
     ALIYUN_SMS_SIGN: str = ""
     # 内容安全 Green 文本审核端点（按 region 选择）。
     ALIYUN_CONTENT_SAFETY_ENDPOINT: str = "https://green.cn-shanghai.aliyuncs.com"
+    # 一句话识别（短音频 ≤60s 同步）——dashscope SDK 用此 key（阿里云百炼 API key）。
+    # 未配置时 /ai/asr 返回 503（懒初始化失败，per-request，不阻断启动）。
+    ALIYUN_ASR_KEY: str = ""
 
     # TikHub 数据 API（拆账号/拆视频取数）。
     TIKHUB_API_KEY: str = ""

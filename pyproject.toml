@@ -14,6 +14,11 @@ dependencies = [
     "pgvector>=0.3",
     "httpx>=0.27",
     "pydantic-settings>=2.4",
+    # 阿里云一句话识别（短音频 ≤60s 同步）——paraformer-realtime 走 dashscope SDK。
+    # 与 P3 拆解转写「录音文件识别」（长音频异步批量）是不同 API。
+    "dashscope>=1.17",
+    # FastAPI 文件上传（/ai/asr multipart）所需。
+    "python-multipart>=0.0.6",
 ]
 
 [build-system]
