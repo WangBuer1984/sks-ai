@@ -172,14 +172,24 @@ async def test_video_meta_returns_single(monkeypatch):
 
 
 async def test_precheck_returns_reachable_and_count(monkeypatch):
+    # 修复盲点：mock 必须尊重 count 查询参数（返回 min(count, pool) 条），
+    # 否则 count=1 的 bug 会被 4-条-固定-response 掩盖。
     monkeypatch.setattr(settings, "TIKHUB_API_KEY", "tk-test-key")
+
+    POOL = 4  # 账号仅有 4 条视频
 
     async def handler(request: httpx.Request):
         path = request.url.path
         if path.endswith("get_sec_user_id"):
             return httpx.Response(200, json={"code": 200, "data": {"sec_user_id": "SEC"}})
         if path.endswith("fetch_user_post_videos"):
-            items = [{"aweme_id": str(i), "desc": "t", "statistics": {}, "video": {"play_addr": {"url_list": ["u"]}}} for i in range(4)]
+            count = int(request.url.params.get("count", "0"))
+            assert count > 1, "precheck must request a meaningful first-page count, not 1"
+            n = min(count, POOL)
+            items = [
+                {"aweme_id": str(i), "desc": "t", "statistics": {}, "video": {"play_addr": {"url_list": ["u"]}}}
+                for i in range(n)
+            ]
             return httpx.Response(200, json={"code": 200, "data": {"aweme_list": items}})
         return httpx.Response(404)
 
@@ -190,6 +200,37 @@ async def test_precheck_returns_reachable_and_count(monkeypatch):
         await client.aclose()
     assert result["reachable"] is True
     assert result["video_count"] == 4
+
+
+async def test_precheck_returns_meaningful_first_page_count(monkeypatch):
+    # Q2 RED→GREEN 证明：20 条视频的账号，precheck 必须返回反映首页的 video_count
+    # （≤20 且非退化的 {0,1}），以使 Task 3.3 的 max(1,min(10,floor(N/2))) 公式非退化。
+    monkeypatch.setattr(settings, "TIKHUB_API_KEY", "tk-test-key")
+
+    POOL = 50  # 账号有 50 条视频（首页最多 20 条）
+
+    async def handler(request: httpx.Request):
+        path = request.url.path
+        if path.endswith("get_sec_user_id"):
+            return httpx.Response(200, json={"code": 200, "data": {"sec_user_id": "SEC"}})
+        if path.endswith("fetch_user_post_videos"):
+            count = int(request.url.params.get("count", "0"))
+            n = min(count, POOL)
+            items = [
+                {"aweme_id": str(i), "desc": "t", "statistics": {}, "video": {"play_addr": {"url_list": ["u"]}}}
+                for i in range(n)
+            ]
+            return httpx.Response(200, json={"code": 200, "data": {"aweme_list": items}})
+        return httpx.Response(404)
+
+    client = _mock_client(handler)
+    try:
+        result = await precheck("https://www.douyin.com/user/x", client=client)
+    finally:
+        await client.aclose()
+    assert result["reachable"] is True
+    # 反映真实首页条数（capped at 20），而非退化的 {0,1}
+    assert result["video_count"] == 20, f"expected meaningful first-page count (20), got {result['video_count']}"
 
 
 async def test_precheck_unreachable_when_sec_user_id_missing(monkeypatch):
@@ -284,3 +325,109 @@ async def test_network_exception_raises_datasource_error(monkeypatch):
             await hot_board(client=client)
     finally:
         await client.aclose()
+
+
+async def test_get_json_retries_transient_connect_error_then_succeeds(monkeypatch):
+    # Q1 RED→GREEN：首次 ConnectError（瞬时 DNS 抖动）→ 重试 → 成功。
+    # 当前实现无重试，首次失败即抛 DataSourceError（RED）。
+    monkeypatch.setattr(settings, "TIKHUB_API_KEY", "tk-test-key")
+    # 把 backoff sleep 压成 0，避免测试真实等待
+    import app.datasource.tikhub as tikhub_mod
+
+    async def _no_sleep(_s):
+        return None
+
+    monkeypatch.setattr(tikhub_mod, "_sleep", _no_sleep)
+
+    calls = {"n": 0}
+
+    async def handler(request: httpx.Request):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise httpx.ConnectError("transient dns blip")
+        return httpx.Response(200, json={"code": 200, "data": {"hot_list": []}})
+
+    client = _mock_client(handler)
+    try:
+        items = await hot_board(client=client)
+    finally:
+        await client.aclose()
+    assert items == []
+    assert calls["n"] == 2, f"expected 2 attempts (1 fail + 1 retry-success), got {calls['n']}"
+
+
+async def test_get_json_retries_5xx_then_succeeds(monkeypatch):
+    # Q1：5xx 同属可重试瞬时错误——首次 502 → 重试 → 成功。
+    monkeypatch.setattr(settings, "TIKHUB_API_KEY", "tk-test-key")
+    import app.datasource.tikhub as tikhub_mod
+
+    async def _no_sleep(_s):
+        return None
+
+    monkeypatch.setattr(tikhub_mod, "_sleep", _no_sleep)
+
+    calls = {"n": 0}
+
+    async def handler(request: httpx.Request):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx.Response(502, text="bad gateway")
+        return httpx.Response(200, json={"code": 200, "data": {"hot_list": []}})
+
+    client = _mock_client(handler)
+    try:
+        items = await hot_board(client=client)
+    finally:
+        await client.aclose()
+    assert items == []
+    assert calls["n"] == 2
+
+
+async def test_get_json_does_not_retry_on_4xx(monkeypatch):
+    # Q1 不可重试类：4xx 客户端错误（bad URL/auth）→ 立即抛，仅 1 次尝试。
+    monkeypatch.setattr(settings, "TIKHUB_API_KEY", "tk-test-key")
+    import app.datasource.tikhub as tikhub_mod
+
+    async def _no_sleep(_s):
+        return None
+
+    monkeypatch.setattr(tikhub_mod, "_sleep", _no_sleep)
+
+    calls = {"n": 0}
+
+    async def handler(request: httpx.Request):
+        calls["n"] += 1
+        return httpx.Response(401, text="unauthorized")
+
+    client = _mock_client(handler)
+    try:
+        with pytest.raises(DataSourceError):
+            await hot_board(client=client)
+    finally:
+        await client.aclose()
+    assert calls["n"] == 1, "4xx must not be retried"
+
+
+async def test_get_json_does_not_retry_on_business_code_failure(monkeypatch):
+    # Q1 不可重试类：TikHub 业务 code != 200（确定性失败）→ 立即抛，仅 1 次尝试。
+    monkeypatch.setattr(settings, "TIKHUB_API_KEY", "tk-test-key")
+    import app.datasource.tikhub as tikhub_mod
+
+    async def _no_sleep(_s):
+        return None
+
+    monkeypatch.setattr(tikhub_mod, "_sleep", _no_sleep)
+
+    calls = {"n": 0}
+
+    async def handler(request: httpx.Request):
+        calls["n"] += 1
+        return httpx.Response(200, json={"code": 404, "message": "not found", "data": {}})
+
+    client = _mock_client(handler)
+    try:
+        with pytest.raises(DataSourceError):
+            await hot_board(client=client)
+    finally:
+        await client.aclose()
+    assert calls["n"] == 1, "business-code failure must not be retried"

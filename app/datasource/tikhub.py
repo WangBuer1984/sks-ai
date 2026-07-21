@@ -26,6 +26,7 @@ Task 3.2/3.3 捕获后翻译（拆账号全量失败 → 全额退款 + 引导�
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 
@@ -45,6 +46,24 @@ _PATH_HOT_TOTAL_LIST = "/api/v1/douyin/billboard/fetch_hot_total_list"
 # 阿里云录音文件识别用 OSS/public URL 直传，TikHub 下载直链多为短时签名 URL——
 # 联调期需确认阿里云侧能否拉到该直链；如不能，需在 transcribe 内先下载再传 file_link。
 _TIMEOUT = httpx.Timeout(30.0, connect=10.0)
+
+# === TikHub GET 瞬时错误重试策略（仅作用于幂等的 _get_json，不含 transcribe._submit_task） ===
+# Brief Step 3「超时重试」：TikHub 四个 GET 端点均为幂等读，瞬时网络抖动/5xx 重试安全。
+# transcribe._submit_task（阿里云 SubmitTask）非幂等——严禁重试（会创建重复转写任务）。
+_RETRY_ATTEMPTS = 3  # 总尝试次数（首次 + 2 次重试）
+_RETRY_BACKOFFS = (0.5, 1.5)  # 每次重试前 sleep 秒数（attempt 0→0.5s, attempt 1→1.5s）
+# 仅瞬时传输错误 + 5xx 可重试；4xx（bad URL/auth）与业务 code!=200（确定性失败）不重试。
+_RETRYABLE_TRANSPORT_ERRORS = (
+    httpx.ConnectError,
+    httpx.ReadTimeout,
+    httpx.ConnectTimeout,
+    httpx.RemoteProtocolError,
+)
+
+
+async def _sleep(seconds: float) -> None:
+    """可被测试 monkeypatch 的 sleep seam（避免真实 backoff 拖慢测试）。"""
+    await asyncio.sleep(seconds)
 
 
 @dataclass
@@ -78,21 +97,62 @@ def _headers() -> dict[str, str]:
 
 
 async def _get_json(client: httpx.AsyncClient, path: str, params: dict | None = None) -> dict:
+    """GET TikHub JSON，带瞬时错误有界重试。
+
+    重试仅覆盖瞬时传输错误（ConnectError/ReadTimeout/ConnectTimeout/
+    RemoteProtocolError）与 HTTP 5xx。4xx 客户端错误与 TikHub 业务 code!=200
+    属确定性失败，不重试。重试上限 ``_RETRY_ATTEMPTS`` 次，backoff 见
+    ``_RETRY_BACKOFFS``。耗尽后抛 DataSourceError（与历史行为一致）。
+    """
     url = f"{_base_url()}{path}"
-    try:
-        resp = await client.get(url, params=params, headers=_headers(), timeout=_TIMEOUT)
-    except httpx.HTTPError as e:
-        raise DataSourceError(f"tikhub transport failed ({path}): {e}") from e
-    if resp.status_code < 200 or resp.status_code >= 300:
-        raise DataSourceError(f"tikhub http {resp.status_code} ({path}): {resp.text[:200]}")
-    try:
-        body = resp.json()
-    except ValueError as e:
-        raise DataSourceError(f"tikhub bad json ({path}): {e}") from e
-    code = body.get("code")
-    if code != 200:
-        raise DataSourceError(f"tikhub business code={code} ({path}): {body.get('message', '')}")
-    return body
+    last_exc: Exception | None = None
+    for attempt in range(_RETRY_ATTEMPTS):
+        try:
+            resp = await client.get(url, params=params, headers=_headers(), timeout=_TIMEOUT)
+        except _RETRYABLE_TRANSPORT_ERRORS as e:
+            last_exc = e
+            if attempt < _RETRY_ATTEMPTS - 1:
+                log.warning(
+                    "tikhub transient transport error (%s) attempt %d/%d, retrying: %s",
+                    path, attempt + 1, _RETRY_ATTEMPTS, e,
+                )
+                await _sleep(_RETRY_BACKOFFS[attempt])
+                continue
+            raise DataSourceError(
+                f"tikhub transport failed ({path}) after {_RETRY_ATTEMPTS} attempts: {e}"
+            ) from e
+        except httpx.HTTPError as e:
+            # 其他 httpx 错误（非瞬时）——不重试
+            raise DataSourceError(f"tikhub transport failed ({path}): {e}") from e
+        # 5xx 视为上游瞬时错误，可重试
+        if 500 <= resp.status_code < 600:
+            if attempt < _RETRY_ATTEMPTS - 1:
+                log.warning(
+                    "tikhub http %d (%s) attempt %d/%d, retrying",
+                    resp.status_code, path, attempt + 1, _RETRY_ATTEMPTS,
+                )
+                last_exc = DataSourceError(
+                    f"tikhub http {resp.status_code} ({path}): {resp.text[:200]}"
+                )
+                await _sleep(_RETRY_BACKOFFS[attempt])
+                continue
+            raise DataSourceError(f"tikhub http {resp.status_code} ({path}): {resp.text[:200]}")
+        if resp.status_code < 200 or resp.status_code >= 300:
+            # 4xx —— 不重试
+            raise DataSourceError(f"tikhub http {resp.status_code} ({path}): {resp.text[:200]}")
+        try:
+            body = resp.json()
+        except ValueError as e:
+            raise DataSourceError(f"tikhub bad json ({path}): {e}") from e
+        code = body.get("code")
+        if code != 200:
+            # 业务码失败 —— 确定性，不重试
+            raise DataSourceError(f"tikhub business code={code} ({path}): {body.get('message', '')}")
+        return body
+    # 逻辑上不可达（重试循环必然在 continue 或 raise 处分支），防御性兜底
+    raise DataSourceError(
+        f"tikhub retry loop exited unexpectedly ({path}): {last_exc}"
+    )
 
 
 def _parse_video(item: dict) -> VideoMeta:
@@ -166,8 +226,13 @@ async def video_meta(url: str, *, client: httpx.AsyncClient | None = None) -> Vi
 async def precheck(url: str, *, client: httpx.AsyncClient | None = None) -> dict:
     """轻量可达性 + 视频条数预检（Java 预扣额度门槛，Task 3.3）。
 
-    解析 sec_user_id 成功即 reachable=True；再拉一次首页视频列表，按返回条数记 video_count
-    （首页条数，非账号全量精确总数——联调期如需精确总数需翻页聚合，此处轻量即可）。
+    解析 sec_user_id 成功即 reachable=True；再拉一次首页视频列表（count=20，
+    与 ``account_top_videos`` 默认 ``n=20`` 对齐），按返回条数记 video_count。
+
+    video_count 是**首页视频数（≤20），非精确总数**；TikHub 为分页接口，如需精确
+    总数需翻页聚合。Task 3.3 按此估算扣费 ``max(1, min(10, floor(N/2)))``——
+    此处给一个真实首页规模使公式非退化（账号 ≥2 条视频即 ≥1 档 graduated）。
+
     返回 ``{"reachable": bool, "video_count": int}``。
     """
     if not _is_configured():
@@ -182,7 +247,7 @@ async def precheck(url: str, *, client: httpx.AsyncClient | None = None) -> dict
         body = await _get_json(
             client,
             _PATH_USER_POST_VIDEOS,
-            {"sec_user_id": sec_uid, "count": 1, "max_cursor": 0, "sort_type": 0},
+            {"sec_user_id": sec_uid, "count": 20, "max_cursor": 0, "sort_type": 0},
         )
         data = body.get("data") or {}
         items = data.get("aweme_list") or data.get("list") or []
