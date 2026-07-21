@@ -13,6 +13,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
+from app.api.analyze import router as analyze_router
 from app.api.asr import router as asr_router
 from app.api.card_gen import router as card_gen_router
 from app.api.embed import router as embed_router
@@ -80,6 +81,7 @@ app.include_router(script_gen_router)
 app.include_router(card_gen_router)
 app.include_router(interview_router)
 app.include_router(asr_router)
+app.include_router(analyze_router)
 
 
 @app.get("/health")
