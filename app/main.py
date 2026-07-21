@@ -4,6 +4,7 @@
 （Java→Python 唯一出口带 X-Service-Token）。后续 skill 路由按 task 逐步挂载。
 """
 
+import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -12,6 +13,8 @@ from app.api.embed import router as embed_router
 from app.api.safety import router as safety_router
 from app.db import close_pool, init_pool
 
+log = logging.getLogger(__name__)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -19,7 +22,9 @@ async def lifespan(app: FastAPI):
     try:
         await init_pool()
     except Exception:  # noqa: BLE001 — DB 不可达不应阻断 /health 与 /ai/* 鉴权层启动
-        pass
+        # 不阻断启动（/health 仍可探活、/ai/* 鉴权层可用），但必须留痕：
+        # 否则配置错的 DATABASE_URL 会让 /health 假 UP，把坏连接推迟到首个 RAG 调用才暴露。
+        log.exception("init_pool failed; /health stays UP, RAG/kb_card/analyze_task endpoints will fail on demand")
     yield
     # shutdown：关池
     await close_pool()
