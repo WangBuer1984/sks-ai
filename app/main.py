@@ -9,6 +9,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
+from app.api.card_gen import router as card_gen_router
 from app.api.embed import router as embed_router
 from app.api.safety import router as safety_router
 from app.api.script_gen import router as script_gen_router
@@ -35,6 +36,7 @@ app = FastAPI(title="sks-ai", version="0.1.0", lifespan=lifespan)
 app.include_router(embed_router)
 app.include_router(safety_router)
 app.include_router(script_gen_router)
+app.include_router(card_gen_router)
 
 
 @app.get("/health")
