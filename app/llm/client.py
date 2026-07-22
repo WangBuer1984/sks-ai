@@ -21,7 +21,12 @@ def _default_factory(spec: ModelSpec) -> ChatOpenAI:
         base_url=settings.ZHIPU_BASE_URL,
         api_key=settings.ZHIPU_API_KEY,
         model=spec.model,
-        timeout=120,  # §5.1 LLM 单次超时 120s（内层最短于外层 270/300）
+        timeout=120,  # §5.1 LLM 单次超时 120s
+        # §5.3 timeout-chain 可证化：max_retries=1 → 最多 2 次 × 120s = 240s < Java 270s < nginx 300s
+        # （内层短于外层）。显式设 1 而非依赖 openai SDK 默认（max_retries=2 → 3 次 ≈ 360s，
+        #  将越过 Java 270s read-timeout，触发对仍在重试的 Python 打 AI_FAILED 的 #1 风险）。
+        # 与 Java AiClient 对 ResourceAccessException 的传输层重试正交（不同层），两者并存。
+        max_retries=1,
         model_kwargs={
             "extra_body": {"thinking": {"type": "enabled" if spec.thinking else "disabled"}}
         },
