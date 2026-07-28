@@ -26,10 +26,9 @@ class Settings(BaseSettings):
     # Postgres：业务表 + pgvector + LangGraph 检查点，单库三合一。
     DATABASE_URL: str = "postgresql://postgres:postgres@localhost:5432/sks"
 
-    # 阿里云：SMS / ASR / 内容安全同厂商。
+    # 阿里云：ASR / 内容安全同厂商（SMS 归 sks-server）。
     ALIYUN_ACCESS_KEY_ID: str = ""
     ALIYUN_ACCESS_KEY_SECRET: str = ""
-    ALIYUN_SMS_SIGN: str = ""
     # 内容安全 Green 文本审核端点（按 region 选择）。
     ALIYUN_CONTENT_SAFETY_ENDPOINT: str = "https://green.cn-shanghai.aliyuncs.com"
     # 一句话识别（短音频 ≤60s 同步）——dashscope SDK 用此 key（阿里云百炼 API key）。
