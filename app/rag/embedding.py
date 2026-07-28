@@ -31,7 +31,7 @@ async def embed(text: str, *, client: httpx.AsyncClient | None = None) -> list[f
                 "Authorization": f"Bearer {settings.ZHIPU_API_KEY}",
                 "Content-Type": "application/json",
             },
-            json={"model": EMBEDDING_MODEL, "input": text},
+            json={"model": EMBEDDING_MODEL, "input": text, "dimensions": EMBEDDING_DIM},
         )
         resp.raise_for_status()
         vec = resp.json()["data"][0]["embedding"]
