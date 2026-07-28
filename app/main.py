@@ -35,21 +35,27 @@ async def _init_checkpointer() -> None:
     （与 init_pool 失败处理同口径）。
     """
     try:
-        from langgraph.checkpoint.postgres.aio import (
-            AsyncConnectionPool,
-            AsyncPostgresSaver,
-        )
+        from psycopg import AsyncConnection
+        from psycopg.rows import dict_row
+
+        from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
         from app.skills.interview.graph import set_checkpointer
 
-        # psycopg 连接串与 asyncpg 同库；asyncpg 用 postgresql://，psycopg 接受同格式
-        # timeout=3.0：DB 不可达时快速失败（避免 TestClient lifespan 卡 30s 默认超时）
-        pool = AsyncConnectionPool(
-            conninfo=settings.DATABASE_URL, min_size=1, max_size=10,
-            open=False, timeout=3.0,
+        # 单连接 autocommit 模式——与 langgraph 官方 from_conn_string 同口径
+        # （其内部即 AsyncConnection.connect(..., autocommit=True, prepare_threshold=0, row_factory=dict_row)）。
+        # 为什么 autocommit：saver.setup() 跑 CREATE INDEX CONCURRENTLY，该语句不能在事务块内执行；
+        # psycopg 默认 autocommit=False 会把每条语句包进事务 → ActiveSqlTransaction。autocommit 后
+        # 裸 execute 不开事务，CONCURRENTLY 通过；运行时 checkpoint 操作仍用 conn.transaction()
+        # 显式开事务保证原子性（不受影响）。不能用 pool 的 configure 回调设：AsyncConnection 的
+        # autocommit 属性只读，须 await set_autocommit()，而 configure 是同步回调无法 await。
+        # 单连接而非 pool：saver 自带 asyncio.Lock 串行化所有 checkpoint 操作，单连接即够，无并发诉求。
+        conn = await AsyncConnection.connect(
+            settings.DATABASE_URL,
+            autocommit=True, prepare_threshold=0, row_factory=dict_row,
+            connect_timeout=3.0,
         )
-        await pool.open()
-        saver = AsyncPostgresSaver(conn=pool)
+        saver = AsyncPostgresSaver(conn=conn)
         await saver.setup()  # 建检查点表（迁移例外，LangGraph 私有）
         set_checkpointer(saver)
         log.info("interview checkpointer ready (AsyncPostgresSaver)")
