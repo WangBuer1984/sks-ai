@@ -53,7 +53,7 @@ class GLMClient:
         llm = self._llm_factory(spec)
 
         if json_schema is not None:
-            structured = llm.with_structured_output(json_schema, method="json_schema")
+            structured = llm.with_structured_output(json_schema, method="function_calling")
             result = await structured.ainvoke(messages)
         else:
             result = await llm.ainvoke(messages)
