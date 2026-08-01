@@ -28,7 +28,7 @@ class ModelSpec:
 MODEL_FOR: dict[str, ModelSpec] = {
     # 创作类：glm-4.7，thinking 关
     "script_gen": ModelSpec("glm-4.7", thinking=False),
-    "interview": ModelSpec("glm-4.7", thinking=False),
+    "interview": ModelSpec("glm-4.5-air", thinking=False),
     "video_analyze": ModelSpec("glm-4.7", thinking=False),
     # 轻量抽取：glm-4.5-air
     "card_gen": ModelSpec("glm-4.5-air", thinking=False),
