@@ -34,8 +34,21 @@ import httpx
 
 from app.config import settings
 from app.datasource import DataSourceError
+from app.datasource.media import MediaRef
 
 log = logging.getLogger(__name__)
+
+# === 抖音下载请求头 ===
+# 抖音 CDN 直链下载需带浏览器 UA + Referer: https://www.douyin.com/，否则 403。
+# ``video_meta_to_media_ref`` 通过 ``dict(DOUYIN_DOWNLOAD_HEADERS)`` 注入新鲜字典——
+# 严禁直接传本模块字典给多个 ref（共享可变 dict，一处 mutate 全局生效）。
+DOUYIN_DOWNLOAD_HEADERS: dict[str, str] = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+    ),
+    "Referer": "https://www.douyin.com/",
+}
 
 # === 端点路径常量（联调期如 TikHub 改路径，仅改这里） ===
 _PATH_GET_SEC_USER_ID = "/api/v1/douyin/web/get_sec_user_id"
@@ -73,6 +86,7 @@ class VideoMeta:
     play_count: int
     fav_count: int
     download_url: str
+    author: str = ""  # aweme author.nickname / author.nick_name
 
 
 @dataclass
@@ -159,11 +173,29 @@ def _parse_video(item: dict) -> VideoMeta:
     stats = item.get("statistics") or {}
     play_addr = (item.get("video") or {}).get("play_addr") or {}
     url_list = play_addr.get("url_list") or []
+    author_obj = item.get("author") or {}
+    author = str(author_obj.get("nickname") or author_obj.get("nick_name") or "")
     return VideoMeta(
         title=str(item.get("desc") or ""),
         play_count=int(stats.get("play_count") or 0),
         fav_count=int(stats.get("digg_count") or 0),
         download_url=str(url_list[0]) if url_list else "",
+        author=author,
+    )
+
+
+def video_meta_to_media_ref(v: VideoMeta) -> MediaRef:
+    """VideoMeta → MediaRef（抖音下载头注入）。
+
+    ``headers=dict(DOUYIN_DOWNLOAD_HEADERS)`` 复制一份新鲜字典，避免多个 ref
+    共享模块级可变 dict。``title``/``author`` 空串归一为 ``None``（下游空值更稳）。
+    """
+    return MediaRef(
+        platform="douyin",
+        download_url=v.download_url,
+        headers=dict(DOUYIN_DOWNLOAD_HEADERS),
+        title=v.title or None,
+        author=v.author or None,
     )
 
 
