@@ -5,8 +5,11 @@
 阿里云 400 MissingAction → 404 InvalidAction.NotFound——端点已不支持旧版 ROA。
 切到 2.0 TextModeration（RPC，Action=TextModeration，域 green-cip.*）。
 
-响应格式（2.0）：{"Code":200,"Data":{"Result":[{"Confidence":0,"Label":"non_label","Suggestion":"pass"}]}}
-判定：Code==200 且所有 Result[].Suggestion=="pass" 才安全。
+响应格式（2.0）：
+  安全：{"Code":200,"Data":{"reason":"","descriptions":"","labels":""}}
+  命中：{"Code":200,"Data":{"reason":"涉政","labels":"political"}}
+  错误：{"Code":408,"Message":"..."}（如服务未开通）
+判定：Code==200 且 Data.reason/labels 为空 → 安全；非空 → 命中。
 """
 
 from __future__ import annotations
@@ -29,15 +32,17 @@ _SERVICE = "comment_detection"
 
 
 def _is_safe(body: dict) -> bool:
-    """解析 TextModeration 2.0 响应：Code==200 且所有 Suggestion==pass 才安全。"""
+    """解析 TextModeration 2.0 响应：Code==200 且 reason/labels 为空才安全。"""
     if body.get("Code") != 200:
         return False
     data = body.get("Data") or {}
-    results = data.get("Result") or []
-    if not results:
+    # 安全时 Data 为 {"reason":"","descriptions":"","labels":""}（全空）。
+    # 命中时 reason/labels 非空（如 reason="涉政", labels="political"）。
+    if data.get("reason") or data.get("labels"):
         return False
-    for r in results:
-        if r.get("Suggestion") != "pass":
+    # 若有 Result 数组（部分响应格式），检查 Suggestion。
+    for r in (data.get("Result") or []):
+        if r.get("Suggestion") not in (None, "pass"):
             return False
     return True
 
@@ -74,11 +79,12 @@ async def check(text: str, *, client=None) -> bool:
         safe = _is_safe(body)
         if not safe:
             log.warning(
-                "content safety blocked (suggestion != pass or format mismatch): %s",
+                "content safety blocked (reason/labels non-empty or Code!=200): %s",
                 json.dumps(body, ensure_ascii=False)[:500],
             )
         return safe
     except Exception as e:
+        # fail-closed：宁可让 Java 走重试/退款，也不放行未审内容。
         log.warning(
             "content safety check failed (fail-closed → blocked): %s",
             e,
