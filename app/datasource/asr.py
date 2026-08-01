@@ -157,17 +157,16 @@ def _sync_transcribe(audio_bytes: bytes, fmt: str) -> str:
     )
     try:
         recognition.start()
-        # 分批发送：paraformer 流式接口期望小帧（100ms = 3200 bytes @ 16kHz 16-bit mono）
-        chunk_size = 3200
+        # 分帧入队即可：send_audio_frame 只是 put 进 SDK 队列，由接收线程按实时节奏抽走。
+        # 整段已在内存里，无需 sleep 模拟麦克风节拍（以前 10ms×帧数会无谓拖慢短录音）。
+        # 帧长与官方 call(file) 读盘块接近（12800 ≈ 400ms @ 16kHz 16-bit mono）。
+        chunk_size = 12800
         for i in range(0, len(audio_data), chunk_size):
-            chunk = audio_data[i:i+chunk_size]
-            recognition.send_audio_frame(chunk)
-            import time
-            time.sleep(0.01)  # 10ms 间隔，给 paraformer 处理时间
+            recognition.send_audio_frame(audio_data[i : i + chunk_size])
         recognition.stop()
         if not done.wait(timeout=30.0):
             log.warning("asr timed out after 30s (fmt=%s, sr=%d, bytes=%d)", actual_fmt, sr, len(audio_data))
-            return collected["text"] or ""
+            return collected["text"] or collected["partial"] or ""
     except Exception as e:  # noqa: BLE001
         log.warning("asr transport failed: %s (fmt=%s, sr=%d, bytes=%d)", e, actual_fmt, sr, len(audio_data))
         raise ASRRecognitionError(f"asr transport failed: {e}") from e
