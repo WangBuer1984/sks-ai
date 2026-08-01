@@ -355,7 +355,7 @@ async def interview_step(
         if not await check(user_reply):
             return {"blocked": True}
 
-    sv = _graph.get_state(config)
+    sv = await _graph.aget_state(config)
     has_active = sv is not None and bool(sv.next)
 
     if has_active:
@@ -373,14 +373,14 @@ async def interview_step(
             {"user_id": user_id, "materials": materials or ""}, config=config
         )
 
-    sv = _graph.get_state(config)
+    sv = await _graph.aget_state(config)
     return _build_response(sv)
 
 
 async def fetch_result(thread_id: str) -> dict[str, Any] | None:
     """/ai/interview/result 只读：取最新 checkpoint 的 summarize 产出，不推进状态机。"""
     config = {"configurable": {"thread_id": thread_id}}
-    sv = _graph.get_state(config)
+    sv = await _graph.aget_state(config)
     if not sv or not sv.values:
         return None
     return sv.values.get("profile")
