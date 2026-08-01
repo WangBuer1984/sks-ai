@@ -58,6 +58,7 @@ async def post_asr(audio: UploadFile = File(...)) -> ASRResponse:
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail={"error": "ASR_FAILED"},
         )
+    log.info("asr result: fmt=%s, bytes=%d, text='%s'", fmt, len(audio_bytes), text[:100] if text else "(empty)")
     return ASRResponse(text=text)
 
 

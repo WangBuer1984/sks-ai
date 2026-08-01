@@ -101,7 +101,10 @@ def _sync_transcribe(audio_bytes: bytes, fmt: str) -> str:
     if collected["error"] is not None:
         log.warning("asr recognition error: %s (format=%s)", collected["error"], fmt)
         raise ASRRecognitionError(f"asr recognition error: {collected['error']}")
-    return collected["text"] or ""
+    result_text = collected["text"] or ""
+    log.info("asr _sync_transcribe done: fmt=%s, sr=%d, bytes=%d, text='%s'",
+             fmt, sr, len(audio_bytes), result_text[:100] if result_text else "(empty)")
+    return result_text
 
 
 async def transcribe_short(audio_bytes: bytes, fmt: str) -> str:
