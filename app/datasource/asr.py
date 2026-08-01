@@ -41,19 +41,23 @@ def _to_wav(audio_bytes: bytes, source_fmt: str) -> tuple[bytes, str]:
 
     paraformer-realtime-v2 不认 WebM 容器——直接喂 WebM 返空文本。
     pydub + ffmpeg 转 WAV 后以 format=wav 送 paraformer，确定能识别。
-    若 pydub/ffmpeg 不可用（如容器里没装 ffmpeg），原样返回（降级走 opus 格式）。
+    若 pydub/ffmpeg 不可用（如容器里没装 ffmpeg），原样返回（降级走原格式）。
     """
     if source_fmt == "wav":
         return audio_bytes, "wav"
     try:
         from pydub import AudioSegment
 
-        audio = AudioSegment.from_file(io.BytesIO(audio_bytes), format=source_fmt)
+        # pydub.from_file 按"容器格式"推断——浏览器发的是 WebM 容器，
+        # 不是裸 Opus 帧。source_fmt 是 _infer_format 的返回值（"opus"），
+        # 但 ffmpeg 需要的是容器格式 "webm"，不是编解码器名 "opus"。
+        container_fmt = "webm" if source_fmt == "opus" else source_fmt
+        audio = AudioSegment.from_file(io.BytesIO(audio_bytes), format=container_fmt)
         audio = audio.set_frame_rate(16000).set_channels(1)
         wav_buf = io.BytesIO()
         audio.export(wav_buf, format="wav")
         wav_bytes = wav_buf.getvalue()
-        log.warning("asr: converted %s→wav (16kHz mono): %d→%d bytes", source_fmt, len(audio_bytes), len(wav_bytes))
+        log.warning("asr: converted %s(%s)→wav (16kHz mono): %d→%d bytes", source_fmt, container_fmt, len(audio_bytes), len(wav_bytes))
         return wav_bytes, "wav"
     except Exception as e:
         log.warning("asr: pydub convert failed (%s→wav), falling back to original: %s", source_fmt, e)
