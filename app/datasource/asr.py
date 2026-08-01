@@ -78,22 +78,28 @@ def _sync_transcribe(audio_bytes: bytes, fmt: str) -> str:
 
     callback = _Collector()
     # paraformer-realtime-v2 支持常见短音频格式；sample_rate 按音频实际值
+    # opus 编码（webm 容器）恒 48000Hz；wav/pcm 可能 16000。按 fmt 选。
+    sr = 48000 if fmt == "opus" else 16000
     recognition = Recognition(
         model="paraformer-realtime-v2",
         callback=callback,
         format=fmt,
-        sample_rate=16000,
+        sample_rate=sr,
     )
     try:
         recognition.start()
         recognition.send_audio_frame(audio_bytes)
         recognition.stop()
         # 等待 on_close/on_error（stop 内部已等回调，但显式 wait 兜底边界时序）
-        done.wait(timeout=30.0)
+        if not done.wait(timeout=30.0):
+            log.warning("asr timed out after 30s (format=%s, sr=%d, bytes=%d)", fmt, sr, len(audio_bytes))
+            return collected["text"] or ""
     except Exception as e:  # noqa: BLE001
+        log.warning("asr transport failed: %s (format=%s, sr=%d, bytes=%d)", e, fmt, sr, len(audio_bytes))
         raise ASRRecognitionError(f"asr transport failed: {e}") from e
 
     if collected["error"] is not None:
+        log.warning("asr recognition error: %s (format=%s)", collected["error"], fmt)
         raise ASRRecognitionError(f"asr recognition error: {collected['error']}")
     return collected["text"] or ""
 
