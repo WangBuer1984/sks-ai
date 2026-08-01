@@ -1,7 +1,7 @@
 # 长音频转写对齐 clever-hans（TikHub 下载 → wav/切片 → qwen3-asr-flash）
 
 日期：2026-08-02  
-状态：已批准（2026-08-02；含复盘补丁 + 第一轮结构审查补丁）  
+状态：已批准（2026-08-02；含复盘补丁 + 结构审查补丁 + 代码事实校对补丁）  
 范围：`sks-ai` 拆视频（粘链接）/ 拆账号转写管线；参考 `clever-hans` 媒体+ASR，取链仍用 TikHub（不用 yt-dlp）
 
 ## 1. 背景与问题
@@ -57,14 +57,15 @@
   → transcribe(MediaRef) → …见下
 ```
 
-**B. 已是媒体直链（拆账号逐条）**
+**B. 拆账号逐条（已有 VideoMeta）**
 
 ```text
-download_url: str
-  → transcribe(str)  # 只下载+转写，禁止再 resolve_media
-  # 门面内将 str 提升为 MediaRef(platform=douyin 默认, download_url=str,
-  #   headers=抖音默认 UA+Referer)，以保证防 403 headers；无 title（Qwen context 可空）
+VideoMeta
+  → MediaRef(platform=douyin, download_url, headers=抖音默认 UA+Referer, title=VideoMeta.title)
+  → transcribe(MediaRef)  # 禁止裸 str 进拆账号热路径；download.py 保持平台无感
 ```
+
+兼容：`transcribe(str)` 仍保留作测试/内部 seam，语义为「已是直链」；门面可把 str 提升为带抖音默认 headers 的 MediaRef。**业务拆账号必须走 MediaRef**，避免丢 headers/title。
 
 **`transcribe` 内部（A/B 汇合后）**
 
@@ -98,7 +99,7 @@ HTTP 下载到临时目录（decode_key 非空则解码）
 
 - 下载源是 TikHub 直链，不是 yt-dlp
 - 失败抛 `DataSourceError`，不返回空 transcript
-- 配置走 `app.config.settings`
+- 配置：`from app.config import settings`（`app/config.py` 内 `Settings` 单例实例，不是独立包 `app.config.settings`）
 
 **模块边界（LOAD-BEARING）**
 
@@ -121,14 +122,14 @@ async def transcribe(media: MediaRef | str) -> str:
 
 | 类型 | 含义 | 行为 |
 |---|---|---|
-| `MediaRef` | 已 resolve 的媒体描述 | 用其 `download_url` / headers / decode_key / title |
-| `str` | **已是可下载直链**（拆账号逐条） | **禁止** `resolve_media`；门面内提升为 `MediaRef(platform="douyin", download_url=str, headers=抖音默认 UA+Referer)`；无 title |
+| `MediaRef` | 已 resolve / 已装配的媒体描述 | 用其 `download_url` / headers / decode_key / title；**业务热路径（单视频+拆账号）只走此类型** |
+| `str` | **已是可下载直链**（测试/兼容 seam） | **禁止** `resolve_media`；门面可提升为带抖音默认 headers 的 MediaRef；**拆账号业务不得依赖裸 str** |
 
 分享链必须由调用方 `resolve_media` → `MediaRef` 后再进门面；禁止把分享链当 `str` 传入。
 
 **拼接算法**：移植 clever-hans `backend/app/core/pipeline.py` 的 `_merge_transcript_parts` + `_find_overlap_text`（tail/head 最长公共前后缀，上限约 50 字；无时间戳对齐）。实现期带与 clever-hans 同构的单测（见其 `tests/test_pipeline.py`）。
 
-- 配置：`_is_configured()` 改为检查 `ALIYUN_ASR_KEY`（语义见 §5.5 命名债）；ffmpeg/ffprobe 缺失时在首次转写报 `DataSourceError`（或启动探针，实现期二选一，文档写明）。
+- 配置：读 `from app.config import settings`（见上）。长转写 `_is_configured()` **只查** `settings.ALIYUN_ASR_KEY`（不再查 ACCESS_KEY / AppKey）。短 ASR `asr.py` 的 `_is_configured()` 已是同一 Key，无需改语义。ffmpeg/ffprobe 缺失时首次转写报 `DataSourceError`（或启动探针）。
 
 ### 5.3 TikHub 扩展（`app/datasource/tikhub.py`）
 
@@ -140,11 +141,13 @@ async def transcribe(media: MediaRef | str) -> str:
 
 `MediaRef` 建议字段：`platform`, `download_url`, `headers`（可选）, `decode_key`（可选）, `title`（可选）, `raw_id`（可选）。
 
-**抖音 headers / fallback 归属**
+**抖音 headers / `play_addr` fallback 归属（LOAD-BEARING）**
 
-- 默认下载 headers（`User-Agent` + `Referer: https://www.douyin.com/`）由 **产出 `MediaRef` 时写入**（`resolve_media` / 或 `transcribe(str)` 提升时补默认）。
-- `play_addr` 为空 → 在 **resolve 阶段** fallback 调 TikHub 高清播放接口，写入最终 `download_url`。
-- 首次 `download` 403/失败 → **可选**：`transcribe` 调 tikhub 再取一次高清 URL，换 `MediaRef.download_url` 后重试 download **一次**；仍失败 → `DataSourceError`。download 层本身不感知 TikHub。
+- `play_addr` 仅是 `tikhub._parse_video` 内部中间字段，**不**出现在 `VideoMeta` / `MediaRef` 公共 API。
+- 「`play_addr` 为空 → 调 TikHub 高清播放接口」**只发生在** `resolve_media` / `_parse_video`（或同文件辅助函数）内部；产出的 `MediaRef.download_url` 已是最终可下链接。
+- `download.py` **不感知** `play_addr`、不感知 TikHub 高清接口、不 import tikhub。
+- 默认下载 headers（`User-Agent` + `Referer: https://www.douyin.com/`）在 **装配 MediaRef 时写入**（`resolve_media` 或 `VideoMeta → MediaRef` 辅助函数）。
+- 首次 download 403/失败后的「再取高清 URL 重试一次」若需要：由 **门面 `transcribe` 编排调用 tikhub**，再把新 URL 交给 download；仍失败 → `DataSourceError`。
 
 **视频号 decode（必达门槛）**
 
@@ -154,24 +157,34 @@ async def transcribe(media: MediaRef | str) -> str:
 
 **`VideoMeta` 与 `MediaRef`**
 
-- 允许并存：`VideoMeta` 继续服务拆账号列表解析。
-- 拆账号逐条：**推荐** `transcribe(video.download_url)`（str 路径），由门面补抖音默认 headers；title/context 本期可空（非阻塞）。若后续要 Qwen 专名 context，再改为 `MediaRef(title=video.title, ...)`，不强迫本期改 `VideoMeta` 结构。
+- 允许并存：`VideoMeta` 继续服务拆账号列表解析（字段：`title` / `play_count` / `fav_count` / `download_url`）。
+- 拆账号逐条（**选定路径 b**）：`video_meta_to_media_ref(v) → MediaRef(download_url, headers=抖音默认, title=v.title)` → `transcribe(MediaRef)`。  
+  **不**走裸 `transcribe(v.download_url)`，以免丢防 403 headers 与 title context。  
+  **不**把平台判定塞进 `download.py`。
 
 ### 5.4 调用方
 
 | 入口 | 改动 |
 |---|---|
-| `analyze_video_link(task_id, url)` | `ref = await resolve_media(url)` → `transcribe(ref)`（带心跳） |
+| `analyze_video_link(task_id, url)` | `ref = await resolve_media(url)` → `_transcribe_with_heartbeat(task_id, ref)` |
 | `analyze_account` / `precheck` | **仅抖音**。视频号主页/未知平台 → `DataSourceError`（文案引导改用单视频粘链接） |
-| `analyze_account` 逐条 | 对抖音 `VideoMeta.download_url` 调 `transcribe(str)`（门面补默认 headers） |
+| `analyze_account` 逐条 | `ref = video_meta_to_media_ref(v)` → `_transcribe_with_heartbeat(task_id, ref)` |
 | `structure_video` / 粘文案 | 不动 |
-| `asr.py` / `/ai/asr` | 不动 |
+| `asr.py` / `/ai/asr` | 不动（仍用 `settings.ALIYUN_ASR_KEY`；本期不重命名） |
+
+**心跳（两处独立实现，须同步改）**
+
+- `_transcribe_with_heartbeat` **不在** `transcribe.py`，而是两份拷贝：  
+  1. `app/skills/video_analyze/graph.py`  
+  2. `app/skills/account_analyze/graph.py`  
+- 二者均需同步调整入参：`download_url: str` → `media: MediaRef | str`（或统一 `MediaRef`），内部 `create_task(transcribe(media))`，60s touch `updated_at` 覆盖下载+转码+多段 ASR。
+- 实现期 checklist：改完 video 必须同 PR 改 account，禁止只改一处。
 
 **心跳 vs Java running-timeout（澄清，通常无需改 Java）**
 
 - Java「5min running-timeout」语义是：**`updated_at` 停滞超过 5min** 才判 failed，不是墙钟总时长 5min。
-- 现有 `_transcribe_with_heartbeat`（`HEARTBEAT_INTERVAL=60s`）在下载+转码+多段 ASR 全程周期性 `touch updated_at`，因此总耗时 15–20min 仍可存活。
-- **本期默认不改** Java timeout；实现计划标注「核对 heartbeat 仍覆盖新管线全程；若联调发现 touch 间隙断裂再动 Java」。
+- 心跳 60s touch 下，总耗时 15–20min 仍可存活。
+- **本期默认不改** Java / sks-server timeout；实现计划列为核对项：「联调确认 heartbeat 覆盖新管线；若 touch 间隙断裂再与 sks-server 联动」。
 - Python 单条硬上限（建议 15–20min）是独立熔断，超时 → `DataSourceError`，与 Java 策略正交。
 
 **产品/前端联动（本期默认）**
@@ -183,18 +196,19 @@ async def transcribe(media: MediaRef | str) -> str:
 
 | 变量 | 变化 |
 |---|---|
-| `ALIYUN_ASR_KEY` | 长转写 + 短 ASR 共用（必填于长转写路径）。**命名债**：实为 DashScope/百炼 API Key，非 ISI。本期不重命名（`asr.py` 同用，影响面大）；`.env.example` / config 注释必须写明「DashScope/百炼 Key」。可选后续改名 `DASHSCOPE_API_KEY` |
-| `ALIYUN_ASR_APP_KEY` | 废弃：从必填检查、`.env.example`、GO_LIVE checklist 移除或标 deprecated |
+| `ALIYUN_ASR_KEY` | 长转写 + 短 ASR（`asr.py`）共用。**命名债**：实为 DashScope/百炼 API Key，**非**阿里云 ISI。本期**不重命名**（会同时震动 `asr.py` 的 `dashscope.api_key = settings.ALIYUN_ASR_KEY`）；`.env.example` / `app/config.py` 注释必须写明。可选后续改名 `DASHSCOPE_API_KEY` |
+| `ALIYUN_ASR_APP_KEY` | 废弃：从长转写 `_is_configured`、`.env.example`、**`sks-agent/deploy/GO_LIVE_CHECKLIST.md`** 移除或标 deprecated |
+| `ALIYUN_ACCESS_KEY_ID/SECRET` | **保留**：内容安全 `AcsClient` 仍用。从长转写 `_is_configured()` 检查项中**摘除**；不从 `.env.example` 删除 |
 | `TIKHUB_API_KEY` | 不变 |
 | `ASR_TMP_DIR`（可选） | 临时目录；默认系统 tempfile |
 | 并发 | **MVP 必做** `asr` 信号量（初值 3 为起点，§8 联调压测后定稿）；download / convert 建议同步加（如 5 / 4） |
 
 部署：`sks-ai` 镜像必须含 `ffmpeg` / `ffprobe`。
 
-**依赖（已 grep 确认，2026-08-02）**
+**依赖与 SDK 边界（已 grep 确认，2026-08-02）**
 
-- `aliyun-python-sdk-core`：**保留**——`app/safety/content_safety.py`（Green TextModeration）仍用 `AcsClient`/`CommonRequest`。长转写删 filetrans 后 **不得** 从 `pyproject` 移除该包，除非内容安全也迁走。
-- `ALIYUN_ACCESS_KEY_ID/SECRET`：继续服务内容安全，与 ASR AppKey 解耦。
+- `aliyun-python-sdk-core`：**不得从 `pyproject` 移除**。`app/safety/content_safety.py` 用同一包的 `AcsClient` + `CommonRequest` 打 `green-cip.*.aliyuncs.com`（TextModeration 2.0）；仓内**没有**独立 green SDK。长转写只是**停止**调用其 filetrans 路径，与内容安全在 SDK 上解耦、在依赖上共享。
+- 误删该包会打挂 UGC 内容安全审核，违反仓内硬不变量。
 - Dockerfile / ffmpeg：实现计划单列。
 
 **临时文件与 hard-kill**
@@ -239,26 +253,27 @@ Java 侧退款 / poller 行为不改，仍依赖 Python 写 `failed`。
 
 ## 8. 测试计划
 
-- 单测（mock 网络与 DashScope）：download、`_merge_transcript_parts` 对齐 clever-hans、qwen 重试、`transcribe` 编排清临时文件、`resolve_media`、`transcribe(str)` 默认补抖音 headers、分享链误传契约。  
-- 重写 `tests/test_transcribe.py`（去掉 POP mock）。  
-- 更新 `test_video_analyze` / `test_account_analyze` monkeypatch。  
+- **必重写**：`tests/test_transcribe.py`——现状全程 mock `_submit_task` / `_get_task_result` POP seam；切 Qwen 后改为 mock `download` / `convert_to_wav` / `slice_audio` / `qwen_asr` / merge。  
+- **skill 层测试改动小**：`test_video_analyze.py` / `test_account_analyze.py` mock 的是 skill 模块级 `transcribe` 别名（经 `_transcribe_with_heartbeat`），不是 POP seam。只要符号仍被 import，通常只需：心跳包裹层入参改为 `MediaRef` 时同步 mock 入参；返回值语义不变则断言可不动。  
+- 单测另补：`resolve_media`、`video_meta_to_media_ref` 带默认 headers、分享链误传契约、merge 对齐 clever-hans。  
 - 联调：  
-  1. 真实抖音链 +（spike 通过后）真实视频号链各 ≥1；无 `ALIYUN_ASR_APP_KEY` 可跑通。  
-  2. **DashScope 并发压测**：拆账号路径模拟 N 路并行 ASR，标定安全 `asr` 信号量初值（取代拍脑袋 3）。  
-  3. 确认心跳下单条 >5min 墙钟不被 Java 误判 failed。
+  1. 真实抖音链 +（spike 通过后）真实视频号链各 ≥1；无 AppKey 可跑通。  
+  2. **DashScope 并发压测**：标定 `asr` 信号量。  
+  3. 心跳下单条 >5min 墙钟不被 Java 误判 failed。
 
 ## 9. 文档与清单同步
 
-- `sks-ai/docs/API_CONTRACT.md`：filetrans/AppKey → Qwen 管线。  
-- `sks-ai/.env.example`、`sks-agent/.env.example`、`deploy/GO_LIVE_CHECKLIST.md`：废弃 AppKey；注明 ffmpeg；`ALIYUN_ASR_KEY` 注释写明 DashScope/百炼。  
-- Java running-timeout：**默认不改**；实现计划核对项即可。  
+- `sks-ai/docs/API_CONTRACT.md`：**无需**改写「转写实现/filetrans」描述（契约本就不暴露实现细节）。仅核对：`POST /ai/asr` 的 503/`ASR_NOT_CONFIGURED` 仍对应 `ALIYUN_ASR_KEY`，**不要**引入 AppKey 文案。  
+- `sks-ai/.env.example`、`sks-agent/.env.example`：废弃 AppKey；`ALIYUN_ASR_KEY` 注释写明 DashScope/百炼；保留 ACCESS_KEY 给内容安全；注明 ffmpeg。  
+- **`sks-agent/deploy/GO_LIVE_CHECKLIST.md`**（已存在于 **sks-agent** 仓，非 sks-ai）：更新 AppKey / 长转写 / ffmpeg 条目。勿写成 `sks-ai/deploy/...`。  
+- Java running-timeout：**默认不改**；实现计划与 sks-server 核对项。  
 - 本设计实现后由 writing-plans 产出实现计划（另文）。
 
 ## 10. 风险
 
 | 风险 | 缓解 |
 |---|---|
-| TikHub 直链 403 | MediaRef/str 默认 headers；高清 fallback 仅在 resolve/门面，不在 download.py |
+| TikHub 直链 403 | 拆账号走 MediaRef+默认 headers（路径 b）；高清 fallback 仅 resolve/_parse_video 或门面，不在 download.py |
 | 视频号 decode 细节不清 | spike 门槛；失败则单视频可砍 |
 | Qwen ≤5min / ≤10MB | duration 切片为主；≤300s 却 >10MB wav 当异常 |
 | 临时磁盘占满 | finally + 入口陈旧 GC；不假设 hard-kill 能 finally |
@@ -270,10 +285,12 @@ Java 侧退款 / poller 行为不改，仍依赖 Python 写 `failed`。
 ## 11. 决议摘要
 
 - 对齐 clever-hans **转写形态**，不对齐 yt-dlp。  
-- 长转写 = Qwen；短校准 = Paraformer；同一 DashScope Key。  
-- 硬切 filetrans。  
+- 长转写 = Qwen；短校准 = Paraformer；同一 `ALIYUN_ASR_KEY`（DashScope/百炼，命名保留）。  
+- 硬切 filetrans；**`aliyun-python-sdk-core` 因内容安全保留**——ASR 与内容安全在调用路径上解耦、在依赖包上共享。  
+- `ALIYUN_ACCESS_KEY_ID/SECRET` 留给内容安全；长转写 `_is_configured` 只查 DashScope Key。  
 - 必达：抖音单视频 + 抖音拆账号 +（spike 通过后的）视频号单视频；视频号账号可砍；spike 失败则视频号单视频亦可砍。  
-- `transcribe(str)` = 直链 only；分享链必须先 `resolve_media`。
+- 业务热路径只走 `MediaRef`（含默认 headers）；分享链必须先 `resolve_media`。  
+- 两处 `_transcribe_with_heartbeat` 同 PR 改签名。
 
 ## 12. 复盘补丁记录（2026-08-02）
 
@@ -286,7 +303,7 @@ Java 侧退款 / poller 行为不改，仍依赖 Python 写 `failed`。
 | ID | 决议 |
 |---|---|
 | P1-1 | 高清 fallback / play_addr 空 → **仅** tikhub resolve（或门面编排一次重试）；`download.py` 纯下载 |
-| P1-2 | `transcribe(str)` 提升为带抖音默认 headers 的 MediaRef；title 本期可空 |
+| P1-2 | 初版曾倾向 str 门面补 headers；§14 改为拆账号必走 MediaRef（路径 b） |
 | P1-3 | 保留名 `ALIYUN_ASR_KEY`，注释标明 DashScope/百炼；重命名可选后续 |
 | P2-4 | 拼接对齐 clever-hans `_merge_transcript_parts` / `_find_overlap_text` + 同构单测 |
 | P2-5 | 去掉「压码率」；按 duration 切片；≤300s 且 wav>10MB → 异常 |
@@ -294,3 +311,20 @@ Java 侧退款 / poller 行为不改，仍依赖 Python 写 `failed`。
 | P3-7 | §8 增加 DashScope 并发压测联调项 |
 | P3-8 | finally + 入口陈旧临时文件 GC；承认 hard-kill 无 finally |
 | P3-9 | **已确认**：`aliyun-python-sdk-core` 因 `content_safety.py` **必须保留** |
+
+## 14. 代码事实校对补丁（2026-08-02，第二轮）
+
+针对「与代码现状冲突」审查，再锁定：
+
+| ID | 决议 |
+|---|---|
+| P0-1 | 措辞改为：**不得**移除 `aliyun-python-sdk-core`；长转写只停用 filetrans；§11 写明 SDK 解耦边界 |
+| P0-2 | GO_LIVE 路径订正为已存在的 **`sks-agent/deploy/GO_LIVE_CHECKLIST.md`** |
+| P0-3 | `API_CONTRACT.md` 无需改实现描述；只核对短 ASR 503 ↔ `ALIYUN_ASR_KEY` |
+| P0-4 | 配置写法改为 `from app.config import settings`（`app/config.py` Settings 实例） |
+| P1-1 | **选定 (b)**：拆账号 `VideoMeta → MediaRef(+headers+title)`，不走裸 str |
+| P1-2 | `play_addr` 仅 resolve/_parse_video 内部；download 不感知 |
+| P1-3 | 点明 video/account **两处** heartbeat 同 PR 改 |
+| P1-4 | 命名债 + 不重命名原因（`asr.py`）写清 |
+| P3-1 | 细化：重写 `test_transcribe.py`；video/account 测试改动面小 |
+| P3-3 | ACCESS_KEY 保留给内容安全；仅从长转写 `_is_configured` 摘除 |
