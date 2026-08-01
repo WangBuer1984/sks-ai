@@ -1,7 +1,7 @@
 # 长音频转写对齐 clever-hans（TikHub 下载 → wav/切片 → qwen3-asr-flash）
 
 日期：2026-08-02  
-状态：待审  
+状态：已批准（2026-08-02；复盘补丁同日合入）  
 范围：`sks-ai` 拆视频（粘链接）/ 拆账号转写管线；参考 `clever-hans` 媒体+ASR，取链仍用 TikHub（不用 yt-dlp）
 
 ## 1. 背景与问题
@@ -47,19 +47,37 @@
 
 ## 4. 目标管线
 
+两条入口，勿混用：
+
+**A. 分享链 / 需解析的 URL（单视频）**
+
 ```text
-用户 URL（分享链 / 主页）
-  → 平台判定（抖音 | 视频号 | 未知）
-  → TikHub resolve → MediaRef{ download_url, headers?, decode_key?, title? }
-  → HTTP 下载到临时目录（decode_key 非空则解码）
+用户分享链
+  → resolve_media(url) → MediaRef{ platform, download_url, headers?, decode_key?, title? }
+  → transcribe(MediaRef) → …见下
+```
+
+**B. 已是媒体直链（拆账号逐条）**
+
+```text
+download_url: str
+  → transcribe(str)  # 只下载+转写，禁止再 resolve_media
+```
+
+**`transcribe` 内部（A/B 汇合后）**
+
+```text
+HTTP 下载到临时目录（decode_key 非空则解码）
   → ffmpeg → WAV 16kHz mono
-  → duration ≤ 300s：一次 qwen3-asr-flash
-     duration > 300s 或未知：切片（segment≈270s, overlap=3s）→ 分段识别 → overlap 文本去重拼接
+  → 若单文件 >10MB：再压码率或强制切片，仍超则 DataSourceError
+  → duration ≤ 300s 且 ≤10MB：一次 qwen3-asr-flash
+     duration > 300s 或未知或体积仍大：切片（segment≈270s, overlap=3s）
+       → 分段识别 → overlap 文本去重拼接
   → finally 清理临时文件
   → 既有 LLM 结构化 / 账号归纳（不变）
 ```
 
-参数对齐 clever-hans：`segment_duration=270`，`overlap=3`，单次上限参考官方 `qwen3-asr-flash` **≤5 分钟 / 10MB**。
+参数对齐 clever-hans：`segment_duration=270`，`overlap=3`；单次调用遵守官方 `qwen3-asr-flash` **≤5 分钟且 ≤10MB**（时长与体积双约束）。
 
 ## 5. 模块设计（均在 `sks-ai`）
 
@@ -90,8 +108,16 @@ async def transcribe(media: MediaRef | str) -> str:
     """下载 → wav →（切片）Qwen ASR → 全文。失败 DataSourceError。"""
 ```
 
-- `str` 兼容期：若传入仍是 URL，视为「已是 download_url」（拆账号逐条）；单视频应由调用方先 resolve。
-- 配置：`_is_configured()` 改为检查 `ALIYUN_ASR_KEY`（及可选探测 ffmpeg，联调期至少文档要求）。
+**入参契约（LOAD-BEARING）**
+
+| 类型 | 含义 | 行为 |
+|---|---|---|
+| `MediaRef` | 已 resolve 的媒体描述 | 用其 `download_url` / headers / decode_key / title |
+| `str` | **已是可下载直链**（拆账号逐条） | **只下载+转写，禁止调用 `resolve_media`** |
+
+分享链必须由调用方 `resolve_media` → `MediaRef` 后再进门面；禁止把分享链当 `str` 传入。
+
+- 配置：`_is_configured()` 改为检查 `ALIYUN_ASR_KEY`；ffmpeg/ffprobe 缺失时在首次转写报 `DataSourceError`（或启动探针，实现期二选一，文档写明）。
 
 ### 5.3 TikHub 扩展（`app/datasource/tikhub.py`）
 
@@ -104,22 +130,34 @@ async def transcribe(media: MediaRef | str) -> str:
 `MediaRef` 建议字段：`platform`, `download_url`, `headers`（可选）, `decode_key`（可选）, `title`（可选）, `raw_id`（可选）。
 
 抖音下载：GET 直链，带常见 `User-Agent` + `Referer: https://www.douyin.com/`（防 403）。  
-视频号：下载后若存在 `decode_key`，按 TikHub/社区约定做解码（实现期对照 TikHub 返回样例；解码失败明确 `DataSourceError`）。
-
 高清播放 URL：若 `play_addr` 为空或下载失败，允许 fallback 到 TikHub 高清播放接口（抖音），再重试一次下载。
+
+**视频号 decode（必达门槛）**
+
+- 实现编码前先做 **spike**：真实调用 TikHub `fetch_video_detail` ≥1 条，固化样例（`media` / `decode_key` 是否为空、解码算法）。
+- 样例与解码方案写入实现笔记或本 spec 附录后再合入「视频号单视频」。
+- 若 spike 无法在合理时间内（建议 ≤1 个工作日）闭环：将 **视频号单视频降为可砍**，本 milestone 必达收缩为抖音双路径（单视频+拆账号）；不阻塞硬切 Qwen。
+
+`VideoMeta` 可继续服务拆账号；单视频 resolve 产出 `MediaRef`（可含 `title` 供 Qwen context）。不必强行把 `VideoMeta` 改造成 `MediaRef`，允许并存。
 
 ### 5.4 调用方
 
 | 入口 | 改动 |
 |---|---|
 | `analyze_video_link(task_id, url)` | `ref = await resolve_media(url)` → `transcribe(ref)`（带心跳） |
-| `analyze_account` 逐条 | 继续对抖音 `VideoMeta.download_url` 调 `transcribe`；若做视频号账号则用对应列表 → `MediaRef` |
+| `analyze_account` / `precheck` | **仅抖音**。视频号主页/未知平台 → `DataSourceError`（文案引导改用单视频粘链接） |
+| `analyze_account` 逐条 | 对抖音 `VideoMeta.download_url` 调 `transcribe(str)` |
 | `structure_video` / 粘文案 | 不动 |
 | `asr.py` / `/ai/asr` | 不动 |
 
 心跳：`_transcribe_with_heartbeat` 覆盖「下载 + 转码 + 多段 ASR」全程（仍可能 > Java running-timeout 5min）。
 
-### 5.5 配置与运维
+**产品/前端联动（本期默认）**
+
+- 后端先具备视频号单视频能力；`sks-web` Analyze 入口与错误文案是否展示视频号，可同期小改或紧随——实现计划单列任务，避免「后端有、前端永远抖音文案」的静默缺口。
+- 视频号拆账号未做时，前端勿暴露「视频号拆账号」。
+
+### 5.5 配置、依赖与运维
 
 | 变量 | 变化 |
 |---|---|
@@ -127,24 +165,30 @@ async def transcribe(media: MediaRef | str) -> str:
 | `ALIYUN_ASR_APP_KEY` | 废弃：从必填检查、`.env.example`、GO_LIVE checklist 移除或标 deprecated |
 | `TIKHUB_API_KEY` | 不变 |
 | `ASR_TMP_DIR`（可选） | 临时目录；默认系统 tempfile |
-| 并发（可选） | download / convert / asr 信号量；初值保守（如 5 / 4 / 3），可随后调 |
+| 并发 | **MVP 必做** `asr` 信号量（建议初值 3）；download / convert 建议同步加（如 5 / 4），防拆账号 20 路打爆 DashScope |
 
 部署：`sks-ai` 镜像必须含 `ffmpeg` / `ffprobe`。
 
-内容安全 AK/SK（`ALIYUN_ACCESS_KEY_ID/SECRET`）与长转写解耦，不再因 ASR 需要 AppKey。
+依赖：长转写不再需要 `aliyun-python-sdk-core`（若无其他模块使用则可从 `pyproject` 移除）；内容安全若仍用 AK/SK + Green SDK，与 ASR 解耦保留。Dockerfile / 依赖变更在实现计划中单列。
+
+**成本与超时（设计级）**
+
+- 拆账号最坏：20 ×（下载 + 多段 Qwen），耗时与费用高于原 filetrans 直传；定价侧需在联调后粗算是否仍覆盖（记录在实现/运维笔记即可）。
+- 单条转写建议硬上限（如 15–20min，含切片），超时 → `DataSourceError`；整号任务继续靠心跳 + 既有 Java running 策略，避免无限挂起。
 
 ## 6. 里程碑范围（建议）
 
 ### 必达（同一 milestone 合入）
 
-1. 媒体管线 + Qwen 门面，filetrans 删除  
-2. 抖音：单视频（resolve + 转写）+ 拆账号（逐条 download_url）  
-3. 视频号：**单视频**（resolve + 下载/解码 + 转写）  
+1. 媒体管线 + Qwen 门面，filetrans 删除；asr 信号量  
+2. 抖音：单视频（resolve + 转写）+ 拆账号（逐条 download_url）；账号/precheck 仅抖音  
+3. 视频号：**单视频**（resolve + 下载/解码 + 转写）——以 §5.3 spike 通过为前提  
 4. 测试与文档/契约更新  
 
 ### 可砍（不堵必达）
 
-- **视频号拆账号**：若 TikHub 用户作品列表不稳定或字段不足，本里程碑只做单条；账号拆紧随下一小迭代。产品文案可暂仅暴露视频号「粘链接」。
+- **视频号拆账号**：列表不稳或字段不足则不做；产品勿暴露入口。  
+- **视频号单视频**：spike 失败时降级可砍，本 milestone 仍交付抖音双路径 + Qwen 硬切。
 
 ## 7. 失败与钱路
 
@@ -176,14 +220,21 @@ Java 侧退款 / poller 行为不改，仍依赖 Python 写 `failed`。
 | 风险 | 缓解 |
 |---|---|
 | TikHub 直链 403 | UA/Referer；抖音高清 URL fallback |
-| 视频号 decode 细节不清 | 联调样例驱动；单视频优先；账号可砍 |
-| Qwen 5min/10MB 限制 | 切片 + overlap 拼接（clever-hans 已验证思路） |
+| 视频号 decode 细节不清 | spike 门槛；失败则单视频可砍 |
+| Qwen ≤5min / ≤10MB | 时长切片 + 体积校验/再切；仍超则报错 |
 | 临时磁盘占满 | `finally` 清理；可选 `ASR_TMP_DIR` 监控 |
-| 与短 ASR 共 Key 被限流 | 分信号量；观测后再调并发 |
+| 与短 ASR 共 Key 被限流 | **asr 信号量 MVP 必做**；观测后再调 |
+| 拆账号成本/耗时上升 | 联调粗算；单条超时上限 |
+| `str` 误传分享链 | 契约单测锁定：分享链必须 `MediaRef` |
 
 ## 11. 决议摘要
 
 - 对齐 clever-hans **转写形态**，不对齐 yt-dlp。  
 - 长转写 = Qwen；短校准 = Paraformer；同一 DashScope Key。  
 - 硬切 filetrans。  
-- 必达三件套 + 视频号账号可砍。
+- 必达：抖音单视频 + 抖音拆账号 +（spike 通过后的）视频号单视频；视频号账号可砍；spike 失败则视频号单视频亦可砍。  
+- `transcribe(str)` = 直链 only；分享链必须先 `resolve_media`。
+
+## 12. 复盘补丁记录（2026-08-02）
+
+自审后合入：入参契约、管线分 A/B 入口、10MB 约束、账号仅抖音、视频号 decode spike 门槛、asr 信号量必做、成本/超时、前端联动、依赖/ffmpeg 说明。
