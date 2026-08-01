@@ -77,8 +77,13 @@ def _to_pcm(audio_bytes: bytes, source_fmt: str) -> tuple[bytes, str]:
         pcm_buf = io.BytesIO()
         audio.export(pcm_buf, format="raw")
         pcm_bytes = pcm_buf.getvalue()
-        log.warning("asr: converted %s(%s)→pcm (16kHz mono 16-bit): %d→%d bytes",
-                    source_fmt, container_fmt, len(audio_bytes), len(pcm_bytes))
+        log.debug(
+            "asr: converted %s(%s)→pcm: %d→%d bytes",
+            source_fmt,
+            container_fmt,
+            len(audio_bytes),
+            len(pcm_bytes),
+        )
         return pcm_bytes, "pcm"
     except Exception as e:
         log.warning("asr: pydub convert failed (%s→pcm), falling back to original: %s", source_fmt, e)
@@ -104,7 +109,7 @@ def _sync_transcribe(audio_bytes: bytes, fmt: str) -> str:
 
     class _Collector(RecognitionCallback):
         def on_open(self) -> None:  # noqa: D401
-            log.warning("asr callback: on_open")
+            log.debug("asr: on_open")
 
         def on_event(self, result) -> None:  # noqa: D401
             # dashscope RecognitionCallback 的钩子是 on_event（不是 on_result）。
@@ -120,12 +125,8 @@ def _sync_transcribe(audio_bytes: bytes, fmt: str) -> str:
                     isinstance(s, dict) and RecognitionResult.is_sentence_end(s)
                     for s in sentence
                 )
-            log.warning(
-                "asr callback: on_event text='%s' is_end=%s sentence=%s",
-                text[:100] if text else "(empty)",
-                is_end,
-                str(sentence)[:300],
-            )
+            # 中间包极密，只在 DEBUG 留一句；默认日志看最终 asr done 即可。
+            log.debug("asr: on_event is_end=%s text='%s'", is_end, (text[:80] if text else ""))
             if not text:
                 return
             # 中间包是同一句的增量草稿；句末才累加，避免 "你好"+"你好呀" 拼成重复。
@@ -137,15 +138,15 @@ def _sync_transcribe(audio_bytes: bytes, fmt: str) -> str:
 
         def on_error(self, result) -> None:  # noqa: D401
             collected["error"] = result
-            log.warning("asr callback: on_error type=%s", type(result).__name__)
+            log.warning("asr: on_error type=%s", type(result).__name__)
             done.set()
 
         def on_complete(self) -> None:  # noqa: D401
-            log.warning("asr callback: on_complete")
+            log.debug("asr: on_complete")
             done.set()
 
         def on_close(self) -> None:  # noqa: D401
-            log.warning("asr callback: on_close")
+            log.debug("asr: on_close")
             done.set()
 
     callback = _Collector()
@@ -182,9 +183,18 @@ def _sync_transcribe(audio_bytes: bytes, fmt: str) -> str:
         raise ASRRecognitionError(f"asr recognition error: {type(err_obj).__name__} attrs={str(err_dict)[:200]}")
     # 句末未到但已有 partial（超时/提前 close）时，用 partial 兜底，避免白白丢结果。
     result_text = collected["text"] or collected["partial"] or ""
-    log.warning("asr done: fmt=%s→%s, sr=%d, bytes=%d, text='%s', error=%s",
-               fmt, actual_fmt, sr, len(audio_data),
-               result_text[:100] if result_text else "(empty)", collected["error"])
+    # 成功一条 INFO；空结果升 WARNING（前端会当失败提示，便于对照）。
+    if result_text:
+        log.info(
+            "asr ok: %s→%s %dB → %d chars '%s'",
+            fmt,
+            actual_fmt,
+            len(audio_data),
+            len(result_text),
+            result_text[:80],
+        )
+    else:
+        log.warning("asr empty: %s→%s %dB (no text)", fmt, actual_fmt, len(audio_data))
     return result_text
 
 

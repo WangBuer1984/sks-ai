@@ -58,7 +58,8 @@ async def post_asr(audio: UploadFile = File(...)) -> ASRResponse:
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail={"error": "ASR_FAILED"},
         )
-    log.warning("asr endpoint result: fmt=%s, bytes=%d, text='%s'", fmt, len(audio_bytes), text[:100] if text else "(empty)")
+    # 明细已在 datasource 打过；端点只留 DEBUG，避免双份刷屏。
+    log.debug("asr endpoint: fmt=%s bytes=%d chars=%d", fmt, len(audio_bytes), len(text))
     return ASRResponse(text=text)
 
 
