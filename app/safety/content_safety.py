@@ -112,8 +112,15 @@ async def check(text: str, *, client: httpx.AsyncClient | None = None) -> bool:
         resp = await client.post(url, content=body, headers=_build_headers(body))
         resp.raise_for_status()
         return _is_safe(resp.json())
-    except httpx.HTTPError:
+    except httpx.HTTPError as e:
         # 网络层失败按不安全处理（保守：宁可让 Java 走重试/退款，也不放行未审内容）。
+        # 但先留痕——fail-closed 拦截所有内容时，没 log 无从排查是签名错还是内容命中。
+        import logging
+        logging.getLogger(__name__).warning(
+            "content safety check failed (fail-closed → blocked): %s | response=%s",
+            e,
+            getattr(e.response, "text", "")[:300] if hasattr(e, "response") else "no response",
+        )
         return False
     finally:
         if own:
