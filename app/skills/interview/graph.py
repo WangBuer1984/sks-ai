@@ -47,6 +47,7 @@ MAX_ROUNDS = 5
 # ---- 结构化输出 schema ----------------------------------------------------
 
 _GUESS_SCHEMA: dict[str, Any] = {
+    "title": "guess_persona",
     "type": "object",
     "properties": {
         "persona": {
@@ -63,6 +64,7 @@ _GUESS_SCHEMA: dict[str, Any] = {
 }
 
 _QUESTION_SCHEMA: dict[str, Any] = {
+    "title": "interview_question",
     "type": "object",
     "properties": {
         "question": {"type": "string", "description": "本轮访谈问题（简短、聚焦一个维度）"},
@@ -71,6 +73,7 @@ _QUESTION_SCHEMA: dict[str, Any] = {
 }
 
 SUMMARIZE_SCHEMA: dict[str, Any] = {
+    "title": "summarize_profile",
     "type": "object",
     "properties": {
         "profile": {
