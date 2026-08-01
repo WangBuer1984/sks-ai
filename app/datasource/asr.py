@@ -121,13 +121,11 @@ def _sync_transcribe(audio_bytes: bytes, fmt: str) -> str:
         # dashscope RecognitionResult 的 __str__ 有 bug（访问 .headers 崩），
         # 不能直接 %s 或 f-string 格式化——安全提取错误信息。
         err_obj = collected["error"]
-        err_type = type(err_obj).__name__
-        # 尝试安全提取错误码/message（不触发 __str__）
-        err_code = getattr(getattr(err_obj, 'output', None), 'code', None)
-        err_msg = getattr(getattr(err_obj, 'output', None), 'message', None)
-        err_str = f"{err_type}(code={err_code}, msg={err_msg})"
-        log.warning("asr recognition error: %s (fmt=%s, sr=%d)", err_str, actual_fmt, sr)
-        raise ASRRecognitionError(f"asr recognition error: {err_str}")
+        # dump 全部属性看实际结构
+        err_dict = {k: v for k, v in vars(err_obj).items() if not k.startswith('_')} if hasattr(err_obj, '__dict__') else {}
+        log.warning("asr recognition error: type=%s, attrs=%s (fmt=%s, sr=%d)",
+                    type(err_obj).__name__, str(err_dict)[:500], actual_fmt, sr)
+        raise ASRRecognitionError(f"asr recognition error: {type(err_obj).__name__} attrs={str(err_dict)[:200]}")
     result_text = collected["text"] or ""
     log.warning("asr done: fmt=%s→%s, sr=%d, bytes=%d, text='%s', error=%s",
                fmt, actual_fmt, sr, len(audio_data),
