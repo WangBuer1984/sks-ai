@@ -70,7 +70,14 @@ async def check(text: str, *, client=None) -> bool:
             {"content": text}, ensure_ascii=False,
         ))
         resp = await asyncio.to_thread(acs.do_action_with_exception, req)
-        return _is_safe(json.loads(resp.decode()))
+        body = json.loads(resp.decode())
+        safe = _is_safe(body)
+        if not safe:
+            log.warning(
+                "content safety blocked (suggestion != pass or format mismatch): %s",
+                json.dumps(body, ensure_ascii=False)[:500],
+            )
+        return safe
     except Exception as e:
         log.warning(
             "content safety check failed (fail-closed → blocked): %s",
