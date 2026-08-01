@@ -6,9 +6,12 @@
 SDK 选型：dashscope（阿里云百炼官方 SDK）的 paraformer-realtime-v2 实时识别，
 以同步收集模式封装（start → 喂完整段音频 → stop → 取累计文本）。
 
-<b>WebM → WAV 转码</b>：浏览器 MediaRecorder 恒发 audio/webm（Opus 编码 + WebM 容器）。
-paraformer-realtime-v2 不认 WebM 容器（只认原始 Opus 帧），直接喂 WebM 返空文本。
-用 pydub（依赖 ffmpeg）把 WebM → WAV（16kHz mono），再以 format=wav 送 paraformer。
+<b>WebM → PCM 转码</b>：浏览器 MediaRecorder 恒发 audio/webm（Opus 编码 + WebM 容器）。
+paraformer-realtime-v2 的 send_audio_frame 吃原始 PCM 帧，不认 WebM/WAV 容器头。
+用 pydub（依赖 ffmpeg）把 WebM → raw PCM（16kHz mono 16-bit），再以 format=pcm 送出。
+
+<b>回调契约</b>：dashscope ``RecognitionCallback`` 钩子是 ``on_event``（不是 ``on_result``）；
+``get_sentence()`` 返回 ``dict | list[dict]``，文本在 ``sentence["text"]``。
 """
 
 from __future__ import annotations
@@ -34,6 +37,25 @@ class ASRRecognitionError(RuntimeError):
 
 def _is_configured() -> bool:
     return bool(getattr(settings, "ALIYUN_ASR_KEY", ""))
+
+
+def _sentence_text(sentence: Any) -> str:
+    """从 dashscope get_sentence() 的返回值抽出文本。
+
+    SDK 契约是 Dict[str, Any] | List[Dict]，不是带 .text 属性的对象。
+    """
+    if sentence is None:
+        return ""
+    if isinstance(sentence, dict):
+        return str(sentence.get("text") or "")
+    if isinstance(sentence, list):
+        parts = [
+            str(s.get("text") or "")
+            for s in sentence
+            if isinstance(s, dict) and s.get("text")
+        ]
+        return "".join(parts)
+    return str(getattr(sentence, "text", "") or "")
 
 
 def _to_pcm(audio_bytes: bytes, source_fmt: str) -> tuple[bytes, str]:
@@ -69,7 +91,7 @@ def _sync_transcribe(audio_bytes: bytes, fmt: str) -> str:
     WebM/Opus 先转 WAV 再送（paraformer 不认 WebM 容器）。
     """
     import dashscope
-    from dashscope.audio.asr import Recognition, RecognitionCallback
+    from dashscope.audio.asr import Recognition, RecognitionCallback, RecognitionResult
 
     dashscope.api_key = settings.ALIYUN_ASR_KEY
 
@@ -77,27 +99,49 @@ def _sync_transcribe(audio_bytes: bytes, fmt: str) -> str:
     audio_data, actual_fmt = _to_pcm(audio_bytes, fmt)
     sr = 16000 if actual_fmt == "pcm" else 48000
 
-    collected: dict[str, Any] = {"text": "", "error": None}
+    collected: dict[str, Any] = {"text": "", "partial": "", "error": None}
     done = threading.Event()
 
     class _Collector(RecognitionCallback):
         def on_open(self) -> None:  # noqa: D401
             log.warning("asr callback: on_open")
 
-        def on_result(self, result) -> None:  # noqa: D401
-            # dump result 结构看实际字段（不触发 __str__）
-            r_type = type(result).__name__
-            r_dict = {k: v for k, v in vars(result).items() if not k.startswith('_')} if hasattr(result, '__dict__') else {}
-            sent = getattr(result, "get_sentence", lambda: None)()
-            sent_txt = getattr(sent, "text", "") if sent else ""
-            log.warning("asr callback: on_result type=%s, sent_text='%s', attrs=%s",
-                        r_type, str(sent_txt)[:100], str(r_dict)[:300])
-            if sent_txt:
-                collected["text"] += sent_txt
+        def on_event(self, result) -> None:  # noqa: D401
+            # dashscope RecognitionCallback 的钩子是 on_event（不是 on_result）。
+            # get_sentence() 返回 Dict 或 List[Dict]，字段是 sentence["text"]——
+            # 用 getattr(sent, "text") 对 dict 恒为空，会把真实识别结果吞掉。
+            sentence = result.get_sentence() if hasattr(result, "get_sentence") else None
+            text = _sentence_text(sentence)
+            is_end = False
+            if isinstance(sentence, dict):
+                is_end = RecognitionResult.is_sentence_end(sentence)
+            elif isinstance(sentence, list) and sentence:
+                is_end = all(
+                    isinstance(s, dict) and RecognitionResult.is_sentence_end(s)
+                    for s in sentence
+                )
+            log.warning(
+                "asr callback: on_event text='%s' is_end=%s sentence=%s",
+                text[:100] if text else "(empty)",
+                is_end,
+                str(sentence)[:300],
+            )
+            if not text:
+                return
+            # 中间包是同一句的增量草稿；句末才累加，避免 "你好"+"你好呀" 拼成重复。
+            if is_end or isinstance(sentence, list):
+                collected["text"] += text
+                collected["partial"] = ""
+            else:
+                collected["partial"] = text
 
         def on_error(self, result) -> None:  # noqa: D401
             collected["error"] = result
             log.warning("asr callback: on_error type=%s", type(result).__name__)
+            done.set()
+
+        def on_complete(self) -> None:  # noqa: D401
+            log.warning("asr callback: on_complete")
             done.set()
 
         def on_close(self) -> None:  # noqa: D401
@@ -137,7 +181,8 @@ def _sync_transcribe(audio_bytes: bytes, fmt: str) -> str:
         log.warning("asr recognition error: type=%s, attrs=%s (fmt=%s, sr=%d)",
                     type(err_obj).__name__, str(err_dict)[:500], actual_fmt, sr)
         raise ASRRecognitionError(f"asr recognition error: {type(err_obj).__name__} attrs={str(err_dict)[:200]}")
-    result_text = collected["text"] or ""
+    # 句末未到但已有 partial（超时/提前 close）时，用 partial 兜底，避免白白丢结果。
+    result_text = collected["text"] or collected["partial"] or ""
     log.warning("asr done: fmt=%s→%s, sr=%d, bytes=%d, text='%s', error=%s",
                fmt, actual_fmt, sr, len(audio_data),
                result_text[:100] if result_text else "(empty)", collected["error"])
