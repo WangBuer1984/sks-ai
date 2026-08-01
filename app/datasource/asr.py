@@ -82,20 +82,26 @@ def _sync_transcribe(audio_bytes: bytes, fmt: str) -> str:
 
     class _Collector(RecognitionCallback):
         def on_open(self) -> None:  # noqa: D401
-            pass
+            log.warning("asr callback: on_open")
 
         def on_result(self, result) -> None:  # noqa: D401
+            # dump result 结构看实际字段（不触发 __str__）
+            r_type = type(result).__name__
+            r_dict = {k: v for k, v in vars(result).items() if not k.startswith('_')} if hasattr(result, '__dict__') else {}
             sent = getattr(result, "get_sentence", lambda: None)()
-            if sent is not None:
-                txt = getattr(sent, "text", "") or ""
-                if txt:
-                    collected["text"] += txt
+            sent_txt = getattr(sent, "text", "") if sent else ""
+            log.warning("asr callback: on_result type=%s, sent_text='%s', attrs=%s",
+                        r_type, str(sent_txt)[:100], str(r_dict)[:300])
+            if sent_txt:
+                collected["text"] += sent_txt
 
         def on_error(self, result) -> None:  # noqa: D401
             collected["error"] = result
+            log.warning("asr callback: on_error type=%s", type(result).__name__)
             done.set()
 
         def on_close(self) -> None:  # noqa: D401
+            log.warning("asr callback: on_close")
             done.set()
 
     callback = _Collector()
@@ -107,7 +113,13 @@ def _sync_transcribe(audio_bytes: bytes, fmt: str) -> str:
     )
     try:
         recognition.start()
-        recognition.send_audio_frame(audio_data)
+        # 分批发送：paraformer 流式接口期望小帧（100ms = 3200 bytes @ 16kHz 16-bit mono）
+        chunk_size = 3200
+        for i in range(0, len(audio_data), chunk_size):
+            chunk = audio_data[i:i+chunk_size]
+            recognition.send_audio_frame(chunk)
+            import time
+            time.sleep(0.01)  # 10ms 间隔，给 paraformer 处理时间
         recognition.stop()
         if not done.wait(timeout=30.0):
             log.warning("asr timed out after 30s (fmt=%s, sr=%d, bytes=%d)", actual_fmt, sr, len(audio_data))
