@@ -71,7 +71,7 @@ async def check(text: str, *, client=None) -> bool:
             ensure_ascii=False,
         ))
         # AcsClient 是同步的——放线程里跑，不阻塞事件循环
-        resp = await asyncio.to_thread(acs.do_response_with_exception, req)
+        resp = await asyncio.to_thread(acs.do_action_with_exception, req)
         return _is_safe(json.loads(resp.decode()))
     except Exception as e:
         # fail-closed：宁可让 Java 走重试/退款，也不放行未审内容。
