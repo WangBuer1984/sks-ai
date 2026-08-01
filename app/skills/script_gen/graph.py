@@ -68,6 +68,7 @@ class ScriptGenState(TypedDict, total=False):
     topic: dict[str, Any]
     profile: dict[str, Any]
     platform: str
+    duration: str
     cards: list[Any]
     cited_card_ids: list[int]
     script: dict[str, Any]
@@ -83,6 +84,9 @@ def _build_messages(state: ScriptGenState) -> list[dict[str, str]]:
     topic = state["topic"]
     profile = state["profile"]
     platform = state["platform"]
+    duration_label = {"45": "45 秒口播", "90": "90 秒", "180": "3 分钟深度"}.get(
+        state.get("duration", "45"), "45 秒口播"
+    )
     cards = state.get("cards", [])
 
     profile_text = json.dumps(profile, ensure_ascii=False, indent=2) if profile else "（无定位档案）"
@@ -103,6 +107,7 @@ def _build_messages(state: ScriptGenState) -> list[dict[str, str]]:
     )
     user = (
         f"平台: {platform}\n"
+        f"目标时长: {duration_label}（按此时长控制篇幅与结构）\n"
         f"选题: {topic.get('title', '')}\n"
         f"选题理由: {topic.get('rationale', '')}\n"
         f"定位档案（A 层全量）:\n{profile_text}\n"
@@ -231,6 +236,7 @@ async def generate_script(
     topic: dict[str, Any],
     profile: dict[str, Any],
     platform: str,
+    duration: str = "45",
 ) -> dict[str, Any]:
     """文案生成入口：retrieve → generate → safety → (rewrite once) → done/blocked。
 
@@ -243,6 +249,7 @@ async def generate_script(
         "topic": topic,
         "profile": profile,
         "platform": platform,
+        "duration": duration,
         "rewrite_attempted": False,
         "safety_passed": False,
         "blocked": False,

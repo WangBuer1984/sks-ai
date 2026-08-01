@@ -31,6 +31,7 @@ class ScriptGenRequest(BaseModel):
     topic: TopicRequest
     profile: dict[str, Any] = Field(default_factory=dict)
     platform: str = "douyin"
+    duration: str = "45"  # '45'|'90'|'180'（秒）；45=45秒口播 90=90秒 180=3分钟深度
 
 
 class ScriptGenResponse(BaseModel):
@@ -48,6 +49,7 @@ async def post_script_gen(req: ScriptGenRequest) -> ScriptGenResponse:
         topic=req.topic.model_dump(),
         profile=req.profile,
         platform=req.platform,
+        duration=req.duration,
     )
     return ScriptGenResponse(**result)
 
