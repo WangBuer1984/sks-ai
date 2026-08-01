@@ -88,7 +88,7 @@ def _to_pcm(audio_bytes: bytes, source_fmt: str) -> tuple[bytes, str]:
 def _sync_transcribe(audio_bytes: bytes, fmt: str) -> str:
     """同步阻塞调用 dashscope paraformer-realtime-v2，收集完整文本后返回。
 
-    WebM/Opus 先转 WAV 再送（paraformer 不认 WebM 容器）。
+    WebM/Opus 先转 raw PCM 再送（流式接口不认容器头）。
     """
     import dashscope
     from dashscope.audio.asr import Recognition, RecognitionCallback, RecognitionResult
