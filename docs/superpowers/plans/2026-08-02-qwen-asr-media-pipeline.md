@@ -15,9 +15,13 @@
 - 业务热路径只传 `MediaRef`；`transcribe(str)` = 裸下载测试 seam，不猜平台、不补 headers。
 - ASR 失败 → `DataSourceError`，禁止静默空串。
 - `download.py` 不 import TikHub；高清 fallback 只在 resolve / 门面。
-- `_is_configured()` 长转写只查 `ALIYUN_ASR_KEY`；**不得**从 pyproject 移除 `aliyun-python-sdk-core`。
-- 两处 `_transcribe_with_heartbeat`（video + account）必须同 PR 改签名。
+- 长转写 `_is_configured()` 查 `ALIYUN_ASR_KEY` **且** `ffmpeg`/`ffprobe` 在 PATH（`shutil.which`）；缺失 → `DataSourceError`。**不得**从 pyproject 移除 `aliyun-python-sdk-core`。
+- `audio.py` 的 subprocess 失败必须翻译为 `DataSourceError`，禁止让 `FileNotFoundError` 冒泡成 skill 层泛型 Exception。
+- 两处 `_transcribe_with_heartbeat`（video + account）必须同 PR 改签名；**只改入参/调用点，保留 blocked / 双 except / per-item continue，禁止整函数重写。**
+- `VideoMeta.author` 从 aweme `author.nickname` 抽取并透传 MediaRef（路径 a）；禁止 author 字段恒 None。
 - 视频号单视频以 spike 通过为前提；失败则降级可砍，不阻塞抖音 + Qwen 硬切。
+- **Dockerfile 当前无 ffmpeg（必装）**——同时修复现有 `asr.py` webm→pcm（pydub）prod 路径。
+- `app/config.py` 由 Task 2（`ASR_TMP_DIR`）与 Task 9（AppKey 注释）**增量编辑**，勿互相覆盖。
 - 运行目录：`/Users/rick/work/sks-ai`；测试：`.venv/bin/python -m pytest …`
 
 ## File map
@@ -45,39 +49,53 @@
 
 ---
 
-### Task 1: MediaRef + 抖音默认 headers + `video_meta_to_media_ref`
+### Task 1: MediaRef + VideoMeta.author + `video_meta_to_media_ref`
 
 **Files:**
 - Create: `app/datasource/media/types.py`
 - Create: `app/datasource/media/__init__.py`
-- Modify: `app/datasource/tikhub.py`
-- Test: `tests/test_tikhub.py`（追加）或 `tests/test_media_ref.py`
+- Modify: `app/datasource/tikhub.py` — `VideoMeta` 加 `author`；`_parse_video` 抽 `author.nickname`；`video_meta_to_media_ref`
+- Test: `tests/test_media_ref.py`；必要时改 `tests/test_tikhub.py` 里构造 `VideoMeta(...)` 的调用（多一个字段）
 
 **Interfaces:**
 - Produces: `MediaRef(platform, download_url, headers=None, decode_key=None, title=None, author=None, raw_id=None)`
+- Produces: `VideoMeta(..., author: str = "")` — 从 aweme `author.nickname` / `author.nick_name` 抽取
 - Produces: `DOUYIN_DOWNLOAD_HEADERS: dict[str, str]`
-- Produces: `video_meta_to_media_ref(v: VideoMeta, *, author: str | None = None) -> MediaRef`
+- Produces: `video_meta_to_media_ref(v: VideoMeta) -> MediaRef` — `author=v.author`（不再靠外部 nickname 变量）
+
+**选定路径 (a)：** 扩展 `_parse_video`，禁止 author 恒 None。
 
 - [ ] **Step 1: 写失败测试**
 
 ```python
 # tests/test_media_ref.py
-from app.datasource.media.types import MediaRef
-from app.datasource.tikhub import VideoMeta, video_meta_to_media_ref, DOUYIN_DOWNLOAD_HEADERS
+from app.datasource.tikhub import VideoMeta, video_meta_to_media_ref, DOUYIN_DOWNLOAD_HEADERS, _parse_video
 
-def test_video_meta_to_media_ref_fills_douyin_headers_and_title():
-    v = VideoMeta(title="你好", play_count=1, fav_count=2, download_url="https://cdn.example/a.mp4")
-    ref = video_meta_to_media_ref(v, author="张三")
+def test_parse_video_extracts_author_nickname():
+    item = {
+        "desc": "标题",
+        "statistics": {"play_count": 1, "digg_count": 2},
+        "video": {"play_addr": {"url_list": ["https://cdn.example/a.mp4"]}},
+        "author": {"nickname": "张三"},
+    }
+    v = _parse_video(item)
+    assert v.author == "张三"
+    assert v.title == "标题"
+
+def test_video_meta_to_media_ref_fills_headers_title_author():
+    v = VideoMeta(
+        title="你好", play_count=1, fav_count=2,
+        download_url="https://cdn.example/a.mp4", author="张三",
+    )
+    ref = video_meta_to_media_ref(v)
     assert ref.platform == "douyin"
-    assert ref.download_url == v.download_url
-    assert ref.title == "你好"
     assert ref.author == "张三"
+    assert ref.title == "你好"
     assert ref.headers["Referer"] == "https://www.douyin.com/"
     assert "User-Agent" in ref.headers
-    assert DOUYIN_DOWNLOAD_HEADERS["Referer"] == "https://www.douyin.com/"
 ```
 
-- [ ] **Step 2: Run — expect FAIL（符号未定义）**
+- [ ] **Step 2: Run — expect FAIL**
 
 ```bash
 .venv/bin/python -m pytest tests/test_media_ref.py -v
@@ -86,58 +104,50 @@ def test_video_meta_to_media_ref_fills_douyin_headers_and_title():
 - [ ] **Step 3: 实现**
 
 ```python
-# app/datasource/media/types.py
-from __future__ import annotations
-from dataclasses import dataclass, field
+# types.py — MediaRef 含 author: str | None = None
+```
 
+```python
 @dataclass
-class MediaRef:
-    platform: str  # "douyin" | "wechat_channels"
+class VideoMeta:
+    title: str
+    play_count: int
+    fav_count: int
     download_url: str
-    headers: dict[str, str] = field(default_factory=dict)
-    decode_key: str | None = None
-    title: str | None = None
-    author: str | None = None
-    raw_id: str | None = None
-```
+    author: str = ""  # NEW — aweme author.nickname
 
-```python
-# app/datasource/media/__init__.py
-from app.datasource.media.types import MediaRef
-__all__ = ["MediaRef"]
-```
+def _parse_video(item: dict) -> VideoMeta:
+    stats = item.get("statistics") or {}
+    play_addr = (item.get("video") or {}).get("play_addr") or {}
+    url_list = play_addr.get("url_list") or []
+    author_obj = item.get("author") or {}
+    author = str(author_obj.get("nickname") or author_obj.get("nick_name") or "")
+    return VideoMeta(
+        title=str(item.get("desc") or ""),
+        play_count=int(stats.get("play_count") or 0),
+        fav_count=int(stats.get("digg_count") or 0),
+        download_url=str(url_list[0]) if url_list else "",
+        author=author,
+    )
 
-在 `tikhub.py` 增加：
-
-```python
-from app.datasource.media.types import MediaRef
-
-DOUYIN_DOWNLOAD_HEADERS: dict[str, str] = {
-    "User-Agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-    ),
-    "Referer": "https://www.douyin.com/",
-}
-
-def video_meta_to_media_ref(v: VideoMeta, *, author: str | None = None) -> MediaRef:
+def video_meta_to_media_ref(v: VideoMeta) -> MediaRef:
     return MediaRef(
         platform="douyin",
         download_url=v.download_url,
         headers=dict(DOUYIN_DOWNLOAD_HEADERS),
         title=v.title or None,
-        author=author,
+        author=v.author or None,
     )
 ```
 
-- [ ] **Step 4: Run — PASS**
+`DOUYIN_DOWNLOAD_HEADERS` 同前（UA + Referer）。
+
+- [ ] **Step 4: 修现有测试里 `VideoMeta(...)` 构造（若位置参数被打乱，改用关键字）— PASS**
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add app/datasource/media/types.py app/datasource/media/__init__.py \
-  app/datasource/tikhub.py tests/test_media_ref.py
-git commit -m "feat: MediaRef + video_meta_to_media_ref（抖音默认 headers）"
+git commit -m "feat: MediaRef + VideoMeta.author + video_meta_to_media_ref"
 ```
 
 ---
@@ -146,7 +156,7 @@ git commit -m "feat: MediaRef + video_meta_to_media_ref（抖音默认 headers�
 
 **Files:**
 - Create: `app/datasource/media/download.py`
-- Modify: `app/config.py` — 增加可选 `ASR_TMP_DIR: str = ""`
+- Modify: `app/config.py` — **仅**增加可选 `ASR_TMP_DIR: str = ""`（AppKey 注释留给 Task 9，勿在此大改 config）
 - Test: `tests/test_media_download.py`
 
 **Interfaces:**
@@ -215,9 +225,13 @@ def test_merge_transcript_parts_overlap():
 
 实现直接移植 clever-hans `pipeline.py` 的 `_merge_transcript_parts` / `_find_overlap_text`（`max_len = min(..., 50)`）。
 
-- [ ] **Step 2: audio 单测** — 若 CI 无 ffmpeg，用 `monkeypatch` mock `asyncio.to_thread` / subprocess；本地有 ffmpeg 可加 integration 标 `@pytest.mark.skipif(not shutil.which("ffmpeg"))`。
+- [ ] **Step 2: audio 单测** — 若 CI 无 ffmpeg，用 `monkeypatch` mock `asyncio.to_thread` / subprocess；本地有 ffmpeg 可加 `@pytest.mark.skipif(not shutil.which("ffmpeg"))`。
 
 `convert_to_wav` / `slice_audio` 参考 clever-hans `audio.py`（`ffmpeg -ar 16000 -ac 1 -vn`；切片 `-ss/-t`）。
+
+**失败语义（必做）：** `FileNotFoundError`（无 ffmpeg）/ 非 0 退出 / timeout → 一律 `raise DataSourceError("ffmpeg …")`，禁止裸 subprocess 异常冒泡。
+
+**切片体积注：** `segment_duration=270` → 16k mono PCM ≈ 8.24MB &lt; 10MB，单段天然满足 qwen 体积上限，无需再给每段加 10MB 守卫。
 
 - [ ] **Step 3: PASS + Commit**
 
@@ -227,7 +241,7 @@ git commit -m "feat: media audio convert/slice + clever-hans merge"
 
 ---
 
-### Task 4: `qwen_asr.py`（失败抛 DataSourceError，不对齐 clever-hans 空串降级）
+### Task 4: `qwen_asr.py` + 三路信号量
 
 **Files:**
 - Create: `app/datasource/media/qwen_asr.py`
@@ -238,41 +252,39 @@ git commit -m "feat: media audio convert/slice + clever-hans merge"
 - Produces: `MODEL_NAME = "qwen3-asr-flash"`
 - Produces: `async def recognize_wav(wav_path: Path | str, *, title: str | None = None, author: str | None = None) -> str`
 - Produces: `get_asr_semaphore() -> asyncio.Semaphore`（默认 3）
+- Produces: `get_download_semaphore() -> asyncio.Semaphore`（默认 5）
+- Produces: `get_convert_semaphore() -> asyncio.Semaphore`（默认 4）
 
 - [ ] **Step 1: 写失败测试**
 
 ```python
 async def test_recognize_wav_success(monkeypatch):
-    # monkeypatch MultiModalConversation.call 返回 status_code=200 + text
     text = await recognize_wav("/tmp/x.wav", title="题", author="作者")
     assert text == "识别结果"
 
-async def test_recognize_wav_all_retries_raise(monkeypatch):
-    # 三次失败 → DataSourceError，不是 ""
+async def test_recognize_wav_transient_retries_then_raises(monkeypatch):
+    # MultiModalConversation.call 连续抛 RuntimeError / 非 200 → 共 3 次后 DataSourceError
+    # 不是返回 ""
+
+async def test_recognize_wav_empty_text_no_retry(monkeypatch):
+    # status_code=200 但无文本 → 立即 DataSourceError("qwen asr empty text")，call 次数 == 1
 ```
 
-- [ ] **Step 2: 实现** — 对齐 clever-hans 调用形态，但第 3 次失败 `raise DataSourceError(...)`：
+- [ ] **Step 2: 实现重试策略（写死）**
 
-```python
-dashscope.api_key = settings.ALIYUN_ASR_KEY
-messages = [{"role": "user", "content": [{"audio": f"file://{wav_path}"}]}]
-# system: "这是一段短视频音频。\n视频标题: …\n作者: …"
-response = MultiModalConversation.call(
-    model=MODEL_NAME,
-    messages=messages,
-    stream=False,
-    incremental_output=False,
-    result_format="message",
-    asr_options={"language": "zh", "enable_lid": True},
-)
-```
+| 情况 | 行为 |
+|---|---|
+| 非 200 / 网络 / `RuntimeError` 等瞬态 | 最多 3 次尝试，耗尽 → `DataSourceError` |
+| 200 但解析后空文本 | **不重试**，立即 `DataSourceError("qwen asr empty text")` |
 
-空文本（200 但无字）→ `DataSourceError("qwen asr empty text")`。
+调用形态对齐 clever-hans（`file://` + `asr_options={language:zh, enable_lid:True}` + system 标题/作者）。**禁止** clever-hans 式空串降级。
+
+`semaphores.py`：三个懒单例 getter（模块级 `None`，首次创建）。
 
 - [ ] **Step 3: PASS + Commit**
 
 ```bash
-git commit -m "feat: qwen3-asr-flash recognize_wav（失败抛 DataSourceError）"
+git commit -m "feat: qwen3-asr-flash + download/convert/asr 信号量"
 ```
 
 ---
@@ -282,74 +294,100 @@ git commit -m "feat: qwen3-asr-flash recognize_wav（失败抛 DataSourceError�
 **Files:**
 - Rewrite: `app/datasource/transcribe.py`
 - Rewrite: `tests/test_transcribe.py`
-- Modify: `app/config.py` — `ALIYUN_ASR_KEY` 注释标明 DashScope；`ALIYUN_ASR_APP_KEY` 标 deprecated（可留字段以免旧 .env 炸）
+- `app/config.py` — **本 Task 可不改**；DashScope/AppKey 注释归 Task 9（避免与 Task 2 冲突）
 
 **Interfaces:**
 - Produces: `async def transcribe(media: MediaRef | str) -> str`
-- Produces: `def _is_configured() -> bool` — 仅 `bool(settings.ALIYUN_ASR_KEY)`
-- Seams（供测试 monkeypatch）：`download_url` / `convert_to_wav` / `get_audio_duration` / `slice_audio` / `recognize_wav` / `merge_transcript_parts` / `gc_stale_tmp`
+- Produces: `def _is_configured() -> bool` — `ALIYUN_ASR_KEY` **且** `shutil.which("ffmpeg")` **且** `shutil.which("ffprobe")`
+- Produces: 模块级 `decode_media: Callable[[Path, str], Path] | None = None` — 可插拔；Task 8a 注入，默认 None
+- Seams：`download_url` / `convert_to_wav` / `get_audio_duration` / `slice_audio` / `recognize_wav` / `merge_transcript_parts` / `gc_stale_tmp` / `get_*_semaphore`
 
 - [ ] **Step 1: 重写测试（不再 mock POP）**
 
 ```python
 async def test_transcribe_media_ref_short_audio(monkeypatch, tmp_path):
     monkeypatch.setattr(settings, "ALIYUN_ASR_KEY", "sk-test")
-    wav = tmp_path / "a.wav"; wav.write_bytes(b"x")
+    monkeypatch.setattr(tr, "_ffmpeg_available", lambda: True)  # 或 which mock
     # mock download→path, convert→wav, duration=10.0, recognize→"你好"
-    ref = MediaRef(platform="douyin", download_url="https://x/a.mp4", headers={...})
+    ref = MediaRef(platform="douyin", download_url="https://x/a.mp4",
+                   headers={"Referer": "https://www.douyin.com/"}, author="张三")
     assert await tr.transcribe(ref) == "你好"
 
 async def test_transcribe_str_is_bare_download_no_headers_guess(monkeypatch, tmp_path):
-    # 捕获 download_url 调用：headers 必须是 None 或 {}
-    ...
+    # 捕获 download_url：headers 必须是 None 或 {}
 
-async def test_transcribe_slices_when_duration_over_300(monkeypatch, tmp_path):
-    # duration=400 → slice 返回 2 段 → recognize 两次 → merge
+async def test_transcribe_slices_when_duration_over_300(monkeypatch, tmp_path): ...
 
-async def test_transcribe_wav_over_10mb_short_duration_errors(monkeypatch, tmp_path):
-    # duration=10, wav.stat().st_size = 11*1024*1024 → DataSourceError
+async def test_transcribe_wav_over_10mb_short_duration_errors(monkeypatch, tmp_path): ...
 
-async def test_transcribe_not_configured(monkeypatch):
+async def test_transcribe_not_configured_missing_key(monkeypatch):
     monkeypatch.setattr(settings, "ALIYUN_ASR_KEY", "")
     with pytest.raises(DataSourceError, match="ALIYUN_ASR_KEY"):
         await tr.transcribe("https://x")
+
+async def test_transcribe_not_configured_missing_ffmpeg(monkeypatch):
+    monkeypatch.setattr(settings, "ALIYUN_ASR_KEY", "sk-test")
+    monkeypatch.setattr(tr, "_ffmpeg_available", lambda: False)
+    with pytest.raises(DataSourceError, match="ffmpeg"):
+        await tr.transcribe("https://x")
+
+async def test_transcribe_decode_key_without_decoder_errors(monkeypatch, tmp_path):
+    # decode_key set, decode_media is None → DataSourceError("channels decode not enabled")
 ```
 
-- [ ] **Step 2: 实现门面伪码**
+- [ ] **Step 2: 实现门面**
 
 ```python
+import shutil
+from app.datasource.media.semaphores import (
+    get_asr_semaphore, get_download_semaphore, get_convert_semaphore,
+)
+
+decode_media = None  # Task 8a: 赋值为 channels decode 函数
+
+def _ffmpeg_available() -> bool:
+    return bool(shutil.which("ffmpeg") and shutil.which("ffprobe"))
+
+def _is_configured() -> bool:
+    return bool(settings.ALIYUN_ASR_KEY) and _ffmpeg_available()
+
 async def transcribe(media: MediaRef | str) -> str:
-    if not _is_configured():
+    if not settings.ALIYUN_ASR_KEY:
         raise DataSourceError("ALIYUN_ASR_KEY not configured")
+    if not _ffmpeg_available():
+        raise DataSourceError("ffmpeg/ffprobe not found on PATH")
     gc_stale_tmp()
     ref = media if isinstance(media, MediaRef) else MediaRef(
         platform="unknown", download_url=media, headers={}
     )
     temps: list[Path] = []
     try:
-        async with download_sem:
+        async with get_download_semaphore():
             src = await download_url(ref.download_url, headers=ref.headers or None)
         temps.append(src)
         if ref.decode_key:
-            src = decode_channels_media(src, ref.decode_key)  # Task 7；无则 stub raise
+            if decode_media is None:
+                raise DataSourceError("channels decode not enabled")
+            src = decode_media(src, ref.decode_key)
             temps.append(src)
-        async with convert_sem:
+        async with get_convert_semaphore():
             wav = await convert_to_wav(src)
         temps.append(wav)
         duration = get_audio_duration(wav)
         size = wav.stat().st_size
+        # 整段守卫；切片单段 270s≈8.24MB 天然 <10MB，无需逐段再检
         if duration > 0 and duration <= 300 and size > 10 * 1024 * 1024:
             raise DataSourceError("wav exceeds 10MB within 300s — unexpected")
-        ctx = {"title": ref.title, "author": ref.author}
         if duration > 0 and duration <= 300:
-            async with asr_sem:
+            async with get_asr_semaphore():
                 text = await recognize_wav(wav, title=ref.title, author=ref.author)
         else:
-            segs = await slice_audio(wav)
+            async with get_convert_semaphore():
+                segs = await slice_audio(wav)
             temps.extend(segs)
             parts = []
             for seg in segs:
-                async with asr_sem:
+                async with get_asr_semaphore():
                     parts.append(await recognize_wav(seg, title=ref.title, author=ref.author))
             text = merge_transcript_parts(parts)
         if not text.strip():
@@ -363,9 +401,9 @@ async def transcribe(media: MediaRef | str) -> str:
                 pass
 ```
 
-单条墙钟上限：可用 `asyncio.wait_for(transcribe_inner(...), timeout=1200)` 或在门面最外层 20min。
+单条墙钟上限：外层 `asyncio.wait_for(..., timeout=1200)`（20min）。
 
-删除全部 filetrans / `AcsClient` / `_submit_task` / `_get_task_result` 代码与模块 docstring 中的 ISI 描述。
+删除全部 filetrans / `AcsClient` / `_submit_task` / `_get_task_result`。
 
 - [ ] **Step 3: PASS + Commit**
 
@@ -386,30 +424,60 @@ git commit -m "feat: transcribe 门面硬切 Qwen 管线（删除 filetrans）"
 - Produces: `async def resolve_media(url: str, *, client=None) -> MediaRef`
 - Heartbeat: `async def _transcribe_with_heartbeat(task_id: int, media: MediaRef | str) -> str`
 
+**锚点（LOAD-BEARING）：** 仅插入 `resolve_media` + 改 heartbeat 入参 `url→media`；**保留**现有 `await _structure_transcript(transcript)`、`result is None → failed(blocked)`、`except DataSourceError → failed`、`except Exception → failed`、`done` 路径。**禁止**用 `...` 整段重写 `analyze_video_link`。注意：链接路径用的是 **`_structure_transcript`**，不是同步入口 `structure_video`。
+
 - [ ] **Step 1: `resolve_media` 测试**
 
-- 抖音分享链 host（`v.douyin.com` / `douyin.com` / `iesdouyin.com`）→ 调现有 `video_meta` 逻辑 → `video_meta_to_media_ref`。
+- 抖音 host → `video_meta` → `video_meta_to_media_ref`（含 author）。
 - 未知 URL → `DataSourceError`。
-- `play_addr`/`download_url` 为空时：在 `_parse_video` / resolve 内尝试高清播放接口（若本期不加接口，至少 download_url 空 → `DataSourceError("empty download_url")`）。高清 fallback 实现可作为本 Task 子步骤；路径常量加到 tikhub 顶部。
+- `download_url` 空 → `DataSourceError("empty download_url")`（高清 fallback 可选子步骤）。
 
-- [ ] **Step 2: 改 `video_analyze/graph.py`**
+- [ ] **Step 2: 最小 diff 改 `video_analyze/graph.py`**
 
 ```python
 from app.datasource.tikhub import resolve_media
+from app.datasource.media.types import MediaRef
+
+# 模块级别名供测试 monkeypatch：
+# resolve_media = resolve_media  （或 from tikhub import resolve_media as resolve_media）
 
 async def _transcribe_with_heartbeat(task_id: int, media: MediaRef | str) -> str:
     task = asyncio.create_task(transcribe(media))
-    # …原 60s 循环不变
+    # 原 60s shield 循环一字不改
 
 async def analyze_video_link(task_id: int, url: str) -> None:
     await update_task(task_id, status="running", progress=0)
     try:
-        ref = await resolve_media(url)
-        transcript = await _transcribe_with_heartbeat(task_id, ref)
+        ref = await resolve_media(url)                    # NEW
+        transcript = await _transcribe_with_heartbeat(task_id, ref)  # was url
+        result = await _structure_transcript(transcript)  # KEEP
+    except DataSourceError as e:                         # KEEP
         ...
+    # 其余 blocked / Exception / done 全部 KEEP
 ```
 
-- [ ] **Step 3: 更新 `test_video_analyze`** — mock `resolve_media` + `transcribe`（或只 mock 模块级 `transcribe` 且让 resolve 也 mock）。确认不再把原始分享链直接 `transcribe(url)`。
+- [ ] **Step 3: 测试 mock 写死**
+
+```python
+async def fake_resolve(url: str, **kwargs):
+    return MediaRef(
+        platform="douyin",
+        download_url="https://cdn.example/a.mp4",
+        headers={"Referer": "https://www.douyin.com/"},
+        title="t", author="a",
+    )
+
+monkeypatch.setattr(vg, "resolve_media", fake_resolve)  # 必须，否则真打 TikHub
+captured = {}
+async def fake_transcribe(media):
+    captured["media"] = media
+    return "转写文本"
+monkeypatch.setattr(vg, "transcribe", fake_transcribe)
+# 跑 analyze_video_link 后：
+assert isinstance(captured["media"], MediaRef)
+assert captured["media"].download_url.startswith("https://cdn")
+# 不得把原始分享链传入 transcribe
+```
 
 - [ ] **Step 4: PASS + Commit**
 
@@ -425,24 +493,29 @@ git commit -m "feat: resolve_media + 单视频链接先解析再转写"
 - Modify: `app/skills/account_analyze/graph.py`
 - Test: `tests/test_account_analyze.py`
 
-- [ ] **Step 1: 改 heartbeat 签名与逐条调用**
+**锚点（LOAD-BEARING）：** 仅改 heartbeat 签名 + 循环内 `v.download_url` → `video_meta_to_media_ref(v)`；**保留** per-item `except DataSourceError: continue`、`except Exception: continue`、`if not await check: continue`、progress/partial/failed 逻辑。**禁止**重写 `analyze_account` 函数体。
+
+- [ ] **Step 1: 最小 diff**
 
 ```python
 from app.datasource.tikhub import video_meta_to_media_ref
+from app.datasource.media.types import MediaRef
 
 async def _transcribe_with_heartbeat(task_id: int, media: MediaRef | str) -> str:
     task = asyncio.create_task(transcribe(media))
-    ...
+    # 原 60s 循环 KEEP
 
-# 在 analyze_account 循环内（原 v.download_url 处）：
-author = ...  # 若已有昵称变量则传入；否则 None
-ref = video_meta_to_media_ref(v, author=author)
+# 循环内原：
+#   transcript = await _transcribe_with_heartbeat(task_id, v.download_url)
+# 改为：
+ref = video_meta_to_media_ref(v)  # author 已在 VideoMeta（Task 1）
 transcript = await _transcribe_with_heartbeat(task_id, ref)
+# 其后 except / check / insert_benchmark 全部 KEEP
 ```
 
-- [ ] **Step 2: `precheck` / 账号入口平台门禁** — 若 URL 像视频号，`account_top_videos` / `precheck` 抛 `DataSourceError("account analyze supports douyin only; use video link for channels")`。可用简单 host 检测函数 `_platform_of(url) -> str` 与 `resolve_media` 共用。
+- [ ] **Step 2: 平台门禁** — `precheck` / `account_top_videos`：视频号 host → `DataSourceError("account analyze supports douyin only; use video link for channels")`。与 `resolve_media` 共用 `_platform_of(url)`。
 
-- [ ] **Step 3: 测试小改 — PASS + Commit**
+- [ ] **Step 3: 测试** — mock `transcribe` 时断言入参为 `MediaRef` 且 `author`/`headers` 来自 fixture VideoMeta。PASS + Commit
 
 ```bash
 git commit -m "feat: 拆账号 VideoMeta→MediaRef + heartbeat 签名同步"
@@ -461,12 +534,12 @@ git commit -m "feat: 拆账号 VideoMeta→MediaRef + heartbeat 签名同步"
 
 用真实 `TIKHUB_API_KEY` 调 `POST /api/v1/wechat_channels/v2/fetch_video_detail`，保存脱敏样例：`media` URL、`decode_key` 是否为空、解码算法。
 
-- [ ] **Step 2a: Spike 成功** — 实现 `channels_video_meta` + decode；`resolve_media` 识别 `weixin.qq.com/sph` / `channels.weixin.qq.com`；单测 mock 响应；commit。
+- [ ] **Step 2a: Spike 成功** — 实现 `channels_video_meta` + decode 函数；在 `transcribe` 模块赋值 `decode_media = channels_decode_fn`（见 Task 5 可插拔 seam）；`resolve_media` 识别视频号 host；单测 mock；commit。
 
-- [ ] **Step 2b: Spike 失败** — 在 design/plan 勾选「视频号单视频可砍」；`resolve_media` 对视频号 URL 返回明确 `DataSourceError("wechat channels not enabled yet")`；**不阻塞** Task 5–7 合入。
+- [ ] **Step 2b: Spike 失败** — 勾选可砍；`resolve_media` 对视频号 → `DataSourceError("wechat channels not enabled yet")`；**保持** `decode_media = None`（门面遇 `decode_key` 已报 `channels decode not enabled`）。**不阻塞** Task 5–7。
 
 ```bash
-git commit -m "feat: 视频号单视频 resolve+decode" 
+git commit -m "feat: 视频号单视频 resolve+decode"
 # 或
 git commit -m "chore: 视频号 spike 未过，单视频入口明确报错（可砍）"
 ```
@@ -476,30 +549,40 @@ git commit -m "chore: 视频号 spike 未过，单视频入口明确报错（可
 ### Task 9: 配置 / Docker / 清单文档
 
 **Files:**
-- Modify: `app/config.py`, `sks-ai/.env.example`, `sks-ai/Dockerfile`
+- Modify: `app/config.py`（**增量**：DashScope/AppKey 注释；勿删 Task 2 的 `ASR_TMP_DIR`）
+- Modify: `sks-ai/.env.example`, `sks-ai/Dockerfile`
 - Modify: `sks-agent/.env.example`, `sks-agent/deploy/GO_LIVE_CHECKLIST.md`（**另仓 commit**）
-- `sks-ai/docs/API_CONTRACT.md` — **仅核对** `/ai/asr` 503 仍对应 `ALIYUN_ASR_KEY`，不写 filetrans
+- `sks-ai/docs/API_CONTRACT.md` — **仅核对** `/ai/asr` 503 ↔ `ALIYUN_ASR_KEY`
 
-- [ ] **Step 1: `config.py`**
+- [ ] **Step 1: `config.py` 注释**
 
 ```python
-# 一句话识别 + 长转写（qwen3-asr-flash）共用——此值为 DashScope/百炼 API Key，非阿里云 ISI。
+# 一句话识别 + 长转写（qwen3-asr-flash）共用——DashScope/百炼 API Key，非阿里云 ISI。
 ALIYUN_ASR_KEY: str = ""
-ASR_TMP_DIR: str = ""  # 可选；空则用系统 tempfile
-# ALIYUN_ASR_APP_KEY: deprecated — 长转写已改 Qwen，勿再依赖；字段可留空兼容旧 .env
+# ASR_TMP_DIR 已由 Task 2 加入——此处勿覆盖
+# ALIYUN_ASR_APP_KEY: deprecated — 长转写已改 Qwen；字段保留兼容旧 .env
 ALIYUN_ASR_APP_KEY: str = ""
 ```
 
-- [ ] **Step 2: Dockerfile** — 确保安装 `ffmpeg`（`apt-get install -y ffmpeg` 或等价）。
+- [ ] **Step 2: Dockerfile（必做，当前镜像无 ffmpeg）**
 
-- [ ] **Step 3: GO_LIVE** — 删除/改写 `ALIYUN_ASR_APP_KEY` 与 filetrans 检查项；增加：`ALIYUN_ASR_KEY`（DashScope）、镜像含 ffmpeg、长转写 Qwen 管线联调。
+现状：`FROM python:3.12-slim` + uv，**无** `apt-get`。必须增加，例如：
+
+```dockerfile
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+```
+
+（放在 `uv sync` 前或后均可，建议靠前。）
+
+**连带修复：** 现有 `asr.py` webm→pcm（pydub）在 prod 也依赖 ffmpeg；GO_LIVE 已标「第一处会坏」。本步同时修短 ASR prod 路径。
+
+- [ ] **Step 3: GO_LIVE** — 删/改 `ALIYUN_ASR_APP_KEY` 与 filetrans；加 `ALIYUN_ASR_KEY`（DashScope）、镜像含 ffmpeg、Qwen 长转写联调；保留/强化短 ASR webm 联检（ffmpeg 已装后应可勾）。
 
 - [ ] **Step 4: Commit（sks-ai + sks-agent 分别）**
 
 ```bash
-# sks-ai
-git commit -m "chore: ASR 配置注释/ffmpeg/废弃 AppKey 文档"
-
+git commit -m "chore: Dockerfile 安装 ffmpeg；废弃 ASR AppKey 文档"
 # sks-agent
 git commit -m "chore: GO_LIVE 长转写改为 Qwen + ffmpeg"
 ```
@@ -508,24 +591,23 @@ git commit -m "chore: GO_LIVE 长转写改为 Qwen + ffmpeg"
 
 ### Task 10: 全量回归 + 联调核对清单
 
-- [ ] **Step 1: 单元测试**
+- [ ] **Step 1: 单元测试（全量，防 config 波及 content_safety 等）**
 
 ```bash
 cd /Users/rick/work/sks-ai
-.venv/bin/python -m pytest tests/test_media_ref.py tests/test_media_download.py \
-  tests/test_media_audio_merge.py tests/test_media_qwen_asr.py tests/test_transcribe.py \
-  tests/test_tikhub.py tests/test_video_analyze.py tests/test_account_analyze.py -q
+.venv/bin/python -m pytest tests/ -q
 ```
 
 Expected: all PASS
 
 - [ ] **Step 2: 联调 checklist（人工）**
 
-1. 无 `ALIYUN_ASR_APP_KEY`，仅 `ALIYUN_ASR_KEY` + `TIKHUB_API_KEY`，抖音单视频粘链接成功。
-2. 抖音拆账号 ≥1 条转写成功（观察 headers 无 403）。
-3. 单条墙钟 >5min 时 Java 不误判 failed（心跳续命）。
-4. （可选）DashScope 并发压测，调整 `ASR_CONCURRENCY`（若做成 settings，默认 3）。
+1. 无 `ALIYUN_ASR_APP_KEY`，仅 `ALIYUN_ASR_KEY` + `TIKHUB_API_KEY`，抖音单视频成功。
+2. 抖音拆账号 ≥1 条成功；日志/抓包确认带 Referer；`author` 非空时进 Qwen context。
+3. 单条墙钟 >5min 时 Java 不误判 failed（两处 heartbeat 60s）。
+4. DashScope 并发压测，标定 asr 信号量。
 5. 视频号：spike 路径或明确错误文案。
+6. 校准短 ASR（webm）在新镜像上冒烟一次（ffmpeg 连带修复）。
 
 - [ ] **Step 3: 最终 commit（若有压测参数调整）**
 
@@ -535,33 +617,48 @@ Expected: all PASS
 
 | Spec 要求 | Task |
 |---|---|
-| MediaRef + headers/author | 1, 7 |
+| MediaRef + headers/author（`_parse_video` 抽 nickname） | 1, 6, 7 |
 | download 纯下载 + GC | 2 |
-| wav/slice/merge | 3 |
-| qwen3-asr-flash + asr_options | 4 |
-| 硬切 filetrans 门面 | 5 |
-| 单视频 resolve | 6 |
-| 拆账号 MediaRef + 双 heartbeat | 6–7 |
+| wav/slice/merge；subprocess→DataSourceError | 3 |
+| qwen3-asr-flash + asr_options；瞬态重试/空文本不重试 | 4 |
+| 硬切 filetrans；ffmpeg 守卫；decode 可插拔 | 5 |
+| 单视频 resolve；保留 `_structure_transcript`/blocked/except | 6 |
+| 拆账号 MediaRef；双 heartbeat；保留 per-item continue | 6, 7 |
 | 视频号 spike/可砍 | 8 |
-| 不删 aliyun-sdk；ACCESS_KEY 留给安全 | 5, 9 |
-| GO_LIVE / .env / ffmpeg | 9 |
+| 不删 aliyun-sdk；ACCESS_KEY 留给安全 | 9 |
+| Dockerfile ffmpeg（兼修 asr.py）；GO_LIVE / .env | 9 |
 | API_CONTRACT 不改实现描述 | 9 |
 | 失败不空串；str 裸下载 | 4, 5 |
-| Java timeout 默认不改 | 6 心跳保留 60s |
+| Java timeout 默认不改 | **6 与 7** 心跳均保 60s |
 
 ## Placeholder scan
 
-无 TBD；视频号 decode 算法以 Task 8 spike 产出为准（允许 2b 可砍分支）。
+无 TBD；视频号 decode 以 Task 8 spike 为准（2b 可砍）。`decode_media` 默认可插拔，不引用未定义符号。
+
+## Plan review patch（2026-08-02）
+
+采纳执行前审查：
+
+| ID | 决议 |
+|---|---|
+| P1-1 | `_is_configured` + audio 均把 ffmpeg 缺失/失败 → `DataSourceError` |
+| P1-2 | 路径 (a)：`VideoMeta.author` ← `author.nickname` |
+| P1-3 | Task 6/7 锚点：禁止整函数重写；保留 blocked/except/continue |
+| P2-1 | 瞬态最多 3 次；空文本立即失败不重试 |
+| P2-2 | 测试写死 mock `resolve_media` + 断言 `MediaRef` |
+| P2-3 | `decode_media` 可插拔 seam；注释 Task 8 |
+| P2-4 | 三路 semaphore getter |
+| P3-* | Dockerfile 必装 ffmpeg；全量 pytest；coverage 表 6+7；`_structure_transcript` 正名；config 增量编辑 |
 
 ---
 
 ## Execution handoff
 
-Plan complete and saved to `docs/superpowers/plans/2026-08-02-qwen-asr-media-pipeline.md`.
+Plan patched and saved to `docs/superpowers/plans/2026-08-02-qwen-asr-media-pipeline.md`.
 
 **Two execution options:**
 
 1. **Subagent-Driven（推荐）** — 每 Task 新开子代理，Task 间审查  
-2. **Inline Execution** — 本会话按 executing-plans 连续做并设检查点  
+2. **Inline Execution** — 本会话连续做并设检查点  
 
 Which approach?
