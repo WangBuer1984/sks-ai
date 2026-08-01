@@ -65,7 +65,7 @@ VideoMeta
   → transcribe(MediaRef)  # 禁止裸 str 进拆账号热路径；download.py 保持平台无感
 ```
 
-兼容：`transcribe(str)` 仍保留作测试/内部 seam，语义为「已是直链」；门面可把 str 提升为带抖音默认 headers 的 MediaRef。**业务拆账号必须走 MediaRef**，避免丢 headers/title。
+兼容：`transcribe(str)` 仍保留作测试/内部 seam，语义为「已是直链、裸下载」——**不**猜平台、**不**自动补 headers。**业务拆账号必须走 MediaRef**。
 
 **`transcribe` 内部（A/B 汇合后）**
 
@@ -91,7 +91,7 @@ HTTP 下载到临时目录（decode_key 非空则解码）
 |---|---|
 | `app/datasource/media/download.py` | **纯下载**：给定最终 URL + headers → 临时文件；超时/非 2xx → `DataSourceError`。**不**调用 TikHub，**不**做高清 fallback |
 | `app/datasource/media/audio.py` | `convert_to_wav` / `get_audio_duration` / `slice_audio`；依赖本机 ffmpeg/ffprobe |
-| `app/datasource/media/qwen_asr.py` | `qwen3-asr-flash`（DashScope `MultiModalConversation` + `file://`）；可选 context（title）；重试 ≤3；仍失败 → `DataSourceError` |
+| `app/datasource/media/qwen_asr.py` | `qwen3-asr-flash`（DashScope `MultiModalConversation` + `file://{wav_path}`）；`asr_options` / system 消息对齐 clever-hans：`{"language":"zh","enable_lid":True}`；system 拼「视频标题 / 作者」作 context；重试 ≤3；仍失败 → `DataSourceError` |
 | `app/datasource/media/merge.py`（或放 `transcribe.py` 内私有） | 分段文本拼接：对齐 clever-hans `_merge_transcript_parts` / `_find_overlap_text`（字符串最长公共前后缀，非时间戳） |
 | `app/datasource/media/__init__.py` | 包导出（按需） |
 
@@ -122,8 +122,8 @@ async def transcribe(media: MediaRef | str) -> str:
 
 | 类型 | 含义 | 行为 |
 |---|---|---|
-| `MediaRef` | 已 resolve / 已装配的媒体描述 | 用其 `download_url` / headers / decode_key / title；**业务热路径（单视频+拆账号）只走此类型** |
-| `str` | **已是可下载直链**（测试/兼容 seam） | **禁止** `resolve_media`；门面可提升为带抖音默认 headers 的 MediaRef；**拆账号业务不得依赖裸 str** |
+| `MediaRef` | 已 resolve / 已装配的媒体描述 | 用其字段见下；**业务热路径（单视频+拆账号）只走此类型** |
+| `str` | **已是可下载直链**（测试/兼容 seam） | **禁止** `resolve_media`；**不**按 host 猜平台、**不**自动补抖音 headers（裸下载）；需要 headers/title/author 时调用方必须传 `MediaRef`。**拆账号业务不得依赖裸 str** |
 
 分享链必须由调用方 `resolve_media` → `MediaRef` 后再进门面；禁止把分享链当 `str` 传入。
 
@@ -138,8 +138,9 @@ async def transcribe(media: MediaRef | str) -> str:
 | 现有 `video_meta` / `account_top_videos` | 抖音单条 / TOP N，`download_url` |
 | 新增 `channels_video_meta(...)` | 视频号：`POST/GET` TikHub `wechat_channels/v2/fetch_video_detail` → `media` + `decode_key` + 标题类字段 |
 | 新增 `resolve_media(url) -> MediaRef` | URL 形态判定平台并分发；未知 → `DataSourceError` |
+| 新增 `video_meta_to_media_ref(v, *, author=None) -> MediaRef` | **放 `tikhub.py`**：`VideoMeta` → `MediaRef`，写入抖音默认 headers、`title=v.title`、可选 `author`（拆账号传入账号名） |
 
-`MediaRef` 建议字段：`platform`, `download_url`, `headers`（可选）, `decode_key`（可选）, `title`（可选）, `raw_id`（可选）。
+`MediaRef` 字段：`platform`, `download_url`, `headers`（可选）, `decode_key`（可选）, `title`（可选）, `author`（可选，供 Qwen system context「作者: …」）, `raw_id`（可选）。
 
 **抖音 headers / `play_addr` fallback 归属（LOAD-BEARING）**
 
@@ -158,9 +159,10 @@ async def transcribe(media: MediaRef | str) -> str:
 **`VideoMeta` 与 `MediaRef`**
 
 - 允许并存：`VideoMeta` 继续服务拆账号列表解析（字段：`title` / `play_count` / `fav_count` / `download_url`）。
-- 拆账号逐条（**选定路径 b**）：`video_meta_to_media_ref(v) → MediaRef(download_url, headers=抖音默认, title=v.title)` → `transcribe(MediaRef)`。  
-  **不**走裸 `transcribe(v.download_url)`，以免丢防 403 headers 与 title context。  
-  **不**把平台判定塞进 `download.py`。
+- 拆账号逐条（**选定路径 b**）：`video_meta_to_media_ref(v, author=账号名) → MediaRef(...)` → `transcribe(MediaRef)`。  
+  **不**走裸 `transcribe(v.download_url)`，以免丢防 403 headers 与 title/author context。  
+  **不**把平台判定塞进 `download.py`。  
+  `author`：拆账号场景几乎免费（主页/sec_user 解析可得）；单视频 `resolve_media` 若 TikHub 返回作者则填，否则可空。
 
 ### 5.4 调用方
 
@@ -168,7 +170,7 @@ async def transcribe(media: MediaRef | str) -> str:
 |---|---|
 | `analyze_video_link(task_id, url)` | `ref = await resolve_media(url)` → `_transcribe_with_heartbeat(task_id, ref)` |
 | `analyze_account` / `precheck` | **仅抖音**。视频号主页/未知平台 → `DataSourceError`（文案引导改用单视频粘链接） |
-| `analyze_account` 逐条 | `ref = video_meta_to_media_ref(v)` → `_transcribe_with_heartbeat(task_id, ref)` |
+| `analyze_account` 逐条 | `ref = video_meta_to_media_ref(v, author=账号名)` → `_transcribe_with_heartbeat(task_id, ref)` |
 | `structure_video` / 粘文案 | 不动 |
 | `asr.py` / `/ai/asr` | 不动（仍用 `settings.ALIYUN_ASR_KEY`；本期不重命名） |
 
@@ -328,3 +330,14 @@ Java 侧退款 / poller 行为不改，仍依赖 Python 写 `failed`。
 | P1-4 | 命名债 + 不重命名原因（`asr.py`）写清 |
 | P3-1 | 细化：重写 `test_transcribe.py`；video/account 测试改动面小 |
 | P3-3 | ACCESS_KEY 保留给内容安全；仅从长转写 `_is_configured` 摘除 |
+
+## 15. 外部引用验证 + P3 润色（2026-08-02）
+
+外部断言已核对通过：Java `updated_at` 停滞 5min、clever-hans merge（50 字 overlap 上限 / 200 搜索窗）、`qwen3-asr-flash` + `file://` + `MultiModalConversation`。
+
+| ID | 决议 |
+|---|---|
+| P3-a | `MediaRef.author?`；`video_meta_to_media_ref(..., author=)` 填账号名 |
+| P3-b | `qwen_asr`：`asr_options={language:zh, enable_lid:True}` + system 标题/作者，对齐 clever-hans |
+| P3-c | `video_meta_to_media_ref` **明确放 `tikhub.py`** |
+| P3-d | `str` seam = 裸下载，不猜平台、不补 headers |
