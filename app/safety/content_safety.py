@@ -54,6 +54,9 @@ async def check(text: str, *, client=None) -> bool:
     AcsClient.do_action_with_exception 是同步——用 asyncio.to_thread 不阻塞事件循环。
     失败（网络/签名/内容命中）按不安全处理（fail-closed），但留痕排查。
     """
+    if not text or not text.strip():
+        # 空文本无需审核（Aliyun API 对空内容返回 400 "content is blank" → 误拦截）
+        return True
     if not settings.ALIYUN_ACCESS_KEY_ID or not settings.ALIYUN_ACCESS_KEY_SECRET:
         log.warning("content safety skip: ALIYUN AK not configured (fail-closed → blocked)")
         return False

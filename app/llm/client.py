@@ -27,9 +27,7 @@ def _default_factory(spec: ModelSpec) -> ChatOpenAI:
         #  将越过 Java 270s read-timeout，触发对仍在重试的 Python 打 AI_FAILED 的 #1 风险）。
         # 与 Java AiClient 对 ResourceAccessException 的传输层重试正交（不同层），两者并存。
         max_retries=1,
-        model_kwargs={
-            "extra_body": {"thinking": {"type": "enabled" if spec.thinking else "disabled"}}
-        },
+        extra_body={"thinking": {"type": "enabled" if spec.thinking else "disabled"}},
     )
 
 
