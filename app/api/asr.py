@@ -77,4 +77,8 @@ def _infer_format(audio: UploadFile) -> str:
         return "opus"
     if "m4a" in ct or name.endswith(".m4a"):
         return "m4a"
+    # webm 容器里的音频通常是 Opus 编码 → paraformer 按 opus 格式解。
+    # 前端 MediaRecorder 恒发 audio/webm（Chrome/Firefox 默认），此前无此分支 → fallback wav → ASR 失败。
+    if "webm" in ct or name.endswith(".webm"):
+        return "opus"
     return "wav"
