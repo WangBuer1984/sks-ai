@@ -20,6 +20,7 @@ dependencies = [
     # 阿里云 ISI 录音文件识别（长音频异步批量，filetrans POP API）——AcsClient+CommonRequest。
     # lazy-import：未配置 key 时不触发加载，per-request 失败。
     "aliyun-python-sdk-core>=2.16",
+    "pydub>=0.25",
     # FastAPI 文件上传（/ai/asr multipart）所需。
     "python-multipart>=0.0.6",
 ]
