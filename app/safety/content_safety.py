@@ -25,7 +25,7 @@ log = logging.getLogger(__name__)
 _DOMAIN = "green-cip.cn-shanghai.aliyuncs.com"
 _VERSION = "2022-03-02"
 _ACTION = "TextModeration"
-_SERVICE = "content_detection"
+_SERVICE = "comment_detection"
 
 
 def _is_safe(body: dict) -> bool:
