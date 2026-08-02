@@ -181,7 +181,7 @@ async def test_transcribe_decode_key_without_decoder_errors(monkeypatch, tmp_pat
 async def test_transcribe_timeout_raises_datasource_error(monkeypatch, tmp_path):
     cap = _common_seams(monkeypatch, tmp_path)
     # 极短超时 + 慢 recognize → wait_for 必然超时。
-    monkeypatch.setattr(tr, "_TRANSCRIBE_TIMEOUT", 0.01)
+    monkeypatch.setattr(tr, "_TRANSCRIBE_TIMEOUT", 0.05)
 
     async def _slow_recognize(wav_path, *, title=None, author=None):
         await asyncio.sleep(1.0)

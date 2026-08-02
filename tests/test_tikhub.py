@@ -14,13 +14,17 @@ import pytest
 
 from app.config import settings
 from app.datasource import DataSourceError
+from app.datasource.media import MediaRef
 from app.datasource.tikhub import (
+    DOUYIN_DOWNLOAD_HEADERS,
     HotItem,
     VideoMeta,
     _base_url,
+    _platform_of,
     account_top_videos,
     hot_board,
     precheck,
+    resolve_media,
     video_meta,
 )
 
@@ -431,3 +435,83 @@ async def test_get_json_does_not_retry_on_business_code_failure(monkeypatch):
     finally:
         await client.aclose()
     assert calls["n"] == 1, "business-code failure must not be retried"
+
+
+# ---- resolve_media：分享/短链 → MediaRef ----------------------------------
+
+async def test_platform_of_detects_douyin_hosts():
+    # 抖音分享短链 + 主域 + iesdouyin 变体均识别为 douyin。
+    assert _platform_of("https://v.douyin.com/abc/") == "douyin"
+    assert _platform_of("https://www.douyin.com/video/123") == "douyin"
+    assert _platform_of("https://www.iesdouyin.com/share/x") == "douyin"
+    # 微信视频号 host（Task 7 平台门预留）
+    assert _platform_of("https://channels.weixin.qq.com/x") == "wechat_channels"
+    # 未知 host
+    assert _platform_of("https://example.com/v") == "unknown"
+    assert _platform_of("not-a-url") == "unknown"
+
+
+async def test_resolve_media_douyin_calls_video_meta_and_returns_media_ref(monkeypatch):
+    """抖音 host → 调 video_meta → video_meta_to_media_ref（含 author + 新鲜头）。"""
+    monkeypatch.setattr(settings, "TIKHUB_API_KEY", "tk-test-key")
+    import app.datasource.tikhub as tikhub_mod
+
+    captured: dict = {}
+
+    async def _fake_video_meta(url, *, client=None):
+        captured["url"] = url
+        captured["client"] = client
+        return VideoMeta(
+            title="a video",
+            play_count=10,
+            fav_count=2,
+            download_url="https://dl/v1.mp4",
+            author="作者甲",
+        )
+
+    monkeypatch.setattr(tikhub_mod, "video_meta", _fake_video_meta)
+
+    ref = await resolve_media("https://v.douyin.com/abc")
+
+    assert isinstance(ref, MediaRef)
+    assert ref.platform == "douyin"
+    assert ref.download_url == "https://dl/v1.mp4"
+    # 抖音下载头注入（新鲜 dict，非模块级共享对象）
+    assert ref.headers == DOUYIN_DOWNLOAD_HEADERS
+    assert ref.headers is not DOUYIN_DOWNLOAD_HEADERS
+    assert ref.headers["Referer"] == "https://www.douyin.com/"
+    assert ref.author == "作者甲"
+    assert ref.title == "a video"
+    assert captured["url"] == "https://v.douyin.com/abc"
+
+
+async def test_resolve_media_unknown_host_raises_datasource_error(monkeypatch):
+    monkeypatch.setattr(settings, "TIKHUB_API_KEY", "tk-test-key")
+    import app.datasource.tikhub as tikhub_mod
+
+    called = {"n": 0}
+
+    async def _fail_video_meta(url, *, client=None):
+        called["n"] += 1
+        return VideoMeta("", 0, 0, "")
+
+    monkeypatch.setattr(tikhub_mod, "video_meta", _fail_video_meta)
+
+    with pytest.raises(DataSourceError, match="unsupported"):
+        await resolve_media("https://example.com/v")
+    # 未知平台不得调 video_meta（短路在平台门）
+    assert called["n"] == 0
+
+
+async def test_resolve_media_empty_download_url_raises_datasource_error(monkeypatch):
+    """video_meta 解析成功但 download_url 空 → DataSourceError（高清 fallback 地板）。"""
+    monkeypatch.setattr(settings, "TIKHUB_API_KEY", "tk-test-key")
+    import app.datasource.tikhub as tikhub_mod
+
+    async def _empty_video_meta(url, *, client=None):
+        return VideoMeta(title="t", play_count=0, fav_count=0, download_url="", author="")
+
+    monkeypatch.setattr(tikhub_mod, "video_meta", _empty_video_meta)
+
+    with pytest.raises(DataSourceError, match="empty download_url"):
+        await resolve_media("https://v.douyin.com/abc")

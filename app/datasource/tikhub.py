@@ -29,6 +29,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
+from urllib.parse import urlparse
 
 import httpx
 
@@ -315,3 +316,39 @@ async def hot_board(*, client: httpx.AsyncClient | None = None) -> list[HotItem]
     finally:
         if own:
             await client.aclose()
+
+
+def _platform_of(url: str) -> str:
+    """URL host → 平台标识（"douyin" / "wechat_channels" / "unknown"）。
+
+    供 Task 6 ``resolve_media`` 与 Task 7 账号分析平台门复用——单一 host 归类源，
+    避免 resolve_media 与 Task 7 各写一份正则导致口径漂移。
+    """
+    host = (urlparse(url).hostname or "").lower()
+    if not host:
+        return "unknown"
+    if host.endswith("douyin.com") or host.endswith("iesdouyin.com"):
+        return "douyin"
+    if host.endswith("weixin.qq.com"):
+        return "wechat_channels"
+    return "unknown"
+
+
+async def resolve_media(url: str, *, client: httpx.AsyncClient | None = None) -> MediaRef:
+    """分享/短链 URL → ``MediaRef``（含下载直链 + 平台必带头 + author/title）。
+
+    抖音 host → 调现有 ``video_meta(url, client=client)`` → ``video_meta_to_media_ref``；
+    未知平台 → ``DataSourceError("unsupported url ...")``；
+    ``video_meta`` 解析成功但 ``download_url`` 为空 → ``DataSourceError("empty download_url")``
+    （高清 fallback 接口可选，本任务不实现——此即地板）。
+
+    本函数是 ``analyze_video_link`` 与 ``transcribe`` 之间的解析 seam：把原始分享链
+    解析成 ``MediaRef`` 后，**原始分享链不再向下游传递**——``transcribe`` 只见直链 + 头。
+    """
+    platform = _platform_of(url)
+    if platform != "douyin":
+        raise DataSourceError(f"resolve_media: unsupported url {url}")
+    vm = await video_meta(url, client=client)
+    if not vm.download_url:
+        raise DataSourceError("resolve_media: empty download_url")
+    return video_meta_to_media_ref(vm)
