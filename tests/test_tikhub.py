@@ -258,30 +258,6 @@ async def test_precheck_unreachable_when_sec_user_id_missing(monkeypatch):
     assert result["video_count"] == 0
 
 
-async def test_precheck_channels_id_miss_returns_unreachable(monkeypatch):
-    """username=None 必须短路，不得再打 fetch_user_videos。"""
-    monkeypatch.setattr(settings, "TIKHUB_API_KEY", "tk")
-    calls = {"id": 0, "videos": 0}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path.endswith("fetch_channel_id_to_username"):
-            calls["id"] += 1
-            return httpx.Response(200, json={"code": 200, "data": {
-                "channel_id": "sphNope123456", "username": None, "error": "not found",
-            }})
-        if request.url.path.endswith("fetch_user_videos"):
-            calls["videos"] += 1
-            return httpx.Response(200, json={"code": 200, "data": {"videos": [{"media": {}}]}})
-        return httpx.Response(500, text=f"unexpected {request.url.path}")
-
-    client = _mock_client(handler)
-    r = await precheck("sphNope123456", client=client)  # 满足 sph regex
-    assert r == {"reachable": False, "video_count": 0}
-    assert calls["id"] == 1
-    assert calls["videos"] == 0  # miss 短路：禁止再拉作品列表
-    await client.aclose()
-
-
 async def test_precheck_channels_share_home_count_no_pagination(monkeypatch):
     monkeypatch.setattr(settings, "TIKHUB_API_KEY", "tk")
     calls = {"videos": 0}
@@ -307,7 +283,7 @@ async def test_precheck_channels_share_home_count_no_pagination(monkeypatch):
 
 
 async def test_precheck_unknown_host_returns_unreachable_no_http_no_raise(monkeypatch):
-    """unknown 入口（裸 channels host 缺 /sph/、not-a-url）→ unreachable dict，不抛、不打 HTTP。"""
+    """unknown 入口（裸 channels host 缺 /sph/、not-a-url、裸 sph 短号）→ unreachable dict，不抛、不打 HTTP。"""
     monkeypatch.setattr(settings, "TIKHUB_API_KEY", "tk")
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -316,6 +292,9 @@ async def test_precheck_unknown_host_returns_unreachable_no_http_no_raise(monkey
     client = _mock_client(handler)
     r = await precheck("https://channels.weixin.qq.com/no-sph-here", client=client)
     assert r == {"reachable": False, "video_count": 0}
+    # 裸 sph 短号走 unknown（不发 HTTP），也 unreachable
+    r2 = await precheck("sphi9BjV8GK0Zsl", client=client)
+    assert r2 == {"reachable": False, "video_count": 0}
     await client.aclose()
 
 
@@ -659,57 +638,6 @@ async def test_resolve_media_channels_dispatches_to_channels_video_meta(monkeypa
 
 # ---- Task 7 平台门禁：account_top_videos / precheck 抖音 only --------------
 
-async def test_account_top_videos_channels_id_paginates_until_n_or_max_pages(monkeypatch):
-    monkeypatch.setattr(settings, "TIKHUB_API_KEY", "tk")
-    pages_hit = {"n": 0}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        path = request.url.path
-        if path.endswith("fetch_channel_id_to_username"):
-            return httpx.Response(200, json={"code": 200, "data": {
-                "channel_id": "sphi9BjV8GK0Zsl",
-                "username": "v2_abc@finder",
-                "nickname": "人民日报",
-            }})
-        if path.endswith("fetch_user_videos"):
-            pages_hit["n"] += 1
-            body = json.loads(request.content.decode())
-            assert body["raw"] is False
-            assert body["username"] == "v2_abc@finder"
-            # 每页 6 条；第 4 页仍 up_continue，但 max_pages=4 应停 → 最多 24，再切到 n=20
-            vids = [{
-                "id": f"id-{pages_hit['n']}-{i}",
-                "title": f"t{i}",
-                "nickname": "人民日报",
-                "read_count": 10,
-                "fav_count": 1,
-                "like_count": 9,
-                "media": {
-                    "full_url": f"http://cdn/{pages_hit['n']}-{i}.mp4",
-                    "decode_key": f"k-{pages_hit['n']}-{i}",
-                },
-            } for i in range(6)]
-            return httpx.Response(200, json={"code": 200, "data": {
-                "username": "v2_abc@finder",
-                "nickname": "人民日报",
-                "videos": vids,
-                "up_continue": True,
-                "last_buffer": f"buf{pages_hit['n']}",
-            }})
-        return httpx.Response(404, json={"code": 404})
-
-    client = _mock_client(handler)
-    videos = await account_top_videos("sphi9BjV8GK0Zsl", n=20, client=client)
-    assert len(videos) == 20
-    assert pages_hit["n"] <= 4
-    assert videos[0].platform == "wechat_channels"
-    assert videos[0].decode_key == "k-1-0"
-    assert videos[0].download_url.endswith("1-0.mp4")
-    assert videos[0].play_count == 10  # read_count 代理
-    assert videos[0].fav_count == 1    # fav 优先于 like
-    await client.aclose()
-
-
 async def test_account_top_videos_channels_share_uses_video_detail_username(monkeypatch):
     monkeypatch.setattr(settings, "TIKHUB_API_KEY", "tk")
     def handler(request: httpx.Request) -> httpx.Response:
@@ -759,14 +687,16 @@ def test_video_meta_to_media_ref_channels_keeps_decode_key_pair():
     assert ref.author == "胖掌柜"
 
 
-# ---- _account_entry_kind：拆账号入口分类（含裸 sph）-----------------------
+# ---- _account_entry_kind：拆账号入口分类 ---------------------------------
 
 def test_account_entry_kind_classifies_inputs():
     assert _account_entry_kind("https://v.douyin.com/abc/") == "douyin"
-    assert _account_entry_kind("sphi9BjV8GK0Zsl") == "channels_id"
     assert _account_entry_kind("https://weixin.qq.com/sph/ADk6xBh2hq") == "channels_share"
-    assert _account_entry_kind("  sphABC_123  ") == "channels_id"
     assert _account_entry_kind("not-a-url") == "unknown"
     assert _account_entry_kind("https://example.com/x") == "unknown"
+    # 裸 sph 短号不再识别为 channels_id（TikHub fetch_channel_id_to_username 对任意 sph
+    # 派生 @finder username，无法识别 bogus）→ 走 unknown，不发 HTTP。
+    assert _account_entry_kind("sphi9BjV8GK0Zsl") == "unknown"
+    assert _account_entry_kind("  sphABC_123  ") == "unknown"
     # 裸串不得崩
-    assert _account_entry_kind("sph") == "unknown"  # 过短 / 不匹配完整 pattern 则 unknown；按 ^sph[A-Za-z0-9_-]+$，「sph」仅前缀不够 → unknown
+    assert _account_entry_kind("sph") == "unknown"

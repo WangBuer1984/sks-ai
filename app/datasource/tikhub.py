@@ -64,7 +64,6 @@ _PATH_USER_POST_VIDEOS = "/api/v1/douyin/app/v3/fetch_user_post_videos"
 _PATH_ONE_VIDEO_BY_SHARE = "/api/v1/douyin/web/fetch_one_video_by_share_url"
 _PATH_HOT_TOTAL_LIST = "/api/v1/douyin/billboard/fetch_hot_total_list"
 _PATH_CHANNELS_VIDEO_DETAIL = "/api/v1/wechat_channels/v2/fetch_video_detail"
-_PATH_CHANNELS_ID_TO_USER = "/api/v1/wechat_channels/v2/fetch_channel_id_to_username"
 _PATH_CHANNELS_USER_VIDEOS = "/api/v1/wechat_channels/v2/fetch_user_videos"
 
 # 视频号账号视频列表翻页硬上限：即使 up_continue 恒真，最多拉 4 页（避免账号视频数
@@ -271,7 +270,7 @@ async def account_top_videos(url: str, n: int = 20, *, client: httpx.AsyncClient
     """取账号主页 Top N 视频（按 TikHub 返回顺序，默认 20 条）。
 
     按 ``_account_entry_kind(url)`` 分发：douyin 短链 → ``_resolve_sec_user_id`` +
-    ``fetch_user_post_videos``；视频号 sph 短号 / 分享链 → ``_resolve_channels_username``
+    ``fetch_user_post_videos``；视频号分享链 → ``_resolve_channels_username``
     + ``fetch_user_videos`` 翻页（硬上限 ``_CHANNELS_MAX_PAGES``）。未知入口 → DataSourceError。
 
     未配置 TIKHUB_API_KEY → DataSourceError（懒初始化失败，per-request，不阻断 import）。
@@ -299,7 +298,7 @@ async def account_top_videos(url: str, n: int = 20, *, client: httpx.AsyncClient
             items = data.get("aweme_list") or data.get("list") or []
             videos = [_parse_video(it) for it in items[:n]]
             return videos
-        # channels_id / channels_share → 视频号账号视频列表
+        # channels_share → 视频号账号视频列表
         username = await _resolve_channels_username(client, kind, url)
         if not username:
             raise DataSourceError(f"account_top_videos: cannot resolve channels username from {url}")
@@ -334,19 +333,10 @@ async def account_top_videos(url: str, n: int = 20, *, client: httpx.AsyncClient
 async def _resolve_channels_username(client: httpx.AsyncClient, kind: str, raw: str) -> str | None:
     """视频号账号入口 → username。
 
-    channels_id（裸 ``sph…`` 短号）→ ``fetch_channel_id_to_username``，校验 username
-    以 ``@finder`` 结尾（视频号账号标识），否则视为未解析。channels_share（分享链）
-    → 复用 ``fetch_video_detail``，从单视频响应取 ``data.username``（不经 media）。
-    其余 kind → None（不应被调用，``account_top_videos`` 已 dispatch）。
+    channels_share（分享链）→ 复用 ``fetch_video_detail``，从单视频响应取
+    ``data.username``（不经 media）。其余 kind → None（不应被调用，
+    ``account_top_videos`` 已 dispatch）。
     """
-    if kind == "channels_id":
-        body = await _post_json(
-            client,
-            _PATH_CHANNELS_ID_TO_USER,
-            {"channel_id": raw.strip(), "raw": False},
-        )
-        u = (body.get("data") or {}).get("username")
-        return u if isinstance(u, str) and u.endswith("@finder") else None
     if kind == "channels_share":
         body = await _post_json(
             client,
@@ -414,7 +404,7 @@ async def precheck(url: str, *, client: httpx.AsyncClient | None = None) -> dict
 
     按 ``_account_entry_kind(url)`` 分发：douyin → ``_resolve_sec_user_id`` +
     ``fetch_user_post_videos``（count=20，与 ``account_top_videos`` 默认 ``n=20``
-    对齐）；视频号 sph 短号 / 分享链 → ``_resolve_channels_username`` +
+    对齐）；视频号分享链 → ``_resolve_channels_username`` +
     ``fetch_user_videos`` **单页**（不翻页，仅取首页条数估规模）。未配置 /
     入口未知 / 解析 miss → ``{"reachable": False, "video_count": 0}``（不抛）。
 
@@ -443,7 +433,7 @@ async def precheck(url: str, *, client: httpx.AsyncClient | None = None) -> dict
             data = body.get("data") or {}
             items = data.get("aweme_list") or data.get("list") or []
             return {"reachable": True, "video_count": len(items)}
-        if kind in ("channels_id", "channels_share"):
+        if kind == "channels_share":
             username = await _resolve_channels_username(client, kind, url)
             if not username:
                 return {"reachable": False, "video_count": 0}
@@ -505,32 +495,24 @@ def _platform_of(url: str) -> str:
     return "unknown"
 
 
-# 视频号账号短号（sph 前缀 + ≥1 字符）。裸串无 host/scheme，必须在 host 检测之前匹配，
-# 否则 ``urlparse("sphi9BjV8GK0Zsl").hostname`` 返回 None —— 虽不报错但会被归为 unknown。
-_SPH_ID_RE = re.compile(r"^sph[A-Za-z0-9_-]+$")
-
-
 def _account_entry_kind(
     raw: str,
-) -> Literal["douyin", "channels_id", "channels_share", "unknown"]:
-    """拆账号入口分类：区分抖音短链 / 视频号 sph 短号 / 视频号分享页 / 未知。
+) -> Literal["douyin", "channels_share", "unknown"]:
+    """拆账号入口分类：区分抖音短链 / 视频号分享页 / 未知。
 
     account_top_videos / precheck 据此分发到对应平台取数路径。与 ``_platform_of``
-    不同：后者只做 host 归类，无法识别裸 ``sph…`` 短号，也无法区分 channels_id
-    与 channels_share（均为 weixin.qq.com host）。两者共存，职责互补。
+    不同：后者只做 host 归类，无法区分 channels_share 与其它 weixin.qq.com 入口
+    （如裸 channels host）。两者共存，职责互补。
 
     顺序约束（load-bearing）：
       1. strip + 空串 → unknown；
-      2. ``_SPH_ID_RE.fullmatch`` 命中 → channels_id（裸 sph 短号无 host，须先判）；
-      3. douyin host → douyin；
-      4. weixin.qq.com host 且 path 含 ``/sph/`` → channels_share；
-      5. 其余 → unknown。
+      2. douyin host → douyin；
+      3. weixin.qq.com host 且 path 含 ``/sph/`` → channels_share；
+      4. 其余 → unknown（含裸 ``sph…`` 短号：``urlparse`` 无 host/scheme → unknown）。
     """
     s = (raw or "").strip()
     if not s:
         return "unknown"
-    if _SPH_ID_RE.fullmatch(s):
-        return "channels_id"
     host = (urlparse(s).hostname or "").lower()
     if host.endswith("douyin.com") or host.endswith("iesdouyin.com"):
         return "douyin"
