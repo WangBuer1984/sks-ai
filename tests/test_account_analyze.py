@@ -243,6 +243,61 @@ async def test_account_failed_when_all_items_fail(monkeypatch):
     assert len(failed) == 1
 
 
+# ---- 视频号 decode_key 透传 --------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_analyze_account_passes_channels_decode_key_to_transcribe(monkeypatch):
+    """Task 1 升级 video_meta_to_media_ref 后，未改 graph 循环也应透传 decode_key。"""
+    from app.datasource.media import MediaRef
+    from app.datasource.tikhub import VideoMeta
+
+    captured: dict = {}
+
+    async def _top(url, n=20):
+        return [VideoMeta(
+            title="频道一条",
+            play_count=3,
+            fav_count=1,
+            download_url="http://cdn/channels/a.mp4",
+            author="前进的胖掌柜",
+            decode_key="dk-pair-1",
+            platform="wechat_channels",
+        )]
+
+    async def _transcribe(media):
+        captured["media"] = media
+        assert isinstance(media, MediaRef)
+        assert media.platform == "wechat_channels"
+        assert media.decode_key == "dk-pair-1"
+        assert media.download_url == "http://cdn/channels/a.mp4"
+        return "转写文案"
+
+    async def _update_task(task_id, *, status=None, progress=None, result=None, error=None):
+        return None
+
+    async def _insert_bench(task_id, title, play_count, fav_count, transcript, structure):
+        return None
+
+    async def _chat(skill, messages, json_schema=None):
+        if skill == "account_analyze_item":
+            return await _fake_chat_item()
+        if skill == "account_analyze_summary":
+            return await _fake_chat_summary()
+        raise AssertionError(skill)
+
+    monkeypatch.setattr("app.skills.account_analyze.graph.account_top_videos", _top)
+    monkeypatch.setattr("app.skills.account_analyze.graph.transcribe", _transcribe)
+    monkeypatch.setattr("app.skills.account_analyze.graph.check", _safe)
+    monkeypatch.setattr("app.skills.account_analyze.graph.chat", _chat)
+    monkeypatch.setattr("app.skills.account_analyze.graph.update_task", _update_task)
+    monkeypatch.setattr("app.skills.account_analyze.graph.insert_benchmark_video", _insert_bench)
+
+    from app.skills.account_analyze.graph import analyze_account
+    await analyze_account(task_id=1, url="sphi9BjV8GK0Zsl")
+    assert isinstance(captured["media"], MediaRef)
+    assert captured["media"].decode_key == "dk-pair-1"
+
+
 # ---- 心跳 -------------------------------------------------------------------
 
 @pytest.mark.asyncio
