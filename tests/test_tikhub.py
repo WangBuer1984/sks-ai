@@ -598,11 +598,85 @@ async def test_resolve_media_channels_dispatches_to_channels_video_meta(monkeypa
 
 # ---- Task 7 平台门禁：account_top_videos / precheck 抖音 only --------------
 
-async def test_account_top_videos_rejects_channels_host_before_http(monkeypatch):
-    """视频号 host → DataSourceError(douyin only)，门禁在 _is_configured 之后、HTTP 之前。"""
-    monkeypatch.setattr(settings, "TIKHUB_API_KEY", "tk-test-key")
-    with pytest.raises(DataSourceError, match="douyin only"):
-        await account_top_videos("https://channels.weixin.qq.com/x")
+async def test_account_top_videos_channels_id_paginates_until_n_or_max_pages(monkeypatch):
+    monkeypatch.setattr(settings, "TIKHUB_API_KEY", "tk")
+    pages_hit = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith("fetch_channel_id_to_username"):
+            return httpx.Response(200, json={"code": 200, "data": {
+                "channel_id": "sphi9BjV8GK0Zsl",
+                "username": "v2_abc@finder",
+                "nickname": "人民日报",
+            }})
+        if path.endswith("fetch_user_videos"):
+            pages_hit["n"] += 1
+            body = json.loads(request.content.decode())
+            assert body["raw"] is False
+            assert body["username"] == "v2_abc@finder"
+            # 每页 6 条；第 4 页仍 up_continue，但 max_pages=4 应停 → 最多 24，再切到 n=20
+            vids = [{
+                "id": f"id-{pages_hit['n']}-{i}",
+                "title": f"t{i}",
+                "nickname": "人民日报",
+                "read_count": 10,
+                "fav_count": 1,
+                "like_count": 9,
+                "media": {
+                    "full_url": f"http://cdn/{pages_hit['n']}-{i}.mp4",
+                    "decode_key": f"k-{pages_hit['n']}-{i}",
+                },
+            } for i in range(6)]
+            return httpx.Response(200, json={"code": 200, "data": {
+                "username": "v2_abc@finder",
+                "nickname": "人民日报",
+                "videos": vids,
+                "up_continue": True,
+                "last_buffer": f"buf{pages_hit['n']}",
+            }})
+        return httpx.Response(404, json={"code": 404})
+
+    client = _mock_client(handler)
+    videos = await account_top_videos("sphi9BjV8GK0Zsl", n=20, client=client)
+    assert len(videos) == 20
+    assert pages_hit["n"] <= 4
+    assert videos[0].platform == "wechat_channels"
+    assert videos[0].decode_key == "k-1-0"
+    assert videos[0].download_url.endswith("1-0.mp4")
+    assert videos[0].play_count == 10  # read_count 代理
+    assert videos[0].fav_count == 1    # fav 优先于 like
+    await client.aclose()
+
+
+async def test_account_top_videos_channels_share_uses_video_detail_username(monkeypatch):
+    monkeypatch.setattr(settings, "TIKHUB_API_KEY", "tk")
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("fetch_video_detail"):
+            return httpx.Response(200, json={"code": 200, "data": {
+                "username": "v2_from_share@finder",
+                "nickname": "前进的胖掌柜",
+                "media": {"full_url": "http://x", "decode_key": "1"},
+            }})
+        if request.url.path.endswith("fetch_user_videos"):
+            body = json.loads(request.content.decode())
+            assert body["username"] == "v2_from_share@finder"
+            return httpx.Response(200, json={"code": 200, "data": {
+                "videos": [{
+                    "title": "[{'shortTitle': '职能部门正在杀死公司'}]",
+                    "read_count": 3, "fav_count": 0, "like_count": 2,
+                    "nickname": "前进的胖掌柜",
+                    "media": {"full_url": "http://cdn/v.mp4", "decode_key": "dk1"},
+                }],
+                "up_continue": False,
+            }})
+        return httpx.Response(500, text="no")
+    client = _mock_client(handler)
+    videos = await account_top_videos("https://weixin.qq.com/sph/ADk6xBh2hq", n=20, client=client)
+    assert len(videos) == 1
+    assert videos[0].title == "职能部门正在杀死公司"
+    assert videos[0].decode_key == "dk1"
+    await client.aclose()
 
 
 async def test_precheck_rejects_channels_host_before_http(monkeypatch):

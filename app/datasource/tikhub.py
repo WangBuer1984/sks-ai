@@ -64,6 +64,12 @@ _PATH_USER_POST_VIDEOS = "/api/v1/douyin/app/v3/fetch_user_post_videos"
 _PATH_ONE_VIDEO_BY_SHARE = "/api/v1/douyin/web/fetch_one_video_by_share_url"
 _PATH_HOT_TOTAL_LIST = "/api/v1/douyin/billboard/fetch_hot_total_list"
 _PATH_CHANNELS_VIDEO_DETAIL = "/api/v1/wechat_channels/v2/fetch_video_detail"
+_PATH_CHANNELS_ID_TO_USER = "/api/v1/wechat_channels/v2/fetch_channel_id_to_username"
+_PATH_CHANNELS_USER_VIDEOS = "/api/v1/wechat_channels/v2/fetch_user_videos"
+
+# 视频号账号视频列表翻页硬上限：即使 up_continue 恒真，最多拉 4 页（避免账号视频数
+# 极大时的取数放大；Task 3.3 按返回 N 计费，上限保护扣费边界）。
+_CHANNELS_MAX_PAGES = 4
 
 # 视频号 CDN 下载头（防盗链弱约束；完整鉴权已在 full_url = url+url_token）。
 CHANNELS_DOWNLOAD_HEADERS: dict[str, str] = {
@@ -264,33 +270,124 @@ async def _resolve_sec_user_id(client: httpx.AsyncClient, url: str) -> str | Non
 async def account_top_videos(url: str, n: int = 20, *, client: httpx.AsyncClient | None = None) -> list[VideoMeta]:
     """取账号主页 Top N 视频（按 TikHub 返回顺序，默认 20 条）。
 
+    按 ``_account_entry_kind(url)`` 分发：douyin 短链 → ``_resolve_sec_user_id`` +
+    ``fetch_user_post_videos``；视频号 sph 短号 / 分享链 → ``_resolve_channels_username``
+    + ``fetch_user_videos`` 翻页（硬上限 ``_CHANNELS_MAX_PAGES``）。未知入口 → DataSourceError。
+
     未配置 TIKHUB_API_KEY → DataSourceError（懒初始化失败，per-request，不阻断 import）。
     解析失败 / 网络 / 业务码非 200 → DataSourceError。
     """
     if not _is_configured():
         raise DataSourceError("TIKHUB_API_KEY not configured")
-    # 平台门禁：拆账号仅支持抖音主页；视频号 host 走拆视频链路。
-    if _platform_of(url) != "douyin":
-        raise DataSourceError("account analyze supports douyin only; use video link for channels")
+    kind = _account_entry_kind(url)
+    if kind == "unknown":
+        raise DataSourceError(f"account_top_videos: unsupported url {url}")
     own = client is None
     if own:
         client = httpx.AsyncClient()
     try:
-        sec_uid = await _resolve_sec_user_id(client, url)
-        if not sec_uid:
-            raise DataSourceError(f"cannot resolve sec_user_id from url: {url}")
-        body = await _get_json(
-            client,
-            _PATH_USER_POST_VIDEOS,
-            {"sec_user_id": sec_uid, "count": n, "max_cursor": 0, "sort_type": 0},
-        )
-        data = body.get("data") or {}
-        items = data.get("aweme_list") or data.get("list") or []
-        videos = [_parse_video(it) for it in items[:n]]
-        return videos
+        if kind == "douyin":
+            sec_uid = await _resolve_sec_user_id(client, url)
+            if not sec_uid:
+                raise DataSourceError(f"cannot resolve sec_user_id from url: {url}")
+            body = await _get_json(
+                client,
+                _PATH_USER_POST_VIDEOS,
+                {"sec_user_id": sec_uid, "count": n, "max_cursor": 0, "sort_type": 0},
+            )
+            data = body.get("data") or {}
+            items = data.get("aweme_list") or data.get("list") or []
+            videos = [_parse_video(it) for it in items[:n]]
+            return videos
+        # channels_id / channels_share → 视频号账号视频列表
+        username = await _resolve_channels_username(client, kind, url)
+        if not username:
+            raise DataSourceError(f"account_top_videos: cannot resolve channels username from {url}")
+        videos: list[VideoMeta] = []
+        last_buffer: str | None = None
+        for _page in range(_CHANNELS_MAX_PAGES):
+            req_body = {"username": username, "raw": False}
+            if last_buffer:
+                req_body["last_buffer"] = last_buffer
+            body = await _post_json(client, _PATH_CHANNELS_USER_VIDEOS, req_body)
+            data = body.get("data") or {}
+            fallback_author = str(data.get("nickname") or "") or ""
+            raw_items = data.get("videos") or []
+            page_videos = [
+                v for v in (_parse_channels_video(it, fallback_author=fallback_author) for it in raw_items)
+                if v is not None
+            ]
+            videos.extend(page_videos)
+            if len(videos) >= n:
+                break
+            if not data.get("up_continue"):
+                break
+            last_buffer = data.get("last_buffer")
+            if not last_buffer:
+                break
+        return videos[:n]
     finally:
         if own:
             await client.aclose()
+
+
+async def _resolve_channels_username(client: httpx.AsyncClient, kind: str, raw: str) -> str | None:
+    """视频号账号入口 → username。
+
+    channels_id（裸 ``sph…`` 短号）→ ``fetch_channel_id_to_username``，校验 username
+    以 ``@finder`` 结尾（视频号账号标识），否则视为未解析。channels_share（分享链）
+    → 复用 ``fetch_video_detail``，从单视频响应取 ``data.username``（不经 media）。
+    其余 kind → None（不应被调用，``account_top_videos`` 已 dispatch）。
+    """
+    if kind == "channels_id":
+        body = await _post_json(
+            client,
+            _PATH_CHANNELS_ID_TO_USER,
+            {"channel_id": raw.strip(), "raw": False},
+        )
+        u = (body.get("data") or {}).get("username")
+        return u if isinstance(u, str) and u.endswith("@finder") else None
+    if kind == "channels_share":
+        body = await _post_json(
+            client,
+            _PATH_CHANNELS_VIDEO_DETAIL,
+            {"share_url": raw.strip(), "raw": False},
+        )
+        u = (body.get("data") or {}).get("username")
+        return u if isinstance(u, str) and u else None
+    return None
+
+
+def _parse_channels_video(item: dict, *, fallback_author: str = "") -> VideoMeta | None:
+    """视频号 ``fetch_user_videos`` 单条 → ``VideoMeta``。
+
+    与 ``channels_video_meta`` 单视频装配口径一致：``full_url`` 优先，否则
+    ``url + url_token``；``decode_key`` 与 URL 配对透传；``title`` 经 ``_channels_title``
+    归一。**必须** 同时设置 ``decode_key`` 与 ``platform="wechat_channels"``——
+    production 取数走 ``video_meta_to_media_ref`` 的 channels 分支，二者缺一不可。
+    无 media / 无 full_url → None（跳过该条）。
+    """
+    media = item.get("media") or {}
+    if not isinstance(media, dict):
+        return None
+    full = str(media.get("full_url") or "").strip() or (
+        str(media.get("url") or "") + str(media.get("url_token") or "")
+    ).strip()
+    if not full:
+        return None
+    dk = media.get("decode_key") or media.get("decodeKey")
+    fav = item.get("fav_count")
+    if fav is None:
+        fav = item.get("like_count") or 0
+    return VideoMeta(
+        title=_channels_title(item.get("title")),
+        play_count=int(item.get("read_count") or 0),
+        fav_count=int(fav or 0),
+        download_url=full,
+        author=str(item.get("nickname") or fallback_author or ""),
+        decode_key=str(dk).strip() if dk not in (None, "") else None,
+        platform="wechat_channels",
+    )
 
 
 async def video_meta(url: str, *, client: httpx.AsyncClient | None = None) -> VideoMeta:
