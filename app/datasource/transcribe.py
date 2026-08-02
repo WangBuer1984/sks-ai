@@ -119,11 +119,13 @@ async def _transcribe_inner(media: Union[MediaRef, str]) -> str:
             src = await download_url(ref.download_url, headers=ref.headers or None)
         temps.append(src)
 
-        # channels decode 可插拔 seam：decode_key 非空但 decode_media 未注入 → 故障。
+        # channels decode：视频号必须有 decode_key；同步 CLI 放 to_thread，避免堵事件循环。
+        if ref.platform == "wechat_channels" and not ref.decode_key:
+            raise DataSourceError("channels media missing decode_key")
         if ref.decode_key:
             if decode_media is None:
                 raise DataSourceError("channels decode not enabled")
-            src = decode_media(src, ref.decode_key)
+            src = await asyncio.to_thread(decode_media, src, ref.decode_key)
             temps.append(src)
 
         # 转码到 WAV 16k mono。

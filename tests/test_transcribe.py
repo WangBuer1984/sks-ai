@@ -177,7 +177,7 @@ async def test_transcribe_decode_key_without_decoder_errors(monkeypatch, tmp_pat
 
 @pytest.mark.asyncio
 async def test_transcribe_decode_media_injected_and_called(monkeypatch, tmp_path):
-    """decode_key 非空时走注入的 decode_media，再进入 convert。"""
+    """decode_key 非空时走注入的 decode_media（to_thread），再进入 convert。"""
     cap = _common_seams(monkeypatch, tmp_path)
     called: dict = {}
 
@@ -201,6 +201,19 @@ async def test_transcribe_decode_media_injected_and_called(monkeypatch, tmp_path
     assert Path(called["src"]).name == "dl_source.mp4"
     # convert 收到的是 decode 产出，而非原始下载文件
     assert cap["convert_calls"][0].name == "decoded.mp4"
+
+
+@pytest.mark.asyncio
+async def test_transcribe_channels_missing_decode_key_errors(monkeypatch, tmp_path):
+    _common_seams(monkeypatch, tmp_path)
+    ref = MediaRef(
+        platform="wechat_channels",
+        download_url="https://x/a.mp4",
+        headers={},
+        decode_key=None,
+    )
+    with pytest.raises(DataSourceError, match="missing decode_key"):
+        await tr.transcribe(ref)
 
 
 # ---- contract 新增测试 ------------------------------------------------------

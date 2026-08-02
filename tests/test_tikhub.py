@@ -23,6 +23,7 @@ from app.datasource.tikhub import (
     _account_entry_kind,
     _base_url,
     _channels_title,
+    _parse_channels_video,
     _platform_of,
     account_top_videos,
     channels_video_meta,
@@ -279,6 +280,35 @@ async def test_precheck_channels_share_home_count_no_pagination(monkeypatch):
     assert r["reachable"] is True
     assert r["video_count"] == 3
     assert calls["videos"] == 1  # 不翻页
+    await client.aclose()
+
+
+async def test_precheck_empty_home_page_unreachable(monkeypatch):
+    """首页 0 条 → reachable:false（抖音与视频号同口径）。"""
+    monkeypatch.setattr(settings, "TIKHUB_API_KEY", "tk")
+
+    def douyin_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("get_sec_user_id"):
+            return httpx.Response(200, json={"code": 200, "data": {"sec_user_id": "u1"}})
+        if request.url.path.endswith("fetch_user_post_videos"):
+            return httpx.Response(200, json={"code": 200, "data": {"aweme_list": []}})
+        return httpx.Response(500, text=request.url.path)
+
+    client = _mock_client(douyin_handler)
+    r = await precheck("https://www.douyin.com/user/x", client=client)
+    assert r == {"reachable": False, "video_count": 0}
+    await client.aclose()
+
+    def channels_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("fetch_video_detail"):
+            return httpx.Response(200, json={"code": 200, "data": {"username": "v2_x@finder"}})
+        if request.url.path.endswith("fetch_user_videos"):
+            return httpx.Response(200, json={"code": 200, "data": {"videos": []}})
+        return httpx.Response(500, text=request.url.path)
+
+    client = _mock_client(channels_handler)
+    r2 = await precheck("https://weixin.qq.com/sph/abc", client=client)
+    assert r2 == {"reachable": False, "video_count": 0}
     await client.aclose()
 
 
@@ -634,6 +664,39 @@ async def test_resolve_media_channels_dispatches_to_channels_video_meta(monkeypa
     ref = await resolve_media("https://weixin.qq.com/sph/abc")
     assert ref.platform == "wechat_channels"
     assert ref.decode_key == "k1"
+
+
+async def test_channels_video_meta_missing_decode_key_errors(monkeypatch):
+    monkeypatch.setattr(settings, "TIKHUB_API_KEY", "tk")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"code": 200, "data": {
+            "media": {"full_url": "http://cdn/v.mp4"},
+        }})
+
+    client = _mock_client(handler)
+    with pytest.raises(DataSourceError, match="missing decode_key"):
+        await channels_video_meta("https://weixin.qq.com/sph/abc", client=client)
+    await client.aclose()
+
+
+def test_parse_channels_video_skips_missing_decode_key():
+    assert _parse_channels_video({
+        "title": "t", "read_count": 1, "nickname": "a",
+        "media": {"full_url": "http://cdn/v.mp4"},
+    }) is None
+
+
+def test_video_meta_to_media_ref_channels_requires_decode_key():
+    v = VideoMeta(
+        title="t", play_count=1, fav_count=0,
+        download_url="http://cdn/a.mp4",
+        author="a",
+        decode_key=None,
+        platform="wechat_channels",
+    )
+    with pytest.raises(DataSourceError, match="requires decode_key"):
+        video_meta_to_media_ref(v)
 
 
 # ---- Task 7 平台门禁：account_top_videos / precheck 抖音 only --------------

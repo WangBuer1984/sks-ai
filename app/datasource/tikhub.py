@@ -241,6 +241,10 @@ def video_meta_to_media_ref(v: VideoMeta) -> MediaRef:
     ref 共享模块级可变 dict。``title``/``author`` 空串归一为 ``None``（下游空值更稳）。
     """
     if v.platform == "wechat_channels" or v.decode_key:
+        if not v.decode_key:
+            raise DataSourceError(
+                "video_meta_to_media_ref: wechat_channels requires decode_key"
+            )
         return MediaRef(
             platform="wechat_channels",
             download_url=v.download_url,
@@ -353,9 +357,9 @@ def _parse_channels_video(item: dict, *, fallback_author: str = "") -> VideoMeta
 
     与 ``channels_video_meta`` 单视频装配口径一致：``full_url`` 优先，否则
     ``url + url_token``；``decode_key`` 与 URL 配对透传；``title`` 经 ``_channels_title``
-    归一。**必须** 同时设置 ``decode_key`` 与 ``platform="wechat_channels"``——
+    归一。**必须** 同时设置非空 ``decode_key`` 与 ``platform="wechat_channels"``——
     production 取数走 ``video_meta_to_media_ref`` 的 channels 分支，二者缺一不可。
-    无 media / 无 full_url → None（跳过该条）。
+    无 media / 无 full_url / 无 decode_key → None（跳过该条）。
     """
     media = item.get("media") or {}
     if not isinstance(media, dict):
@@ -366,6 +370,9 @@ def _parse_channels_video(item: dict, *, fallback_author: str = "") -> VideoMeta
     if not full:
         return None
     dk = media.get("decode_key") or media.get("decodeKey")
+    decode_key = str(dk).strip() if dk not in (None, "") else ""
+    if not decode_key:
+        return None
     fav = item.get("fav_count")
     if fav is None:
         fav = item.get("like_count") or 0
@@ -375,7 +382,7 @@ def _parse_channels_video(item: dict, *, fallback_author: str = "") -> VideoMeta
         fav_count=int(fav or 0),
         download_url=full,
         author=str(item.get("nickname") or fallback_author or ""),
-        decode_key=str(dk).strip() if dk not in (None, "") else None,
+        decode_key=decode_key,
         platform="wechat_channels",
     )
 
@@ -406,7 +413,7 @@ async def precheck(url: str, *, client: httpx.AsyncClient | None = None) -> dict
     ``fetch_user_post_videos``（count=20，与 ``account_top_videos`` 默认 ``n=20``
     对齐）；视频号分享链 → ``_resolve_channels_username`` +
     ``fetch_user_videos`` **单页**（不翻页，仅取首页条数估规模）。未配置 /
-    入口未知 / 解析 miss → ``{"reachable": False, "video_count": 0}``（不抛）。
+    入口未知 / 解析 miss / 首页 0 条 → ``{"reachable": False, "video_count": 0}``（不抛）。
 
     video_count 是**首页视频数（≤20），非精确总数**；TikHub 为分页接口，如需精确
     总数需翻页聚合。Task 3.3 按此估算扣费 ``max(1, min(10, floor(N/2)))``——
@@ -432,6 +439,8 @@ async def precheck(url: str, *, client: httpx.AsyncClient | None = None) -> dict
             )
             data = body.get("data") or {}
             items = data.get("aweme_list") or data.get("list") or []
+            if not items:
+                return {"reachable": False, "video_count": 0}
             return {"reachable": True, "video_count": len(items)}
         if kind == "channels_share":
             username = await _resolve_channels_username(client, kind, url)
@@ -444,6 +453,8 @@ async def precheck(url: str, *, client: httpx.AsyncClient | None = None) -> dict
             )
             data = body.get("data") or {}
             videos = data.get("videos") or []
+            if not videos:
+                return {"reachable": False, "video_count": 0}
             return {"reachable": True, "video_count": len(videos)}
         return {"reachable": False, "video_count": 0}
     finally:
@@ -579,7 +590,9 @@ async def channels_video_meta(url: str, *, client: httpx.AsyncClient | None = No
         if not full_url:
             raise DataSourceError("channels_video_meta: empty download_url")
         decode_key_raw = media.get("decode_key") or media.get("decodeKey")
-        decode_key = str(decode_key_raw).strip() if decode_key_raw not in (None, "") else None
+        decode_key = str(decode_key_raw).strip() if decode_key_raw not in (None, "") else ""
+        if not decode_key:
+            raise DataSourceError("channels_video_meta: missing decode_key")
         raw_id = data.get("id")
         return MediaRef(
             platform="wechat_channels",

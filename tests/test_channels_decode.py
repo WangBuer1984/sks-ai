@@ -26,6 +26,14 @@ def test_decode_empty_key_errors(tmp_path: Path):
         decode_channels_media(src, "  ")
 
 
+def test_decode_requires_node(monkeypatch, tmp_path: Path):
+    src = tmp_path / "e.mp4"
+    src.write_bytes(b"x" * 64)
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+    with pytest.raises(DataSourceError, match="requires node"):
+        decode_channels_media(src, "910035402")
+
+
 @pytest.mark.skipif(not shutil.which("node"), reason="node not on PATH")
 def test_decode_channels_media_wasm_ftyp(tmp_path: Path):
     """用 spike 固化的加密头 + 配对 decode_key 验证 ftyp（若样例文件存在）。
