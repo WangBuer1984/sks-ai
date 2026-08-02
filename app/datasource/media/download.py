@@ -26,7 +26,6 @@ import stat
 import tempfile
 import time
 from pathlib import Path
-from typing import Optional
 
 import httpx
 
@@ -83,8 +82,8 @@ async def _get_shared_client() -> httpx.AsyncClient:
 async def download_url(
     url: str,
     *,
-    headers: Optional[dict[str, str]] = None,
-    client: Optional[httpx.AsyncClient] = None,
+    headers: dict[str, str] | None = None,
+    client: httpx.AsyncClient | None = None,
 ) -> Path:
     """下载直链到 temp 文件，返回 ``Path``。
 
@@ -97,6 +96,8 @@ async def download_url(
     if client is None:
         client = await _get_shared_client()
 
+    log.info("download start: url=%s", url[:100])
+    t0 = time.monotonic()
     tmp_path: str | None = None
     try:
         try:
@@ -126,10 +127,15 @@ async def download_url(
         except httpx.HTTPError as exc:
             raise DataSourceError(f"download transport error for {url}: {exc}") from exc
         except OSError as exc:
-            raise DataSourceError(f"failed to write tmp file for {url}") from exc
+            raise DataSourceError(
+                f"failed to write tmp file {tmp_path!r} for {url}: {exc}"
+            ) from exc
 
         assert tmp_path is not None
-        log.info("downloaded %s -> %s (%d bytes)", url, tmp_path, written)
+        log.info(
+            "download done: url=%s -> %s (%d bytes) elapsed=%.2fs",
+            url[:100], tmp_path, written, time.monotonic() - t0,
+        )
         return Path(tmp_path)
     except Exception:
         # 含 DataSourceError / 传输中断：清掉半截文件，避免 ASR_TMP 堆残骸。

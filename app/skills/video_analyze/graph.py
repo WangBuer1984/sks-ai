@@ -13,9 +13,10 @@
 进度语义（LOAD-BEARING，Task 3.3 按比例退款依赖）：单条 progress 0→100，``100`` 仅在结构化
 完成并写 result 后赋。无中间值（单条无中间条目概念）。
 
-心跳：``transcribe``（Qwen 管线，最长约 20min）期间 ``_transcribe_with_heartbeat``
+心跳：``transcribe``（Qwen 管线，最长约 20min）期间 ``run_with_heartbeat``
 每 ``HEARTBEAT_INTERVAL``（60s）touch 一次 ``updated_at = now()``，防止 Java
-5min running-timeout 把正在转写的任务判为停滞。
+5min running-timeout 把正在转写的任务判为停滞。实现见
+``app.datasource.media.heartbeat``（与 account_analyze 共享）。
 
 模块级别名 ``chat`` / ``check`` / ``transcribe`` / ``update_task`` / ``heartbeat`` 是测试
 monkeypatch 目标（app.skills.video_analyze.graph.*），与 script_gen / card_gen 同模式。
@@ -23,12 +24,12 @@ monkeypatch 目标（app.skills.video_analyze.graph.*），与 script_gen / card
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from typing import Any
 
 from app.datasource import DataSourceError
-from app.datasource.media import MediaRef
+from app.datasource.media.constants import HEARTBEAT_INTERVAL
+from app.datasource.media.heartbeat import run_with_heartbeat
 from app.datasource.tikhub import resolve_media as _resolve_media
 from app.datasource.transcribe import transcribe as _transcribe
 from app.llm.client import glm_client
@@ -47,7 +48,8 @@ heartbeat = _heartbeat
 resolve_media = _resolve_media
 
 # 心跳间隔：长转写期间每 N 秒 touch updated_at，短于 Java running-timeout 5min。
-HEARTBEAT_INTERVAL = 60.0
+# 自 ``app.datasource.media.constants`` import（共享常量）；调用 ``run_with_heartbeat``
+# 时传 ``interval=HEARTBEAT_INTERVAL``，故测试 monkeypatch ``vg.HEARTBEAT_INTERVAL`` 仍生效。
 
 
 # ---- 结构化输出 schema ----------------------------------------------------
@@ -101,25 +103,10 @@ async def _structure_transcript(transcript: str) -> dict[str, Any] | None:
 
 
 # ---- 心跳包裹的转写 --------------------------------------------------------
-
-async def _transcribe_with_heartbeat(task_id: int, media: MediaRef | str) -> str:
-    """transcribe + 周期心跳：长转写（最长 10min）期间每 HEARTBEAT_INTERVAL touch updated_at。
-
-    用 asyncio.shield 保护内层 task 不被 wait_for 超时取消——超时仅跳出本轮 wait，
-    下一轮继续 await 同一 task，transcribe 真实进度不丢。
-
-    ``media``：经 ``resolve_media`` 解析后的 ``MediaRef``（直链 + 平台头），
-    或裸直链 str（兼容旧调用方/文本路径）。
-    """
-    task = asyncio.create_task(transcribe(media))
-    while True:
-        await heartbeat(task_id)  # 本轮先 touch，再 wait
-        if task.done():
-            return await task
-        try:
-            return await asyncio.wait_for(asyncio.shield(task), timeout=HEARTBEAT_INTERVAL)
-        except asyncio.TimeoutError:
-            continue  # 超时但 task 未完，循环再 touch heartbeat
+# 实现已提取至 ``app.datasource.media.heartbeat.run_with_heartbeat``（与
+# account_analyze 共享）。此处调用时在调用点构建 ``transcribe(media)`` coro，
+# 便于测试 monkeypatch ``vg.transcribe`` 别名后 patched 函数被实际调用；并传
+# ``interval=HEARTBEAT_INTERVAL``（模块级，可被测试 patch 缩短）。
 
 
 # ---- 入口 1：同步结构化（/ai/analyze/video/text） ---------------------------
@@ -156,7 +143,9 @@ async def analyze_video_link(task_id: int, url: str) -> None:
     await update_task(task_id, status="running", progress=0)
     try:
         ref = await resolve_media(url)
-        transcript = await _transcribe_with_heartbeat(task_id, ref)
+        transcript = await run_with_heartbeat(
+            task_id, transcribe(ref), interval=HEARTBEAT_INTERVAL
+        )
         result = await _structure_transcript(transcript)
     except DataSourceError as e:
         await update_task(task_id, status="failed", error=str(e))

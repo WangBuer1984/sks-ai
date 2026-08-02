@@ -22,8 +22,9 @@
 - ``failed``：全量 scrape DataSourceError / 所有条目失败 / summary 致命错误 → 全额退款。
 
 心跳：``account_top_videos``（视频号可多页）与每条 ``transcribe`` 均用
-``_run_with_heartbeat`` 包裹，轮询间隙 touch updated_at，防 Java 5min
-running-timeout 误判（与 video_analyze 同实现）。
+``run_with_heartbeat`` 包裹，轮询间隙 touch updated_at，防 Java 5min
+running-timeout 误判（与 video_analyze 共享实现，见
+``app.datasource.media.heartbeat``）。
 
 模块级别名 ``chat`` / ``check`` / ``transcribe`` / ``account_top_videos`` / ``update_task`` /
 ``insert_benchmark_video`` / ``heartbeat`` 是测试 monkeypatch 目标。
@@ -31,12 +32,12 @@ running-timeout 误判（与 video_analyze 同实现）。
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from typing import Any
 
 from app.datasource import DataSourceError
-from app.datasource.media import MediaRef
+from app.datasource.media.constants import HEARTBEAT_INTERVAL
+from app.datasource.media.heartbeat import run_with_heartbeat
 from app.datasource.tikhub import account_top_videos as _account_top_videos
 from app.datasource.tikhub import video_meta_to_media_ref
 from app.datasource.tikhub import VideoMeta
@@ -59,7 +60,8 @@ insert_benchmark_video = _insert_benchmark_video
 heartbeat = _heartbeat
 
 # 心跳间隔：与 video_analyze 一致，短于 Java running-timeout 5min。
-HEARTBEAT_INTERVAL = 60.0
+# 自 ``app.datasource.media.constants`` import（共享常量）；调用 ``run_with_heartbeat``
+# 时传 ``interval=HEARTBEAT_INTERVAL``，故测试 monkeypatch ``ag.HEARTBEAT_INTERVAL`` 仍生效。
 _TOP_N = 20
 
 _ITEM_FIELDS = ("structure", "why_hot", "framework", "diff_hint")
@@ -150,24 +152,12 @@ async def _summarize(items: list[dict[str, Any]]) -> dict[str, Any] | None:
     return {k: result.get(k, "") for k in _SUMMARY_FIELDS}
 
 
-# ---- 心跳包裹（与 video_analyze 同实现，保持独立便于单测） -----------------
-
-async def _run_with_heartbeat(task_id: int, coro):
-    """任意长协程 + 周期心跳：每 HEARTBEAT_INTERVAL touch updated_at。"""
-    task = asyncio.create_task(coro)
-    while True:
-        await heartbeat(task_id)
-        if task.done():
-            return await task
-        try:
-            return await asyncio.wait_for(asyncio.shield(task), timeout=HEARTBEAT_INTERVAL)
-        except asyncio.TimeoutError:
-            continue
-
-
-async def _transcribe_with_heartbeat(task_id: int, media: MediaRef | str) -> str:
-    """transcribe + 周期心跳（薄包装，兼容既有测试 monkeypatch 点）。"""
-    return await _run_with_heartbeat(task_id, transcribe(media))
+# ---- 心跳包裹 -------------------------------------------------------------
+# 实现已提取至 ``app.datasource.media.heartbeat.run_with_heartbeat``（与
+# video_analyze 共享）。调用时在调用点构建 coro（``account_top_videos(...)`` /
+# ``transcribe(ref)``），便于测试 monkeypatch ``ag.account_top_videos`` /
+# ``ag.transcribe`` 别名后 patched 函数被实际调用；并传
+# ``interval=HEARTBEAT_INTERVAL``（模块级，可被测试 patch 缩短）。
 
 
 # ---- 入口：后台异步 --------------------------------------------------------
@@ -183,8 +173,8 @@ async def analyze_account(task_id: int, url: str) -> None:
     # 1. 全量 scrape（含视频号多页）——须心跳，慢网下可 1–3min。
     # DataSourceError → failed（Java 全额退款）
     try:
-        videos = await _run_with_heartbeat(
-            task_id, account_top_videos(url, n=_TOP_N)
+        videos = await run_with_heartbeat(
+            task_id, account_top_videos(url, n=_TOP_N), interval=HEARTBEAT_INTERVAL
         )
     except DataSourceError as e:
         await update_task(task_id, status="failed", error=str(e))
@@ -202,7 +192,9 @@ async def analyze_account(task_id: int, url: str) -> None:
         try:
             # UGC 安全（transcript 来自抖音创作者，仍按 UGC 处理 §5.1）
             ref = video_meta_to_media_ref(v)  # author 已在 VideoMeta（Task 1）
-            transcript = await _transcribe_with_heartbeat(task_id, ref)
+            transcript = await run_with_heartbeat(
+                task_id, transcribe(ref), interval=HEARTBEAT_INTERVAL
+            )
             if not await check(transcript):
                 log.warning("account item transcript blocked by safety, skipping: %s", v.title)
                 continue  # 本条不算完成

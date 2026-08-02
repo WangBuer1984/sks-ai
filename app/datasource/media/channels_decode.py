@@ -15,6 +15,7 @@ from __future__ import annotations
 import logging
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 from app.datasource import DataSourceError
@@ -57,6 +58,8 @@ def decode_channels_media(src: Path, decode_key: str) -> Path:
         raise DataSourceError(f"channels decode: encrypted file not found: {src}")
 
     out = src.with_name(f"{src.stem}_decoded.mp4")
+    log.info("channels decode start: src=%s", src.name)
+    t0 = time.monotonic()
     try:
         try:
             proc = subprocess.run(
@@ -95,7 +98,7 @@ def decode_channels_media(src: Path, decode_key: str) -> Path:
         raise
 
     log.info(
-        "channels decode ok: src=%s out=%s keystream=%d",
-        src.name, out.name, _KEYSTREAM_SIZE,
+        "channels decode ok: src=%s out=%s keystream=%d elapsed=%.2fs",
+        src.name, out.name, _KEYSTREAM_SIZE, time.monotonic() - t0,
     )
     return out

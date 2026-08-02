@@ -14,7 +14,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional
 
 
 @dataclass
@@ -34,8 +33,8 @@ class MediaRef:
 
     platform: str
     download_url: str
-    headers: Optional[dict[str, str]] = None
-    decode_key: Optional[str] = None
-    title: Optional[str] = None
-    author: Optional[str] = None
-    raw_id: Optional[str] = None
+    headers: dict[str, str] | None = None
+    decode_key: str | None = None
+    title: str | None = None
+    author: str | None = None
+    raw_id: str | None = None

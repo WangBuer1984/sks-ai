@@ -23,8 +23,8 @@ P0 不变量（20min 超时 → DataSourceError）：
 seam 全部模块级绑定（与 ``tikhub.py`` 同模式），测试 monkeypatch 目标：
 ``app.datasource.transcribe.download_url`` / ``.convert_to_wav`` /
 ``.get_audio_duration`` / ``.slice_audio`` / ``.recognize_wav`` /
-``.merge_transcript_parts`` / ``.gc_stale_tmp`` / ``._ffmpeg_available`` /
-``._TRANSCRIBE_TIMEOUT``。
+``.merge_transcript_parts`` / ``.gc_stale_tmp`` / ``._ffmpeg_available``。
+转写墙钟超时从 ``settings.TRANSCRIBE_TIMEOUT`` 读取（默认 1200s）。
 """
 
 from __future__ import annotations
@@ -32,14 +32,16 @@ from __future__ import annotations
 import asyncio
 import logging
 import shutil
+import time
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable, Optional, Union
 
 from app.config import settings
 from app.datasource import DataSourceError
 from app.datasource.media import MediaRef
 from app.datasource.media.audio import convert_to_wav, get_audio_duration, slice_audio
 from app.datasource.media.channels_decode import decode_channels_media
+from app.datasource.media.constants import WAV_SIZE_LIMIT
 from app.datasource.media.download import download_url, gc_stale_tmp
 from app.datasource.media.merge import merge_transcript_parts
 from app.datasource.media.qwen_asr import recognize_wav
@@ -52,16 +54,11 @@ from app.datasource.media.semaphores import (
 
 log = logging.getLogger(__name__)
 
-# 20min 硬上限（单条转写墙钟）。module-level 以便测试 monkeypatch 缩短。
-_TRANSCRIBE_TIMEOUT = 1200
-
-# 10MB（qwen3-asr-flash 单次 wav 体积上限）——整段守卫；切片单段 270s≈8.24MB 天然满足。
-_WAV_SIZE_LIMIT = 10 * 1024 * 1024
 _SHORT_DURATION_LIMIT = 300.0
 
 # channels decode 可插拔 seam：Task 8a 注入 ``decode_channels_media``；
 # 测试可 monkeypatch 为 None / fake。缺注入且 ``decode_key`` 非空 → 守卫报错。
-decode_media: Optional[Callable[[Path, str], Path]] = decode_channels_media
+decode_media: Callable[[Path, str], Path] | None = decode_channels_media
 
 
 def _ffmpeg_available() -> bool:
@@ -74,36 +71,38 @@ def _is_configured() -> bool:
     return bool(settings.ALIYUN_ASR_KEY) and _ffmpeg_available()
 
 
-async def transcribe(media: Union[MediaRef, str]) -> str:
+async def transcribe(media: MediaRef | str) -> str:
     """下载 → 转码 → 时长分支 → 识别 → 拼接，返回完整文案。
 
     入参 ``media``：``MediaRef``（携带下载直链/请求头/解码键/标题/作者）或裸 str
     URL（裸 str 时构造 ``MediaRef(platform="unknown", download_url=media, headers={})``，
     **绝不猜测 douyin Referer/UA**——裸 str 视为无特殊请求头）。
 
-    P0：外层 ``wait_for(timeout=1200)``，超时翻译为 ``DataSourceError``（非裸 TimeoutError）。
-    配置校验（key + ffmpeg）在 ``wait_for`` 之前，缺一即 fail-fast。
+    P0：外层 ``wait_for(timeout=settings.TRANSCRIBE_TIMEOUT)``，超时翻译为
+    ``DataSourceError``（非裸 TimeoutError）。配置校验（key + ffmpeg）在 ``wait_for``
+    之前，缺一即 fail-fast。
     """
     # 配置校验优先——缺 key / 缺 ffmpeg 立即失败，不进入 20min 超时后才报错。
     if not settings.ALIYUN_ASR_KEY:
         raise DataSourceError("ALIYUN_ASR_KEY not configured")
     if not _ffmpeg_available():
         raise DataSourceError("ffmpeg/ffprobe not found on PATH")
+    timeout = settings.TRANSCRIBE_TIMEOUT
     try:
         return await asyncio.wait_for(
-            _transcribe_inner(media), timeout=_TRANSCRIBE_TIMEOUT
+            _transcribe_inner(media), timeout=timeout
         )
     except asyncio.TimeoutError as e:
         # P0：裸 TimeoutError 不可泄漏到 skill 层（只 catch DataSourceError）。
         raise DataSourceError(
-            f"transcribe timed out after {_TRANSCRIBE_TIMEOUT}s"
+            f"transcribe timed out after {timeout}s"
         ) from e
 
 
 _TEMP_DIR_PREFIXES = ("sks_asr_wav_", "sks_asr_slice_")
 
 
-async def _transcribe_inner(media: Union[MediaRef, str]) -> str:
+async def _transcribe_inner(media: MediaRef | str) -> str:
     """管线编排本体：own temps 列表 + try/finally 清理。
 
     ``transcribe`` 的 ``wait_for`` 超时会 cancel 本协程，CPython 仍运行本 ``finally``
@@ -117,58 +116,92 @@ async def _transcribe_inner(media: Union[MediaRef, str]) -> str:
         platform="unknown", download_url=media, headers={}
     )
 
+    log.info(
+        "transcribe start: url=%s platform=%s decode_key=%s",
+        ref.download_url[:80], ref.platform, bool(ref.decode_key),
+    )
+    t_total = time.monotonic()
     temps: list[Path] = []
     try:
         # 下载：裸 str 时 headers 为 {} → ``ref.headers or None`` 传 None 给 download_url。
+        t0 = time.monotonic()
         async with get_download_semaphore():
             src = await download_url(ref.download_url, headers=ref.headers or None)
         temps.append(src)
+        log.info("transcribe step download done: elapsed=%.2fs", time.monotonic() - t0)
 
         # channels decode：有 decode_key 才解密（to_thread + decode_sem）；缺 key 直进 ffmpeg。
         if ref.decode_key:
             if decode_media is None:
-                raise DataSourceError("channels decode not enabled")
+                raise DataSourceError(
+                    f"channels decode not enabled: decode_key={ref.decode_key[:8]}…"
+                )
+            t0 = time.monotonic()
             async with get_decode_semaphore():
                 src = await asyncio.to_thread(decode_media, src, ref.decode_key)
             temps.append(src)
+            log.info("transcribe step decode done: elapsed=%.2fs", time.monotonic() - t0)
 
         # 转码到 WAV 16k mono。
+        t0 = time.monotonic()
         async with get_convert_semaphore():
             wav = await convert_to_wav(src)
         temps.append(wav)
+        log.info("transcribe step convert_wav done: elapsed=%.2fs", time.monotonic() - t0)
 
         # ffprobe 同步 subprocess：必须 to_thread，避免堵事件循环/心跳。
+        t0 = time.monotonic()
         duration = await asyncio.to_thread(get_audio_duration, wav)
         size = wav.stat().st_size
+        log.info(
+            "transcribe step probe done: duration=%.1fs size=%d elapsed=%.2fs",
+            duration, size, time.monotonic() - t0,
+        )
 
         # 时长分支（contract 表）：
         #   0 < d <= 300 → 单段 recognize；若 wav>10MB（unexpected）→ DataSourceError
         #   d > 300 或 d == 0.0（ffprobe 失败/未知）→ 切片路径（slice_audio 估时长）
         if 0 < duration <= _SHORT_DURATION_LIMIT:
-            if size > _WAV_SIZE_LIMIT:
+            if size > WAV_SIZE_LIMIT:
                 raise DataSourceError(
-                    "wav exceeds 10MB within 300s — unexpected"
+                    f"wav exceeds 10MB within 300s — unexpected: {wav.name} ({size} bytes)"
                 )
+            t0 = time.monotonic()
             async with get_asr_semaphore():
                 text = await recognize_wav(
                     wav, title=ref.title, author=ref.author
                 )
+            log.info("transcribe step asr(single) done: elapsed=%.2fs", time.monotonic() - t0)
         else:
             # 切片单段 270s≈8.24MB 天然 <10MB，无需逐段再检。
             # 传入已测 duration，避免 slice_audio 再跑一次 ffprobe。
+            t0 = time.monotonic()
             async with get_convert_semaphore():
                 segs = await slice_audio(wav, duration=duration)
             temps.extend(segs)
+            log.info("transcribe step slice done: %d segs elapsed=%.2fs",
+                     len(segs), time.monotonic() - t0)
             parts: list[str] = []
-            for seg in segs:
+            for i, seg in enumerate(segs):
+                tseg = time.monotonic()
                 async with get_asr_semaphore():
                     parts.append(
                         await recognize_wav(seg, title=ref.title, author=ref.author)
                     )
+                log.info("transcribe step asr(seg %d/%d) done: elapsed=%.2fs",
+                         i + 1, len(segs), time.monotonic() - tseg)
+            t0 = time.monotonic()
             text = merge_transcript_parts(parts)
+            log.info("transcribe step merge done: elapsed=%.2fs", time.monotonic() - t0)
 
         if not text.strip():
-            raise DataSourceError("asr produced empty transcript")
+            raise DataSourceError(
+                f"asr produced empty transcript for {ref.download_url[:50]}"
+            )
+        log.info(
+            "transcribe done: url=%s text_len=%d elapsed=%.2fs",
+            ref.download_url[:80], len(text), time.monotonic() - t_total,
+        )
         return text
     finally:
         dirs: set[Path] = set()

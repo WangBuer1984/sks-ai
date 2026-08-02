@@ -4,8 +4,9 @@ ffmpeg 命令形态参考 clever-hans ``backend/app/core/media/audio.py``，但�
 - 不定义 ``AudioConvertError`` —— 所有 ffmpeg/subprocess 失败一律抛
   ``DataSourceError``（``app.datasource`` 全局约束，便于上游按数据源故障
   统一翻译为退款/重试策略，PRD §11.3）。
-- 不读 ``settings.audio_sample_rate`` / ``audio_channels`` —— 16k mono 是
-  qwen ASR 规格的固定目标（非配置），硬编码 ``16000`` / ``1``。
+- 不读旧 ``settings.audio_sample_rate`` / ``audio_channels`` —— 16k mono 是
+  qwen ASR 规格的固定目标（非配置），硬编码 ``_SAMPLE_RATE = 16000`` /
+  ``_CHANNELS = 1``。
 - 临时目录用 ``settings.ASR_TMP_DIR``（空 → 系统 tempfile 目录）。
 
 ``convert_to_wav`` / ``slice_audio`` 通过 ``asyncio.to_thread`` 调度同步
@@ -23,11 +24,12 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 from pathlib import Path
-from typing import Optional
 
 from app.config import settings
 from app.datasource import DataSourceError
+from app.datasource.media.constants import WAV_SIZE_LIMIT
 
 log = logging.getLogger(__name__)
 
@@ -39,8 +41,6 @@ _BYTES_PER_SAMPLE = 2  # s16le
 _CONVERT_TIMEOUT = 300
 _SLICE_TIMEOUT = 120
 _FFPROBE_TIMEOUT = 30
-# 与 facade / qwen 单次上限对齐（16k mono PCM 300s≈9.2MB）。
-_WAV_SIZE_LIMIT = 10 * 1024 * 1024
 # 切片临时目录前缀，便于排查；须纳入 ``gc_stale_tmp``。
 _CONVERT_DIR_PREFIX = "sks_asr_wav_"
 _SLICE_DIR_PREFIX = "sks_asr_slice_"
@@ -65,7 +65,7 @@ def _require_ffmpeg() -> None:
         raise DataSourceError("ffmpeg not found in PATH")
 
 
-def _convert_sync(src_path: Path, output_dir: Optional[str] = None) -> Path:
+def _convert_sync(src_path: Path, output_dir: str | None = None) -> Path:
     """同步 FFmpeg 转码（由 ``convert_to_wav`` 经 ``asyncio.to_thread`` 调用）。"""
     _require_ffmpeg()
     if output_dir is None:
@@ -103,10 +103,17 @@ async def convert_to_wav(src: Path) -> Path:
     - ``subprocess.TimeoutExpired`` → ``DataSourceError("ffmpeg convert timed out …")``
     - 非零退出 / 无输出文件 / 其他 subprocess 错误 → ``DataSourceError("ffmpeg …")``
     """
-    return await asyncio.to_thread(_convert_sync, src)
+    log.info("convert_to_wav start: src=%s", getattr(src, "name", src))
+    t0 = time.monotonic()
+    wav = await asyncio.to_thread(_convert_sync, src)
+    log.info(
+        "convert_to_wav done: out=%s elapsed=%.2fs",
+        wav.name, time.monotonic() - t0,
+    )
+    return wav
 
 
-def _parse_duration_from_ffprobe(output: str) -> Optional[float]:
+def _parse_duration_from_ffprobe(output: str) -> float | None:
     """解析 ffprobe 输出中的 ``duration=xxx`` 字段。"""
     match = re.search(r"duration=(\d+\.?\d*)", output)
     if match:
@@ -194,6 +201,8 @@ async def slice_audio(
     切片体积不变量：270s × 16k mono PCM ≈ 8.24MB < 10MB，
     单段天然满足 qwen ≤10MB 体积上限，无需再加每段 10MB 守卫。
     """
+    log.info("slice_audio start: wav=%s duration=%s", getattr(wav, "name", wav), duration)
+    t0 = time.monotonic()
     if duration is None or duration <= 0:
         duration = await asyncio.to_thread(get_audio_duration, str(wav))
     if duration <= 0:
@@ -208,10 +217,12 @@ async def slice_audio(
                 size = Path(wav).stat().st_size
             except OSError:
                 size = 0
-            if size > _WAV_SIZE_LIMIT:
+            if size > WAV_SIZE_LIMIT:
                 raise DataSourceError(
-                    "audio duration unknown and wav exceeds 10MB"
+                    f"audio duration unknown and wav exceeds 10MB: {Path(wav).name} ({size} bytes)"
                 )
+            log.info("slice_audio skip (short): wav=%s elapsed=%.2fs",
+                     getattr(wav, "name", wav), time.monotonic() - t0)
             return [wav]
 
     if duration <= segment_duration + overlap:
@@ -220,10 +231,13 @@ async def slice_audio(
             size = Path(wav).stat().st_size
         except OSError:
             size = 0
-        if size > _WAV_SIZE_LIMIT:
+        if size > WAV_SIZE_LIMIT:
             raise DataSourceError(
-                "wav exceeds 10MB within short-duration slice skip — unexpected"
+                f"wav exceeds 10MB within short-duration slice skip — unexpected: "
+                f"{Path(wav).name} ({size} bytes)"
             )
+        log.info("slice_audio skip (short): wav=%s elapsed=%.2fs",
+                 getattr(wav, "name", wav), time.monotonic() - t0)
         return [wav]
 
     output_dir = _get_output_dir(_SLICE_DIR_PREFIX)
@@ -241,4 +255,8 @@ async def slice_audio(
         start += segment_duration - overlap
         index += 1
 
+    log.info(
+        "slice_audio done: %d segments elapsed=%.2fs",
+        len(segments), time.monotonic() - t0,
+    )
     return segments

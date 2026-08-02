@@ -20,8 +20,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from pathlib import Path
-from typing import Optional
 
 import dashscope
 from dashscope import MultiModalConversation
@@ -36,7 +36,7 @@ MODEL_NAME = "qwen3-asr-flash"
 _MAX_ATTEMPTS = 3
 
 
-def _build_messages(wav_path_abs: str, title: Optional[str], author: Optional[str]) -> list[dict]:
+def _build_messages(wav_path_abs: str, title: str | None, author: str | None) -> list[dict]:
     """构建 DashScope messages：user 携带音频 file:// URL，system 可选携带标题/作者。
 
     system 消息仅当 title 或 author 非空时插入；空值对应的行被省略（不留静默空行）。
@@ -65,7 +65,7 @@ def _build_messages(wav_path_abs: str, title: Optional[str], author: Optional[st
 
 
 def _call_dashscope_sync(
-    wav_path_abs: str, title: Optional[str], author: Optional[str]
+    wav_path_abs: str, title: str | None, author: str | None
 ) -> str:
     """同步调用 DashScope API（由 ``recognize_wav`` 经 ``asyncio.to_thread`` 调用）。
 
@@ -112,8 +112,8 @@ def _call_dashscope_sync(
 async def recognize_wav(
     wav_path: Path | str,
     *,
-    title: Optional[str] = None,
-    author: Optional[str] = None,
+    title: str | None = None,
+    author: str | None = None,
 ) -> str:
     """调用 DashScope qwen3-asr-flash 识别 wav，返回文本字符串。
 
@@ -132,8 +132,10 @@ async def recognize_wav(
     # file:// 必须用绝对路径——相对路径会被 DashScope 静默误读。
     wav_path_abs = str(Path(wav_path).resolve())
 
-    text: Optional[str] = None
-    last_exc: Optional[BaseException] = None
+    log.info("recognize_wav start: wav=%s", Path(wav_path).name)
+    t0 = time.monotonic()
+    text: str | None = None
+    last_exc: BaseException | None = None
     for attempt in range(_MAX_ATTEMPTS):
         try:
             text = await asyncio.to_thread(
@@ -153,4 +155,8 @@ async def recognize_wav(
     if not text or not text.strip():
         raise DataSourceError("qwen asr empty text")
 
+    log.info(
+        "recognize_wav done: wav=%s text_len=%d elapsed=%.2fs",
+        Path(wav_path).name, len(text), time.monotonic() - t0,
+    )
     return text

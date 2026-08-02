@@ -47,5 +47,9 @@ class Settings(BaseSettings):
     # ASR 媒体下载临时文件目录（空 → 系统 tempfile 目录）。download.py 落盘 + gc_stale_tmp 清扫。
     ASR_TMP_DIR: str = ""
 
+    # 单条转写墙钟硬上限（秒，20min）——transcribe.py 的 wait_for 超时据此翻译为
+    # DataSourceError。可选调（极慢网络/超长视频才需放宽）；测试可 patch 此字段缩短。
+    TRANSCRIBE_TIMEOUT: int = 1200
+
 
 settings = Settings()
