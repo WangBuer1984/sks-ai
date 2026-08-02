@@ -45,5 +45,8 @@ class Settings(BaseSettings):
     # 未配置时 transcribe 懒初始化失败，per-request 报错（不阻断 import）。
     ALIYUN_ASR_APP_KEY: str = ""
 
+    # ASR 媒体下载临时文件目录（空 → 系统 tempfile 目录）。download.py 落盘 + gc_stale_tmp 清扫。
+    ASR_TMP_DIR: str = ""
+
 
 settings = Settings()
