@@ -68,8 +68,9 @@ def decode_channels_media(src: Path, decode_key: str) -> Path:
     if not out.is_file():
         raise DataSourceError("channels decode produced no output file")
 
-    # 轻量二次校验（CLI 内已 assertMp4；此处防写盘残缺）
-    head = out.read_bytes()[:8]
+    # 轻量二次校验（CLI 内已 assertMp4；此处防写盘残缺）。只读 8 字节，禁全量入内存。
+    with out.open("rb") as fh:
+        head = fh.read(8)
     if len(head) < 8 or head[4:8] != b"ftyp":
         raise DataSourceError("channels decode: output missing MP4 ftyp signature")
     log.info(

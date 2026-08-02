@@ -118,17 +118,22 @@ def test_gc_stale_tmp_deletes_only_old_files(tmp_path, monkeypatch):
     fresh.write_bytes(b"fresh")
     old = tmp_path / "sks_asr_dl_old"
     old.write_bytes(b"old")
+    old_wav_dir = tmp_path / "sks_asr_wav_abc"
+    old_wav_dir.mkdir()
+    (old_wav_dir / "audio_16k_mono.wav").write_bytes(b"x")
 
     now = time.time()
     # 陈旧：mtime > 2h 前
     os.utime(old, (now - 3 * 3600, now - 3 * 3600))
+    os.utime(old_wav_dir, (now - 3 * 3600, now - 3 * 3600))
     # 新鲜：当前
     os.utime(fresh, (now, now))
 
     count = gc_stale_tmp(max_age_hours=2.0)
-    assert count == 1
+    assert count == 2
     assert fresh.exists()
     assert not old.exists()
+    assert not old_wav_dir.exists()
 
 
 def test_gc_stale_tmp_safe_on_missing_dir(tmp_path, monkeypatch):

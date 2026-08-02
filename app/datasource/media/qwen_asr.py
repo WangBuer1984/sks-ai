@@ -119,7 +119,8 @@ async def recognize_wav(
 
     失败语义（与 clever-hans 分歧——无空串降级）：
       - ``ALIYUN_ASR_KEY`` 未配置 → 立即 ``DataSourceError``（防御性二次校验）。
-      - 瞬态（非 200 / ``RuntimeError``）：最多 3 次尝试，耗尽 → ``DataSourceError``。
+      - 瞬态（非 200 / 网络等）：最多 3 次尝试，耗尽 → ``DataSourceError``。
+        捕获宽 ``Exception``（含 dashscope/httpx 非 RuntimeError）；``BaseException`` 不重试。
       - 200 但空文本：**不重试**，立即 ``DataSourceError("qwen asr empty text")``。
 
     本函数 **不** acquire ``asr_sem``——速率限制由 facade（Task 5）独占持有。
@@ -140,13 +141,13 @@ async def recognize_wav(
             )
             # 成功（含空串）即跳出重试循环；空判定在循环之外执行。
             break
-        except RuntimeError as exc:
+        except Exception as exc:
             last_exc = exc
             log.warning("Qwen ASR attempt %d/%d failed: %s", attempt + 1, _MAX_ATTEMPTS, exc)
             continue
     else:
-        # 全部 3 次均抛 RuntimeError（瞬态耗尽）。
-        raise DataSourceError(f"qwen asr failed after 3 retries: {last_exc}")
+        # 全部 3 次均抛（瞬态耗尽）→ 统一 DataSourceError，禁止裸异常冒泡。
+        raise DataSourceError(f"qwen asr failed after 3 retries: {last_exc}") from last_exc
 
     # 空文本检查——位于重试循环之外，不由异常触发，故空 200 仅 1 次调用且不重试。
     if not text or not text.strip():

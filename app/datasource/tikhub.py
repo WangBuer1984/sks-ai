@@ -217,17 +217,41 @@ async def _post_json(client: httpx.AsyncClient, path: str, json_body: dict) -> d
     return await _request_json(client, "POST", path, json_body=json_body)
 
 
+def _safe_int(value: object, default: int = 0) -> int:
+    """TikHub 计数字段 → int。容忍 ``None`` / ``"1,234"`` / ``"1.2k"``；失败 → default。"""
+    if value is None or value is False:
+        return default
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    s = str(value).strip().replace(",", "").replace(" ", "")
+    if not s:
+        return default
+    try:
+        if len(s) > 1 and s[-1] in "kKmM":
+            mult = 1_000 if s[-1] in "kK" else 1_000_000
+            return int(float(s[:-1]) * mult)
+        return int(float(s))
+    except (TypeError, ValueError):
+        return default
+
+
 def _parse_video(item: dict) -> VideoMeta:
     stats = item.get("statistics") or {}
     play_addr = (item.get("video") or {}).get("play_addr") or {}
     url_list = play_addr.get("url_list") or []
     author_obj = item.get("author") or {}
     author = str(author_obj.get("nickname") or author_obj.get("nick_name") or "")
+    first = url_list[0] if url_list else None
+    download_url = str(first).strip() if first not in (None, "") else ""
     return VideoMeta(
         title=str(item.get("desc") or ""),
-        play_count=int(stats.get("play_count") or 0),
-        fav_count=int(stats.get("digg_count") or 0),
-        download_url=str(url_list[0]) if url_list else "",
+        play_count=_safe_int(stats.get("play_count")),
+        fav_count=_safe_int(stats.get("digg_count")),
+        download_url=download_url,
         author=author,
     )
 
@@ -375,11 +399,11 @@ def _parse_channels_video(item: dict, *, fallback_author: str = "") -> VideoMeta
         return None
     fav = item.get("fav_count")
     if fav is None:
-        fav = item.get("like_count") or 0
+        fav = item.get("like_count")
     return VideoMeta(
         title=_channels_title(item.get("title")),
-        play_count=int(item.get("read_count") or 0),
-        fav_count=int(fav or 0),
+        play_count=_safe_int(item.get("read_count")),
+        fav_count=_safe_int(fav),
         download_url=full,
         author=str(item.get("nickname") or fallback_author or ""),
         decode_key=decode_key,

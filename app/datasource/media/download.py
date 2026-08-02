@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 import stat
 import tempfile
 import time
@@ -34,6 +35,8 @@ log = logging.getLogger(__name__)
 _DOWNLOAD_TIMEOUT = 60.0
 # 临时文件名前缀——``gc_stale_tmp`` 按此前缀匹配清扫，避免误删其他模块的 temp 文件。
 _TMP_PREFIX = "sks_asr_dl_"
+# convert / slice 的 mkdtemp 目录前缀（见 audio.py）；须一并清扫，否则只漏 inode。
+_GC_PREFIXES = (_TMP_PREFIX, "sks_asr_wav_", "sks_asr_slice_")
 
 
 async def download_url(
@@ -87,12 +90,12 @@ async def download_url(
 
 
 def gc_stale_tmp(*, max_age_hours: float = 2.0) -> int:
-    """清扫陈旧的 ``sks_asr_dl_*`` 临时文件，返回删除数量。
+    """清扫陈旧 ASR 临时文件/目录，返回删除条目数。
 
     扫描目录：``settings.ASR_TMP_DIR``（空 → 系统 tempfile 目录）。
-    - 仅删前缀 ``sks_asr_dl_`` 且 mtime 早于 ``max_age_hours`` 小时前的文件。
-    - best-effort：缺目录返回 0；单文件 ``OSError`` 被吞，继续清扫其余。
-    - 不会 crash，确保可安全周期调用（Task 7 心跳 / 启动钩子）。
+    - 前缀：``sks_asr_dl_``（下载文件）、``sks_asr_wav_`` / ``sks_asr_slice_``（mkdtemp 目录）。
+    - 删 mtime 早于 ``max_age_hours`` 的普通文件；目录用 ``rmtree``。
+    - best-effort：缺目录返回 0；单条 ``OSError`` 被吞，继续清扫其余。
     """
     target_dir = settings.ASR_TMP_DIR or tempfile.gettempdir()
     cutoff = time.time() - max_age_hours * 3600.0
@@ -107,20 +110,23 @@ def gc_stale_tmp(*, max_age_hours: float = 2.0) -> int:
         return 0
 
     for name in entries:
-        if not name.startswith(_TMP_PREFIX):
+        if not name.startswith(_GC_PREFIXES):
             continue
         path = os.path.join(target_dir, name)
         try:
             st = os.stat(path)
-            if not stat.S_ISREG(st.st_mode):
+            if st.st_mtime >= cutoff:
                 continue
-            if st.st_mtime < cutoff:
+            if stat.S_ISREG(st.st_mode):
                 os.unlink(path)
+                deleted += 1
+            elif stat.S_ISDIR(st.st_mode):
+                shutil.rmtree(path, ignore_errors=False)
                 deleted += 1
         except OSError as exc:
             log.warning("gc_stale_tmp: cannot stat/delete %s: %s", path, exc)
             continue
 
     if deleted:
-        log.info("gc_stale_tmp: deleted %d stale file(s) under %s", deleted, target_dir)
+        log.info("gc_stale_tmp: deleted %d stale entr(y/ies) under %s", deleted, target_dir)
     return deleted

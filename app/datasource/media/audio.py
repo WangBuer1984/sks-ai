@@ -10,7 +10,8 @@ ffmpeg 命令形态参考 clever-hans ``backend/app/core/media/audio.py``，但�
 
 ``convert_to_wav`` / ``slice_audio`` 通过 ``asyncio.to_thread`` 调度同步
 subprocess，避免阻塞事件循环。``get_audio_duration`` 是同步纯函数，
-失败返回 ``0.0``（不抛），facade（Task 5）以 ``0.0`` 作为「时长未知 → 切片」信号。
+失败返回 ``0.0``（不抛）；facade 须 ``asyncio.to_thread`` 调用。``0.0`` 表示
+「时长未知」——``slice_audio`` 用 16k mono PCM 体积估时长，禁止把未知当「够短」。
 """
 
 from __future__ import annotations
@@ -33,11 +34,14 @@ log = logging.getLogger(__name__)
 # qwen ASR 规格固定目标：16kHz 单声道。非配置项，硬编码。
 _SAMPLE_RATE = 16000
 _CHANNELS = 1
+_BYTES_PER_SAMPLE = 2  # s16le
 # FFmpeg 转码超时（秒）：完整转码不截断时长，5min 覆盖长音频；切片 2min。
 _CONVERT_TIMEOUT = 300
 _SLICE_TIMEOUT = 120
 _FFPROBE_TIMEOUT = 30
-# 切片临时目录前缀，便于排查。
+# 与 facade / qwen 单次上限对齐（16k mono PCM 300s≈9.2MB）。
+_WAV_SIZE_LIMIT = 10 * 1024 * 1024
+# 切片临时目录前缀，便于排查；须纳入 ``gc_stale_tmp``。
 _CONVERT_DIR_PREFIX = "sks_asr_wav_"
 _SLICE_DIR_PREFIX = "sks_asr_slice_"
 
@@ -113,8 +117,8 @@ def _parse_duration_from_ffprobe(output: str) -> Optional[float]:
 def get_audio_duration(wav: Path | str) -> float:
     """用 ffprobe 获取音频时长（秒）。任何失败返回 ``0.0``，不抛异常。
 
-    facade（Task 5）以 ``0.0`` 作为「时长未知 → 走切片路径」的信号，
-    因此本函数绝不向上抛异常，确保调用方简化分支。
+    facade 以 ``0.0`` 作为「时长未知 → 走切片路径」的信号；本函数含同步
+    ``subprocess.run``，协程内必须经 ``asyncio.to_thread`` 调用。
     """
     try:
         result = subprocess.run(
@@ -126,6 +130,19 @@ def get_audio_duration(wav: Path | str) -> float:
         return duration if duration is not None else 0.0
     except Exception:
         return 0.0
+
+
+def _estimate_pcm_wav_duration(wav: Path | str) -> float:
+    """按 16k mono s16le PCM 体积估时长（跳过约 44 字节头）。失败 → 0.0。"""
+    try:
+        size = Path(wav).stat().st_size
+    except OSError:
+        return 0.0
+    payload = max(0, size - 44)
+    rate = _SAMPLE_RATE * _CHANNELS * _BYTES_PER_SAMPLE
+    if payload <= 0 or rate <= 0:
+        return 0.0
+    return payload / float(rate)
 
 
 def _slice_segment_sync(
@@ -166,12 +183,42 @@ async def slice_audio(
     返回切片文件路径列表（按时间顺序）。若音频时长
     ``<= segment_duration + overlap``，直接返回 ``[wav]``（不切片）。
 
+    ``duration == 0.0``（ffprobe 失败）**不得**当成「够短」：先按 PCM 体积估
+    时长再切片；仍无法估计且 ``wav > 10MB`` → ``DataSourceError``（避免整文件
+    直送 recognize 撞 DashScope 上限）。
+
     切片体积不变量：270s × 16k mono PCM ≈ 8.24MB < 10MB，
     单段天然满足 qwen ≤10MB 体积上限，无需再加每段 10MB 守卫。
     """
     duration = await asyncio.to_thread(get_audio_duration, str(wav))
+    if duration <= 0:
+        duration = _estimate_pcm_wav_duration(wav)
+        if duration > 0:
+            log.warning(
+                "ffprobe duration unknown; estimated %.1fs from wav size (%s)",
+                duration, Path(wav).name,
+            )
+        else:
+            try:
+                size = Path(wav).stat().st_size
+            except OSError:
+                size = 0
+            if size > _WAV_SIZE_LIMIT:
+                raise DataSourceError(
+                    "audio duration unknown and wav exceeds 10MB"
+                )
+            return [wav]
+
     if duration <= segment_duration + overlap:
-        # 音频不够长，不需要切片。
+        # 真短：仍拦 >10MB（异常码率/坏文件），禁止整文件直送 recognize。
+        try:
+            size = Path(wav).stat().st_size
+        except OSError:
+            size = 0
+        if size > _WAV_SIZE_LIMIT:
+            raise DataSourceError(
+                "wav exceeds 10MB within short-duration slice skip — unexpected"
+            )
         return [wav]
 
     output_dir = _get_output_dir(_SLICE_DIR_PREFIX)

@@ -133,12 +133,13 @@ async def _transcribe_inner(media: Union[MediaRef, str]) -> str:
             wav = await convert_to_wav(src)
         temps.append(wav)
 
-        duration = get_audio_duration(wav)
+        # ffprobe 同步 subprocess：必须 to_thread，避免堵事件循环/心跳。
+        duration = await asyncio.to_thread(get_audio_duration, wav)
         size = wav.stat().st_size
 
         # 时长分支（contract 表）：
         #   0 < d <= 300 → 单段 recognize；若 wav>10MB（unexpected）→ DataSourceError
-        #   d > 300 或 d == 0.0（ffprobe 失败/未知）→ 切片路径
+        #   d > 300 或 d == 0.0（ffprobe 失败/未知）→ 切片路径（slice_audio 估时长）
         if 0 < duration <= _SHORT_DURATION_LIMIT:
             if size > _WAV_SIZE_LIMIT:
                 raise DataSourceError(

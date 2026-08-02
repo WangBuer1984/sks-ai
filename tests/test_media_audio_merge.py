@@ -183,6 +183,36 @@ async def test_slice_audio_short_returns_original(tmp_path, monkeypatch):
     assert segments == [wav]
 
 
+@_skip_no_ffmpeg
+async def test_slice_audio_duration_zero_estimates_and_slices(tmp_path, monkeypatch):
+    """ffprobe→0.0 时不得当「够短」：按体积估时长后仍切片（抓真实 slice_audio，不 mock）。"""
+    from app.config import settings
+    monkeypatch.setattr(settings, "ASR_TMP_DIR", str(tmp_path))
+    monkeypatch.setattr(audio, "get_audio_duration", lambda _p: 0.0)
+
+    wav = tmp_path / "long_unknown.wav"
+    _gen_wav(wav, seconds=280.0, rate=16000, channels=1)
+
+    segments = await slice_audio(wav, segment_duration=270, overlap=3)
+    assert len(segments) >= 2
+    for seg in segments:
+        assert seg.exists()
+
+
+async def test_slice_audio_duration_zero_oversized_unestimable_raises(
+    tmp_path, monkeypatch
+):
+    from app.config import settings
+    monkeypatch.setattr(settings, "ASR_TMP_DIR", str(tmp_path))
+    monkeypatch.setattr(audio, "get_audio_duration", lambda _p: 0.0)
+    monkeypatch.setattr(audio, "_estimate_pcm_wav_duration", lambda _p: 0.0)
+
+    wav = tmp_path / "huge.wav"
+    wav.write_bytes(b"\x00" * (11 * 1024 * 1024))
+    with pytest.raises(DataSourceError, match="10MB"):
+        await slice_audio(wav, segment_duration=270, overlap=3)
+
+
 async def test_convert_to_wav_no_ffmpeg_raises_datasource_error(
     tmp_path, monkeypatch
 ):

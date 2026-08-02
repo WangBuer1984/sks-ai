@@ -111,6 +111,25 @@ async def test_recognize_wav_transient_retries_then_raises(monkeypatch):
     assert call_count["n"] == 3
 
 
+async def test_recognize_wav_retries_non_runtime_network_errors(monkeypatch):
+    """dashscope/httpx 等非 RuntimeError 瞬态也须重试并最终 DataSourceError。"""
+    from app.datasource.media import qwen_asr
+
+    monkeypatch.setattr(settings, "ALIYUN_ASR_KEY", "fake-key")
+    call_count = {"n": 0}
+
+    def fake_call(**kwargs):
+        call_count["n"] += 1
+        raise ConnectionError("connection reset")
+
+    monkeypatch.setattr(qwen_asr.MultiModalConversation, "call", fake_call)
+
+    with pytest.raises(DataSourceError, match="after 3 retries"):
+        await qwen_asr.recognize_wav("/tmp/x.wav")
+
+    assert call_count["n"] == 3
+
+
 # ---------------------------------------------------------------------------
 # 3. 空文本：不重试，立即 DataSourceError("qwen asr empty text")
 # ---------------------------------------------------------------------------
