@@ -35,6 +35,7 @@ import asyncio
 import logging
 import re
 from dataclasses import dataclass
+from typing import Literal
 from urllib.parse import urlparse
 
 import httpx
@@ -389,6 +390,41 @@ def _platform_of(url: str) -> str:
         return "douyin"
     if host.endswith("weixin.qq.com"):
         return "wechat_channels"
+    return "unknown"
+
+
+# 视频号账号短号（sph 前缀 + ≥1 字符）。裸串无 host/scheme，必须在 host 检测之前匹配，
+# 否则 ``urlparse("sphi9BjV8GK0Zsl").hostname`` 返回 None —— 虽不报错但会被归为 unknown。
+_SPH_ID_RE = re.compile(r"^sph[A-Za-z0-9_-]+$")
+
+
+def _account_entry_kind(
+    raw: str,
+) -> Literal["douyin", "channels_id", "channels_share", "unknown"]:
+    """拆账号入口分类：区分抖音短链 / 视频号 sph 短号 / 视频号分享页 / 未知。
+
+    account_top_videos / precheck 据此分发到对应平台取数路径。与 ``_platform_of``
+    不同：后者只做 host 归类，无法识别裸 ``sph…`` 短号，也无法区分 channels_id
+    与 channels_share（均为 weixin.qq.com host）。两者共存，职责互补。
+
+    顺序约束（load-bearing）：
+      1. strip + 空串 → unknown；
+      2. ``_SPH_ID_RE.fullmatch`` 命中 → channels_id（裸 sph 短号无 host，须先判）；
+      3. douyin host → douyin；
+      4. weixin.qq.com host 且 path 含 ``/sph/`` → channels_share；
+      5. 其余 → unknown。
+    """
+    s = (raw or "").strip()
+    if not s:
+        return "unknown"
+    if _SPH_ID_RE.fullmatch(s):
+        return "channels_id"
+    host = (urlparse(s).hostname or "").lower()
+    if host.endswith("douyin.com") or host.endswith("iesdouyin.com"):
+        return "douyin"
+    path = urlparse(s).path or ""
+    if host.endswith("weixin.qq.com") and "/sph/" in path:
+        return "channels_share"
     return "unknown"
 
 

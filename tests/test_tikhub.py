@@ -20,6 +20,7 @@ from app.datasource.tikhub import (
     DOUYIN_DOWNLOAD_HEADERS,
     HotItem,
     VideoMeta,
+    _account_entry_kind,
     _base_url,
     _channels_title,
     _platform_of,
@@ -628,3 +629,16 @@ def test_video_meta_to_media_ref_channels_keeps_decode_key_pair():
     assert ref.headers == CHANNELS_DOWNLOAD_HEADERS
     assert ref.headers is not CHANNELS_DOWNLOAD_HEADERS
     assert ref.author == "胖掌柜"
+
+
+# ---- _account_entry_kind：拆账号入口分类（含裸 sph）-----------------------
+
+def test_account_entry_kind_classifies_inputs():
+    assert _account_entry_kind("https://v.douyin.com/abc/") == "douyin"
+    assert _account_entry_kind("sphi9BjV8GK0Zsl") == "channels_id"
+    assert _account_entry_kind("https://weixin.qq.com/sph/ADk6xBh2hq") == "channels_share"
+    assert _account_entry_kind("  sphABC_123  ") == "channels_id"
+    assert _account_entry_kind("not-a-url") == "unknown"
+    assert _account_entry_kind("https://example.com/x") == "unknown"
+    # 裸串不得崩
+    assert _account_entry_kind("sph") == "unknown"  # 过短 / 不匹配完整 pattern 则 unknown；按 ^sph[A-Za-z0-9_-]+$，「sph」仅前缀不够 → unknown
