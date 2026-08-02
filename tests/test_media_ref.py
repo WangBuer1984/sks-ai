@@ -32,6 +32,9 @@ def test_parse_video_null_url_list_entry_becomes_empty():
 def test_safe_int_tolerates_formatted_counts():
     assert _safe_int("1,234") == 1234
     assert _safe_int("1.2k") == 1200
+    assert _safe_int("1.5m") == 1_500_000
+    assert _safe_int(True) == 1
+    assert _safe_int(False) == 0
     assert _safe_int("bad") == 0
     assert _safe_int(None) == 0
 

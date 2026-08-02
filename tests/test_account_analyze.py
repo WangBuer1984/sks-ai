@@ -330,29 +330,60 @@ async def test_account_heartbeat_during_long_transcribe(monkeypatch):
     assert len(hb) >= 2, f"心跳应多次 touch，实际 {len(hb)} 次"
 
 
-# ---- 端点鉴权 + 202 --------------------------------------------------------
+# ---- 端点鉴权 + 202（ASGITransport，避开 TestClient×asyncpg loop flaky） ------
 
-def test_account_endpoint_requires_token(monkeypatch):
-    from fastapi.testclient import TestClient
+async def _noop_lifespan_deps():
+    """跳过真实 DB pool / checkpointer（httpx 0.28 ASGITransport 无 lifespan= 参数）。"""
+    return None
+
+
+def _patch_asgi_lifespan_deps(monkeypatch):
+    """AsyncClient+ASGITransport 若触发 lifespan，避免连真实 Postgres。"""
+    monkeypatch.setattr("app.main.init_pool", _noop_lifespan_deps)
+    monkeypatch.setattr("app.main.close_pool", _noop_lifespan_deps)
+    monkeypatch.setattr("app.main._init_checkpointer", _noop_lifespan_deps)
+
+
+async def test_account_endpoint_requires_token(monkeypatch):
+    from httpx import ASGITransport, AsyncClient
     from app.main import app
 
+    _patch_asgi_lifespan_deps(monkeypatch)
     monkeypatch.setattr(settings, "SERVICE_TOKEN", "test-secret")
 
     async def _noop(*a, **kw):
         return None
 
     monkeypatch.setattr("app.api.analyze.analyze_account", _noop)
-    with TestClient(app) as c:
-        r = c.post("/ai/analyze/account", json={"task_id": 1, "url": "https://u"})
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as c:
+        r = await c.post("/ai/analyze/account", json={"task_id": 1, "url": "https://u"})
     assert r.status_code == 422
 
 
-def test_account_endpoint_returns_202_and_sets_running_before_background(monkeypatch):
+async def test_account_endpoint_wrong_token_rejected(monkeypatch):
+    from httpx import ASGITransport, AsyncClient
+    from app.main import app
+
+    _patch_asgi_lifespan_deps(monkeypatch)
+    monkeypatch.setattr(settings, "SERVICE_TOKEN", "test-secret")
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as c:
+        r = await c.post(
+            "/ai/analyze/account",
+            json={"task_id": 1, "url": "https://u"},
+            headers={"X-Service-Token": "wrong"},
+        )
+    assert r.status_code == 403
+
+
+async def test_account_endpoint_returns_202_and_sets_running_before_background(monkeypatch):
     """endpoint 先写 running，再 BackgroundTasks，返回 202 {task_id}。"""
-    from fastapi.testclient import TestClient
+    from httpx import ASGITransport, AsyncClient
     from app.main import app
     import app.skills.account_analyze.graph as ag
 
+    _patch_asgi_lifespan_deps(monkeypatch)
     order: list[str] = []
 
     async def _update_task(task_id, *, status=None, progress=None, result=None, error=None):
@@ -365,10 +396,13 @@ def test_account_endpoint_returns_202_and_sets_running_before_background(monkeyp
     monkeypatch.setattr("app.api.analyze.analyze_account", _analyze)
     monkeypatch.setattr(settings, "SERVICE_TOKEN", "test-secret")
 
-    with TestClient(app) as c:
-        r = c.post("/ai/analyze/account",
-                   json={"task_id": 11, "url": "https://u"},
-                   headers={"X-Service-Token": "test-secret"})
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as c:
+        r = await c.post(
+            "/ai/analyze/account",
+            json={"task_id": 11, "url": "https://u"},
+            headers={"X-Service-Token": "test-secret"},
+        )
     assert r.status_code == 202
     assert r.json() == {"task_id": 11}
     assert order[0] == "update:running"

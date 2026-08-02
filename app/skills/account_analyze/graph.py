@@ -21,8 +21,9 @@
   result 仍写三层（在成功条目上归纳）+ videos 摘要，error 写失败条数。Java 按比例退款一次。
 - ``failed``：全量 scrape DataSourceError / 所有条目失败 / summary 致命错误 → 全额退款。
 
-心跳：每条 transcribe 用 ``_transcribe_with_heartbeat`` 包裹，轮询间隙 touch updated_at，
-防 Java 5min running-timeout 误判（与 video_analyze 同实现）。
+心跳：``account_top_videos``（视频号可多页）与每条 ``transcribe`` 均用
+``_run_with_heartbeat`` 包裹，轮询间隙 touch updated_at，防 Java 5min
+running-timeout 误判（与 video_analyze 同实现）。
 
 模块级别名 ``chat`` / ``check`` / ``transcribe`` / ``account_top_videos`` / ``update_task`` /
 ``insert_benchmark_video`` / ``heartbeat`` 是测试 monkeypatch 目标。
@@ -149,11 +150,11 @@ async def _summarize(items: list[dict[str, Any]]) -> dict[str, Any] | None:
     return {k: result.get(k, "") for k in _SUMMARY_FIELDS}
 
 
-# ---- 心跳包裹的转写（与 video_analyze 同实现，保持独立便于单测） -----------
+# ---- 心跳包裹（与 video_analyze 同实现，保持独立便于单测） -----------------
 
-async def _transcribe_with_heartbeat(task_id: int, media: MediaRef | str) -> str:
-    """transcribe + 周期心跳：长转写期间每 HEARTBEAT_INTERVAL touch updated_at。"""
-    task = asyncio.create_task(transcribe(media))
+async def _run_with_heartbeat(task_id: int, coro):
+    """任意长协程 + 周期心跳：每 HEARTBEAT_INTERVAL touch updated_at。"""
+    task = asyncio.create_task(coro)
     while True:
         await heartbeat(task_id)
         if task.done():
@@ -162,6 +163,11 @@ async def _transcribe_with_heartbeat(task_id: int, media: MediaRef | str) -> str
             return await asyncio.wait_for(asyncio.shield(task), timeout=HEARTBEAT_INTERVAL)
         except asyncio.TimeoutError:
             continue
+
+
+async def _transcribe_with_heartbeat(task_id: int, media: MediaRef | str) -> str:
+    """transcribe + 周期心跳（薄包装，兼容既有测试 monkeypatch 点）。"""
+    return await _run_with_heartbeat(task_id, transcribe(media))
 
 
 # ---- 入口：后台异步 --------------------------------------------------------
@@ -174,9 +180,12 @@ async def analyze_account(task_id: int, url: str) -> None:
     """
     await update_task(task_id, status="running", progress=0)
 
-    # 1. 全量 scrape——DataSourceError 直接 failed（Java 全额退款）
+    # 1. 全量 scrape（含视频号多页）——须心跳，慢网下可 1–3min。
+    # DataSourceError → failed（Java 全额退款）
     try:
-        videos = await account_top_videos(url, n=_TOP_N)
+        videos = await _run_with_heartbeat(
+            task_id, account_top_videos(url, n=_TOP_N)
+        )
     except DataSourceError as e:
         await update_task(task_id, status="failed", error=str(e))
         return

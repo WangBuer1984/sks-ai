@@ -1,4 +1,4 @@
-"""三路信号量懒单例：ASR / download / convert。
+"""四路信号量懒单例：ASR / download / convert / channels decode。
 
 懒创建（首次调用时构造 ``asyncio.Semaphore``）——不在 import 时构造，避免在
 测试 runner 捕获到错误的 event loop。每个 getter 跨调用返回同一实例。
@@ -11,6 +11,7 @@
   - ASR 并发：3（DashScope qwen3-asr-flash 同步接口，按量计费，限流保守）
   - download 并发：5
   - convert（ffmpeg）并发：4
+  - channels decode（node WASM）并发：2（峰值内存保护）
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ import asyncio
 _asr_sem: asyncio.Semaphore | None = None
 _download_sem: asyncio.Semaphore | None = None
 _convert_sem: asyncio.Semaphore | None = None
+_decode_sem: asyncio.Semaphore | None = None
 
 
 def get_asr_semaphore() -> asyncio.Semaphore:
@@ -44,3 +46,11 @@ def get_convert_semaphore() -> asyncio.Semaphore:
     if _convert_sem is None:
         _convert_sem = asyncio.Semaphore(4)
     return _convert_sem
+
+
+def get_decode_semaphore() -> asyncio.Semaphore:
+    """视频号 WASM decode 并发信号量（默认 2）。跨调用返回同一实例；懒创建。"""
+    global _decode_sem
+    if _decode_sem is None:
+        _decode_sem = asyncio.Semaphore(2)
+    return _decode_sem

@@ -26,11 +26,19 @@ _CLI = _WASM_DIR / "decrypt_cli.js"
 _KEYSTREAM_SIZE = 131_072
 
 
+def _unlink_quiet(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def decode_channels_media(src: Path, decode_key: str) -> Path:
     """解密视频号加密文件，写出 ``*_decoded.mp4`` 并返回路径。
 
     要求 PATH 上有 ``node``；缺 node / CLI / WASM 资产 → ``DataSourceError``。
     解密失败（非 ftyp）由 CLI 非零退出，翻译为 ``DataSourceError``。
+    失败路径会尽量删除已写出的 ``out``，避免孤儿文件依赖 2h GC。
     """
     key = (decode_key or "").strip()
     if not key:
@@ -50,29 +58,42 @@ def decode_channels_media(src: Path, decode_key: str) -> Path:
 
     out = src.with_name(f"{src.stem}_decoded.mp4")
     try:
-        proc = subprocess.run(
-            [node, str(_CLI), str(src), key, str(out)],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
-    except subprocess.TimeoutExpired as e:
-        raise DataSourceError("channels decode timed out") from e
-    except OSError as e:
-        raise DataSourceError(f"channels decode failed to spawn node: {e}") from e
+        try:
+            proc = subprocess.run(
+                [node, str(_CLI), str(src), key, str(out)],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+        except subprocess.TimeoutExpired as e:
+            _unlink_quiet(out)
+            raise DataSourceError("channels decode timed out") from e
+        except OSError as e:
+            _unlink_quiet(out)
+            raise DataSourceError(f"channels decode failed to spawn node: {e}") from e
 
-    if proc.returncode != 0:
-        err = (proc.stderr or proc.stdout or "").strip()[:300]
-        raise DataSourceError(f"channels decode failed: {err or f'exit {proc.returncode}'}")
-    if not out.is_file():
-        raise DataSourceError("channels decode produced no output file")
+        if proc.returncode != 0:
+            _unlink_quiet(out)
+            err = (proc.stderr or proc.stdout or "").strip()[:300]
+            raise DataSourceError(
+                f"channels decode failed: {err or f'exit {proc.returncode}'}"
+            )
+        if not out.is_file():
+            raise DataSourceError("channels decode produced no output file")
 
-    # 轻量二次校验（CLI 内已 assertMp4；此处防写盘残缺）。只读 8 字节，禁全量入内存。
-    with out.open("rb") as fh:
-        head = fh.read(8)
-    if len(head) < 8 or head[4:8] != b"ftyp":
-        raise DataSourceError("channels decode: output missing MP4 ftyp signature")
+        # 轻量二次校验（CLI 内已 assertMp4；此处防写盘残缺）。只读 8 字节，禁全量入内存。
+        with out.open("rb") as fh:
+            head = fh.read(8)
+        if len(head) < 8 or head[4:8] != b"ftyp":
+            _unlink_quiet(out)
+            raise DataSourceError("channels decode: output missing MP4 ftyp signature")
+    except DataSourceError:
+        raise
+    except Exception:
+        _unlink_quiet(out)
+        raise
+
     log.info(
         "channels decode ok: src=%s out=%s keystream=%d",
         src.name, out.name, _KEYSTREAM_SIZE,

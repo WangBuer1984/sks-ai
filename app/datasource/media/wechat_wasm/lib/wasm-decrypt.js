@@ -150,14 +150,41 @@ async function createDecryptor(wasmDir) {
     });
   }
 
-  /** 解密整个文件（读盘 → 密钥流 → XOR → 校验 → 写盘） */
+  /**
+   * 解密文件：只把前 KEYSTREAM_SIZE 读入内存做 XOR；其余 createReadStream→WriteStream
+   * 管道拷贝。避免数百 MB 整文件进 Node Buffer（与 Python 流式 download 对齐）。
+   */
   async function decryptFile(inputPath, decodeKey, outputPath) {
-    const encrypted = fs.readFileSync(inputPath);
     const keystream = await generateKeystream(decodeKey);
-    const decrypted = xorDecrypt(encrypted, keystream);
-    assertMp4(decrypted); // 校验 bytes[4:8] === 'ftyp'
-    fs.writeFileSync(outputPath, decrypted);
-    return { outputPath, encryptedSize: encrypted.length, decryptedSize: decrypted.length };
+    const st = fs.statSync(inputPath);
+    const headLen = Math.min(KEYSTREAM_SIZE, st.size);
+    const fd = fs.openSync(inputPath, 'r');
+    let outFd = -1;
+    try {
+      const head = Buffer.alloc(headLen);
+      fs.readSync(fd, head, 0, headLen, 0);
+      const decryptedHead = xorDecrypt(head, keystream);
+      assertMp4(decryptedHead);
+
+      outFd = fs.openSync(outputPath, 'w');
+      fs.writeSync(outFd, decryptedHead);
+
+      const CHUNK = 1024 * 1024;
+      let pos = headLen;
+      while (pos < st.size) {
+        const n = Math.min(CHUNK, st.size - pos);
+        const buf = Buffer.alloc(n);
+        fs.readSync(fd, buf, 0, n, pos);
+        fs.writeSync(outFd, buf);
+        pos += n;
+      }
+      return { outputPath, encryptedSize: st.size, decryptedSize: st.size };
+    } finally {
+      try { fs.closeSync(fd); } catch (_) { /* ignore */ }
+      if (outFd >= 0) {
+        try { fs.closeSync(outFd); } catch (_) { /* ignore */ }
+      }
+    }
   }
 
   return { Module, generateKeystream, decryptFile, decryptBuffer: xorDecrypt, assertMp4 };

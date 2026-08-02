@@ -46,6 +46,7 @@ from app.datasource.media.qwen_asr import recognize_wav
 from app.datasource.media.semaphores import (
     get_asr_semaphore,
     get_convert_semaphore,
+    get_decode_semaphore,
     get_download_semaphore,
 )
 
@@ -99,13 +100,17 @@ async def transcribe(media: Union[MediaRef, str]) -> str:
         ) from e
 
 
+_TEMP_DIR_PREFIXES = ("sks_asr_wav_", "sks_asr_slice_")
+
+
 async def _transcribe_inner(media: Union[MediaRef, str]) -> str:
     """管线编排本体：own temps 列表 + try/finally 清理。
 
     ``transcribe`` 的 ``wait_for`` 超时会 cancel 本协程，CPython 仍运行本 ``finally``
-    → ``temps`` 中的下载/转码/切片产物均被 unlink（``missing_ok=True``）。
+    → ``temps`` 中的下载/转码/切片产物均被 unlink（``missing_ok=True``）；
+    ``sks_asr_wav_*`` / ``sks_asr_slice_*`` 父目录一并 rmtree，避免空目录堆 inode。
     """
-    gc_stale_tmp()
+    await asyncio.to_thread(gc_stale_tmp)
 
     # str → MediaRef（裸 str：unknown 平台、空 headers，绝不猜 douyin 头）。
     ref = media if isinstance(media, MediaRef) else MediaRef(
@@ -119,11 +124,12 @@ async def _transcribe_inner(media: Union[MediaRef, str]) -> str:
             src = await download_url(ref.download_url, headers=ref.headers or None)
         temps.append(src)
 
-        # channels decode：有 decode_key 才解密（to_thread）；缺 key 视为未加密，直进 ffmpeg。
+        # channels decode：有 decode_key 才解密（to_thread + decode_sem）；缺 key 直进 ffmpeg。
         if ref.decode_key:
             if decode_media is None:
                 raise DataSourceError("channels decode not enabled")
-            src = await asyncio.to_thread(decode_media, src, ref.decode_key)
+            async with get_decode_semaphore():
+                src = await asyncio.to_thread(decode_media, src, ref.decode_key)
             temps.append(src)
 
         # 转码到 WAV 16k mono。
@@ -164,9 +170,13 @@ async def _transcribe_inner(media: Union[MediaRef, str]) -> str:
             raise DataSourceError("asr produced empty transcript")
         return text
     finally:
-        # 任何路径（成功/异常/cancel）均 unlink temps；missing_ok 容忍已被删的。
+        dirs: set[Path] = set()
         for p in temps:
             try:
+                if p.parent.name.startswith(_TEMP_DIR_PREFIXES):
+                    dirs.add(p.parent)
                 p.unlink(missing_ok=True)
             except OSError:
                 pass
+        for d in dirs:
+            shutil.rmtree(d, ignore_errors=True)

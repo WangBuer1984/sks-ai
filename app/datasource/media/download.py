@@ -87,10 +87,18 @@ async def download_url(
                     dir=settings.ASR_TMP_DIR or None,
                 )
                 written = 0
-                with os.fdopen(fd, "wb") as f:
+                f = None
+                try:
+                    f = os.fdopen(fd, "wb")
+                    fd = -1  # ownership transferred
                     async for chunk in resp.aiter_bytes(chunk_size=_CHUNK_SIZE):
                         f.write(chunk)
                         written += len(chunk)
+                finally:
+                    if f is not None:
+                        f.close()
+                    elif fd >= 0:
+                        os.close(fd)
         except httpx.HTTPError as exc:
             raise DataSourceError(f"download transport error for {url}: {exc}") from exc
         except OSError as exc:

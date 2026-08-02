@@ -90,10 +90,10 @@ CHANNELS_DOWNLOAD_HEADERS: dict[str, str] = {
 # 联调期需确认阿里云侧能否拉到该直链；如不能，需在 transcribe 内先下载再传 file_link。
 _TIMEOUT = httpx.Timeout(30.0, connect=10.0)
 
-# === TikHub GET 瞬时错误重试策略（仅作用于幂等的 _get_json，不含 transcribe._submit_task） ===
-# Brief Step 3「超时重试」：TikHub 四个 GET 端点均为幂等读，瞬时网络抖动/5xx 重试安全。
-# transcribe._submit_task（阿里云 SubmitTask）非幂等——严禁重试（会创建重复转写任务）。
-_RETRY_ATTEMPTS = 3  # 总尝试次数（首次 + 2 次重试）
+# === TikHub GET 瞬时错误重试（仅幂等 GET；POST 计费接口默认不重试） ===
+# GET 端点瞬时网络抖动/5xx 重试安全。视频号 POST（fetch_video_detail /
+# fetch_user_videos）上游可能已记账，5xx 再打会放大账单 → ``_post_json`` retry=False。
+_RETRY_ATTEMPTS = 3  # GET 总尝试次数（首次 + 2 次重试）
 _RETRY_BACKOFFS = (0.5, 1.5)  # 每次重试前 sleep 秒数（attempt 0→0.5s, attempt 1→1.5s）
 # 仅瞬时传输错误 + 5xx 可重试；4xx（bad URL/auth）与业务 code!=200（确定性失败）不重试。
 _RETRYABLE_TRANSPORT_ERRORS = (
@@ -149,17 +149,18 @@ async def _request_json(
     *,
     params: dict | None = None,
     json_body: dict | None = None,
+    retry: bool = True,
 ) -> dict:
-    """TikHub JSON 请求（GET/POST），带瞬时错误有界重试。
+    """TikHub JSON 请求（GET/POST）。
 
-    重试仅覆盖瞬时传输错误（ConnectError/ReadTimeout/ConnectTimeout/
-    RemoteProtocolError）与 HTTP 5xx。4xx 客户端错误与 TikHub 业务 code!=200
-    属确定性失败，不重试。重试上限 ``_RETRY_ATTEMPTS`` 次，backoff 见
-    ``_RETRY_BACKOFFS``。耗尽后抛 DataSourceError（与历史行为一致）。
+    ``retry=True``（默认，供 GET）：瞬时传输错误与 HTTP 5xx 最多
+    ``_RETRY_ATTEMPTS`` 次。``retry=False``（POST 计费）：单次尝试，失败立即
+    ``DataSourceError``。4xx / 业务 code!=200 从不重试。
     """
     url = f"{_base_url()}{path}"
+    attempts = _RETRY_ATTEMPTS if retry else 1
     last_exc: Exception | None = None
-    for attempt in range(_RETRY_ATTEMPTS):
+    for attempt in range(attempts):
         try:
             resp = await client.request(
                 method,
@@ -171,25 +172,25 @@ async def _request_json(
             )
         except _RETRYABLE_TRANSPORT_ERRORS as e:
             last_exc = e
-            if attempt < _RETRY_ATTEMPTS - 1:
+            if attempt < attempts - 1:
                 log.warning(
                     "tikhub transient transport error (%s) attempt %d/%d, retrying: %s",
-                    path, attempt + 1, _RETRY_ATTEMPTS, e,
+                    path, attempt + 1, attempts, e,
                 )
                 await _sleep(_RETRY_BACKOFFS[attempt])
                 continue
             raise DataSourceError(
-                f"tikhub transport failed ({path}) after {_RETRY_ATTEMPTS} attempts: {e}"
+                f"tikhub transport failed ({path}) after {attempts} attempts: {e}"
             ) from e
         except httpx.HTTPError as e:
             # 其他 httpx 错误（非瞬时）——不重试
             raise DataSourceError(f"tikhub transport failed ({path}): {e}") from e
-        # 5xx 视为上游瞬时错误，可重试
+        # 5xx 视为上游瞬时错误，可重试（仅 retry=True）
         if 500 <= resp.status_code < 600:
-            if attempt < _RETRY_ATTEMPTS - 1:
+            if attempt < attempts - 1:
                 log.warning(
                     "tikhub http %d (%s) attempt %d/%d, retrying",
-                    resp.status_code, path, attempt + 1, _RETRY_ATTEMPTS,
+                    resp.status_code, path, attempt + 1, attempts,
                 )
                 last_exc = DataSourceError(
                     f"tikhub http {resp.status_code} ({path}): {resp.text[:200]}"
@@ -216,13 +217,15 @@ async def _request_json(
 
 
 async def _get_json(client: httpx.AsyncClient, path: str, params: dict | None = None) -> dict:
-    """GET TikHub JSON（``_request_json`` 薄包装，保持既有调用点）。"""
-    return await _request_json(client, "GET", path, params=params)
+    """GET TikHub JSON（幂等读，瞬时错误可重试）。"""
+    return await _request_json(client, "GET", path, params=params, retry=True)
 
 
 async def _post_json(client: httpx.AsyncClient, path: str, json_body: dict) -> dict:
-    """POST TikHub JSON（视频号 ``fetch_video_detail`` 等）。"""
-    return await _request_json(client, "POST", path, json_body=json_body)
+    """POST TikHub JSON（视频号计费接口，默认不重试）。"""
+    return await _request_json(
+        client, "POST", path, json_body=json_body, retry=False
+    )
 
 
 def _safe_int(value: object, default: int = 0) -> int:

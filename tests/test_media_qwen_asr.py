@@ -83,10 +83,11 @@ async def test_recognize_wav_success(monkeypatch):
     )
     assert "题" in sys_text and "作者" in sys_text
     # file:// 用绝对路径
+    from pathlib import Path
+
     user_content = messages[0]["content"]
     audio_url = user_content[0]["audio"]
-    assert audio_url.startswith("file://")
-    assert audio_url != "file:///tmp/x.wav" or audio_url.startswith("file:///")
+    assert audio_url == f"file://{Path('/tmp/x.wav').resolve()}"
 
 
 # ---------------------------------------------------------------------------
@@ -183,16 +184,20 @@ def test_semaphores_lazy_singleton():
     asr1, asr2 = semaphores.get_asr_semaphore(), semaphores.get_asr_semaphore()
     dl1, dl2 = semaphores.get_download_semaphore(), semaphores.get_download_semaphore()
     cv1, cv2 = semaphores.get_convert_semaphore(), semaphores.get_convert_semaphore()
+    dc1, dc2 = semaphores.get_decode_semaphore(), semaphores.get_decode_semaphore()
 
     assert asr1 is asr2
     assert dl1 is dl2
     assert cv1 is cv2
+    assert dc1 is dc2
     # 不同信号量互不相同
     assert asr1 is not dl1
     assert asr1 is not cv1
+    assert asr1 is not dc1
 
     # 初值（_value 是 asyncio.Semaphore 暴露的剩余配额，CPython 实现细节；
     # 此处断言以锁定期望值，若未来 CPython 改名则改为 identity-only 检查）。
     assert asr1._value == 3
     assert dl1._value == 5
     assert cv1._value == 4
+    assert dc1._value == 2
