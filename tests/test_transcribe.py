@@ -204,16 +204,26 @@ async def test_transcribe_decode_media_injected_and_called(monkeypatch, tmp_path
 
 
 @pytest.mark.asyncio
-async def test_transcribe_channels_missing_decode_key_errors(monkeypatch, tmp_path):
-    _common_seams(monkeypatch, tmp_path)
+async def test_transcribe_channels_missing_decode_key_skips_decode(monkeypatch, tmp_path):
+    """无 decode_key → 跳过 WASM，直进 convert（未加密或 TikHub 缺字段）。"""
+    cap = _common_seams(monkeypatch, tmp_path)
+    called = {"n": 0}
+
+    def _fake_decode(src, key):
+        called["n"] += 1
+        return src
+
+    monkeypatch.setattr(tr, "decode_media", _fake_decode)
     ref = MediaRef(
         platform="wechat_channels",
         download_url="https://x/a.mp4",
         headers={},
         decode_key=None,
     )
-    with pytest.raises(DataSourceError, match="missing decode_key"):
-        await tr.transcribe(ref)
+    text = await tr.transcribe(ref)
+    assert text == "你好"
+    assert called["n"] == 0
+    assert len(cap["convert_calls"]) == 1
 
 
 # ---- contract 新增测试 ------------------------------------------------------

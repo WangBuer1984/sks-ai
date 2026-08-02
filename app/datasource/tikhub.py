@@ -34,6 +34,8 @@ import ast
 import asyncio
 import logging
 import re
+import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Literal
 from urllib.parse import urlparse
@@ -45,6 +47,12 @@ from app.datasource import DataSourceError
 from app.datasource.media import MediaRef
 
 log = logging.getLogger(__name__)
+
+# 分享链 fetch_video_detail 进程内短缓存：precheck 与 account_top_videos /
+# channels_video_meta 常对同一 URL 各打一次，TTL 内复用响应减 TikHub 双倍账单。
+_CHANNELS_DETAIL_TTL_SEC = 300.0
+_CHANNELS_DETAIL_CACHE_MAX = 64
+_channels_detail_cache: OrderedDict[str, tuple[float, dict]] = OrderedDict()
 
 # === 抖音下载请求头 ===
 # 抖音 CDN 直链下载需带浏览器 UA + Referer: https://www.douyin.com/，否则 403。
@@ -260,15 +268,12 @@ def video_meta_to_media_ref(v: VideoMeta) -> MediaRef:
     """VideoMeta → MediaRef（按 platform/decode_key 装配下载头 + 解码键）。
 
     ``v.platform=="wechat_channels"`` 或带 ``decode_key`` → 视频号分支：注入
-    ``CHANNELS_DOWNLOAD_HEADERS`` 并透传 ``decode_key``；否则抖音分支，注入
-    ``DOUYIN_DOWNLOAD_HEADERS``。``headers=dict(...)`` 均复制新鲜字典，避免多个
-    ref 共享模块级可变 dict。``title``/``author`` 空串归一为 ``None``（下游空值更稳）。
+    ``CHANNELS_DOWNLOAD_HEADERS`` 并透传 ``decode_key``（可为 None——未加密或
+    TikHub 缺字段时跳过 decode，由 ffmpeg 实际成败判定）；否则抖音分支。
+    ``headers=dict(...)`` 均复制新鲜字典，避免多个 ref 共享模块级可变 dict。
+    ``title``/``author`` 空串归一为 ``None``（下游空值更稳）。
     """
     if v.platform == "wechat_channels" or v.decode_key:
-        if not v.decode_key:
-            raise DataSourceError(
-                "video_meta_to_media_ref: wechat_channels requires decode_key"
-            )
         return MediaRef(
             platform="wechat_channels",
             download_url=v.download_url,
@@ -358,19 +363,61 @@ async def account_top_videos(url: str, n: int = 20, *, client: httpx.AsyncClient
             await client.aclose()
 
 
+def _clear_channels_detail_cache() -> None:
+    """测试 seam：清空分享链 detail 缓存。"""
+    _channels_detail_cache.clear()
+
+
+def _channels_detail_cache_get(share_url: str) -> dict | None:
+    now = time.monotonic()
+    item = _channels_detail_cache.get(share_url)
+    if item is None:
+        return None
+    expires, body = item
+    if expires <= now:
+        _channels_detail_cache.pop(share_url, None)
+        return None
+    _channels_detail_cache.move_to_end(share_url)
+    return body
+
+
+def _channels_detail_cache_put(share_url: str, body: dict) -> None:
+    _channels_detail_cache[share_url] = (
+        time.monotonic() + _CHANNELS_DETAIL_TTL_SEC,
+        body,
+    )
+    _channels_detail_cache.move_to_end(share_url)
+    while len(_channels_detail_cache) > _CHANNELS_DETAIL_CACHE_MAX:
+        _channels_detail_cache.popitem(last=False)
+
+
+async def _fetch_channels_video_detail(
+    client: httpx.AsyncClient, share_url: str
+) -> dict:
+    """``fetch_video_detail`` + 短 TTL 缓存（按 strip 后的 share_url）。"""
+    key = share_url.strip()
+    hit = _channels_detail_cache_get(key)
+    if hit is not None:
+        log.debug("channels video_detail cache hit url=%s", key[:64])
+        return hit
+    body = await _post_json(
+        client,
+        _PATH_CHANNELS_VIDEO_DETAIL,
+        {"share_url": key, "raw": False},
+    )
+    _channels_detail_cache_put(key, body)
+    return body
+
+
 async def _resolve_channels_username(client: httpx.AsyncClient, kind: str, raw: str) -> str | None:
     """视频号账号入口 → username。
 
-    channels_share（分享链）→ 复用 ``fetch_video_detail``，从单视频响应取
-    ``data.username``（不经 media）。其余 kind → None（不应被调用，
+    channels_share（分享链）→ ``_fetch_channels_video_detail``（带缓存），从单视频
+    响应取 ``data.username``。其余 kind → None（不应被调用，
     ``account_top_videos`` 已 dispatch）。
     """
     if kind == "channels_share":
-        body = await _post_json(
-            client,
-            _PATH_CHANNELS_VIDEO_DETAIL,
-            {"share_url": raw.strip(), "raw": False},
-        )
+        body = await _fetch_channels_video_detail(client, raw)
         u = (body.get("data") or {}).get("username")
         return u if isinstance(u, str) and u else None
     return None
@@ -380,10 +427,8 @@ def _parse_channels_video(item: dict, *, fallback_author: str = "") -> VideoMeta
     """视频号 ``fetch_user_videos`` 单条 → ``VideoMeta``。
 
     与 ``channels_video_meta`` 单视频装配口径一致：``full_url`` 优先，否则
-    ``url + url_token``；``decode_key`` 与 URL 配对透传；``title`` 经 ``_channels_title``
-    归一。**必须** 同时设置非空 ``decode_key`` 与 ``platform="wechat_channels"``——
-    production 取数走 ``video_meta_to_media_ref`` 的 channels 分支，二者缺一不可。
-    无 media / 无 full_url / 无 decode_key → None（跳过该条）。
+    ``url + url_token``；``decode_key`` 有则配对透传（缺省 None，允许未加密片）；
+    ``platform="wechat_channels"``。无 media / 无 full_url → None（跳过该条）。
     """
     media = item.get("media") or {}
     if not isinstance(media, dict):
@@ -394,9 +439,7 @@ def _parse_channels_video(item: dict, *, fallback_author: str = "") -> VideoMeta
     if not full:
         return None
     dk = media.get("decode_key") or media.get("decodeKey")
-    decode_key = str(dk).strip() if dk not in (None, "") else ""
-    if not decode_key:
-        return None
+    decode_key = str(dk).strip() if dk not in (None, "") else None
     fav = item.get("fav_count")
     if fav is None:
         fav = item.get("like_count")
@@ -582,10 +625,11 @@ def _channels_title(raw: object) -> str:
 
 
 async def channels_video_meta(url: str, *, client: httpx.AsyncClient | None = None) -> MediaRef:
-    """视频号分享短链 → ``MediaRef``（``full_url`` + ``decode_key`` + nickname/title）。
+    """视频号分享短链 → ``MediaRef``（``full_url`` + 可选 ``decode_key`` + nickname/title）。
 
-    ``POST /api/v1/wechat_channels/v2/fetch_video_detail``，``raw=false`` 精简结构。
-    ``full_url`` 优先；否则 ``url + url_token``。``decode_key`` 与 URL 必须同一次响应配对。
+    ``POST …/fetch_video_detail``（经短缓存），``raw=false``。``full_url`` 优先；
+    否则 ``url + url_token``。``decode_key`` 有则与 URL 同响应配对；缺省 None
+    （未加密或字段缺失 → 跳过 WASM decode，直接转码）。
     """
     if not _is_configured():
         raise DataSourceError("TIKHUB_API_KEY not configured")
@@ -595,11 +639,7 @@ async def channels_video_meta(url: str, *, client: httpx.AsyncClient | None = No
     if own:
         client = httpx.AsyncClient()
     try:
-        body = await _post_json(
-            client,
-            _PATH_CHANNELS_VIDEO_DETAIL,
-            {"share_url": url, "raw": False},
-        )
+        body = await _fetch_channels_video_detail(client, url)
         data = body.get("data") or {}
         if not isinstance(data, dict) or not data:
             raise DataSourceError(f"channels_video_meta: empty data for url {url}")
@@ -614,9 +654,9 @@ async def channels_video_meta(url: str, *, client: httpx.AsyncClient | None = No
         if not full_url:
             raise DataSourceError("channels_video_meta: empty download_url")
         decode_key_raw = media.get("decode_key") or media.get("decodeKey")
-        decode_key = str(decode_key_raw).strip() if decode_key_raw not in (None, "") else ""
-        if not decode_key:
-            raise DataSourceError("channels_video_meta: missing decode_key")
+        decode_key = (
+            str(decode_key_raw).strip() if decode_key_raw not in (None, "") else None
+        )
         raw_id = data.get("id")
         return MediaRef(
             platform="wechat_channels",

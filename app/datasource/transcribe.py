@@ -119,9 +119,7 @@ async def _transcribe_inner(media: Union[MediaRef, str]) -> str:
             src = await download_url(ref.download_url, headers=ref.headers or None)
         temps.append(src)
 
-        # channels decode：视频号必须有 decode_key；同步 CLI 放 to_thread，避免堵事件循环。
-        if ref.platform == "wechat_channels" and not ref.decode_key:
-            raise DataSourceError("channels media missing decode_key")
+        # channels decode：有 decode_key 才解密（to_thread）；缺 key 视为未加密，直进 ffmpeg。
         if ref.decode_key:
             if decode_media is None:
                 raise DataSourceError("channels decode not enabled")

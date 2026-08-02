@@ -23,6 +23,7 @@ from app.datasource.tikhub import (
     _account_entry_kind,
     _base_url,
     _channels_title,
+    _clear_channels_detail_cache,
     _parse_channels_video,
     _platform_of,
     account_top_videos,
@@ -41,6 +42,14 @@ def _mock_client(handler) -> httpx.AsyncClient:
 
 def _auth_header(request: httpx.Request) -> str:
     return request.headers.get("Authorization", "")
+
+
+@pytest.fixture(autouse=True)
+def _clear_channels_detail_cache_between_tests():
+    """分享链 detail 短缓存不得跨测串味。"""
+    _clear_channels_detail_cache()
+    yield
+    _clear_channels_detail_cache()
 
 
 async def test_base_url_is_api_tikhub_dev():
@@ -666,8 +675,10 @@ async def test_resolve_media_channels_dispatches_to_channels_video_meta(monkeypa
     assert ref.decode_key == "k1"
 
 
-async def test_channels_video_meta_missing_decode_key_errors(monkeypatch):
+async def test_channels_video_meta_allows_missing_decode_key(monkeypatch):
+    """无 decode_key → MediaRef.decode_key=None（未加密/缺字段，跳过 WASM）。"""
     monkeypatch.setattr(settings, "TIKHUB_API_KEY", "tk")
+    _clear_channels_detail_cache()
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"code": 200, "data": {
@@ -675,19 +686,24 @@ async def test_channels_video_meta_missing_decode_key_errors(monkeypatch):
         }})
 
     client = _mock_client(handler)
-    with pytest.raises(DataSourceError, match="missing decode_key"):
-        await channels_video_meta("https://weixin.qq.com/sph/abc", client=client)
+    ref = await channels_video_meta("https://weixin.qq.com/sph/abc", client=client)
+    assert ref.platform == "wechat_channels"
+    assert ref.download_url == "http://cdn/v.mp4"
+    assert ref.decode_key is None
     await client.aclose()
 
 
-def test_parse_channels_video_skips_missing_decode_key():
-    assert _parse_channels_video({
+def test_parse_channels_video_allows_missing_decode_key():
+    v = _parse_channels_video({
         "title": "t", "read_count": 1, "nickname": "a",
         "media": {"full_url": "http://cdn/v.mp4"},
-    }) is None
+    })
+    assert v is not None
+    assert v.platform == "wechat_channels"
+    assert v.decode_key is None
 
 
-def test_video_meta_to_media_ref_channels_requires_decode_key():
+def test_video_meta_to_media_ref_channels_allows_missing_decode_key():
     v = VideoMeta(
         title="t", play_count=1, fav_count=0,
         download_url="http://cdn/a.mp4",
@@ -695,8 +711,45 @@ def test_video_meta_to_media_ref_channels_requires_decode_key():
         decode_key=None,
         platform="wechat_channels",
     )
-    with pytest.raises(DataSourceError, match="requires decode_key"):
-        video_meta_to_media_ref(v)
+    ref = video_meta_to_media_ref(v)
+    assert ref.platform == "wechat_channels"
+    assert ref.decode_key is None
+
+
+async def test_channels_detail_cached_across_precheck_and_account(monkeypatch):
+    """#9：同一分享链 precheck → account_top_videos 只打一次 fetch_video_detail。"""
+    monkeypatch.setattr(settings, "TIKHUB_API_KEY", "tk")
+    _clear_channels_detail_cache()
+    calls = {"detail": 0, "videos": 0}
+    url = "https://weixin.qq.com/sph/cache-me"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("fetch_video_detail"):
+            calls["detail"] += 1
+            return httpx.Response(200, json={"code": 200, "data": {
+                "username": "v2_cache@finder",
+                "nickname": "n",
+                "media": {"full_url": "http://cdn/x", "decode_key": "k"},
+            }})
+        if request.url.path.endswith("fetch_user_videos"):
+            calls["videos"] += 1
+            return httpx.Response(200, json={"code": 200, "data": {
+                "videos": [{
+                    "title": "t", "read_count": 1, "nickname": "n",
+                    "media": {"full_url": "http://cdn/v.mp4", "decode_key": "k1"},
+                }],
+                "up_continue": False,
+            }})
+        return httpx.Response(500, text=request.url.path)
+
+    client = _mock_client(handler)
+    r = await precheck(url, client=client)
+    assert r == {"reachable": True, "video_count": 1}
+    videos = await account_top_videos(url, n=5, client=client)
+    assert len(videos) == 1
+    assert calls["detail"] == 1
+    assert calls["videos"] == 2  # precheck 首页 + account 再拉一页
+    await client.aclose()
 
 
 # ---- Task 7 平台门禁：account_top_videos / precheck 抖音 only --------------
