@@ -29,6 +29,7 @@ from app.datasource.tikhub import (
     precheck,
     resolve_media,
     video_meta,
+    video_meta_to_media_ref,
 )
 
 
@@ -608,3 +609,22 @@ async def test_precheck_rejects_channels_host_before_http(monkeypatch):
     monkeypatch.setattr(settings, "TIKHUB_API_KEY", "tk-test-key")
     with pytest.raises(DataSourceError, match="douyin only"):
         await precheck("https://channels.weixin.qq.com/x")
+
+
+# ---- video_meta_to_media_ref：channels 装配 decode_key ----------------------
+
+def test_video_meta_to_media_ref_channels_keeps_decode_key_pair():
+    v = VideoMeta(
+        title="t", play_count=1, fav_count=2,
+        download_url="http://cdn/a.mp4?tok=1",
+        author="胖掌柜",
+        decode_key="910035402",
+        platform="wechat_channels",
+    )
+    ref = video_meta_to_media_ref(v)
+    assert ref.platform == "wechat_channels"
+    assert ref.download_url == v.download_url
+    assert ref.decode_key == "910035402"
+    assert ref.headers == CHANNELS_DOWNLOAD_HEADERS
+    assert ref.headers is not CHANNELS_DOWNLOAD_HEADERS
+    assert ref.author == "胖掌柜"

@@ -103,6 +103,8 @@ class VideoMeta:
     fav_count: int
     download_url: str
     author: str = ""  # aweme author.nickname / author.nick_name
+    decode_key: str | None = None  # 视频号 CDN 解码键；抖音无需解码，留 None
+    platform: str = "douyin"  # "douyin" / "wechat_channels"；驱动 media_ref 装配分支
 
 
 @dataclass
@@ -225,11 +227,22 @@ def _parse_video(item: dict) -> VideoMeta:
 
 
 def video_meta_to_media_ref(v: VideoMeta) -> MediaRef:
-    """VideoMeta → MediaRef（抖音下载头注入）。
+    """VideoMeta → MediaRef（按 platform/decode_key 装配下载头 + 解码键）。
 
-    ``headers=dict(DOUYIN_DOWNLOAD_HEADERS)`` 复制一份新鲜字典，避免多个 ref
-    共享模块级可变 dict。``title``/``author`` 空串归一为 ``None``（下游空值更稳）。
+    ``v.platform=="wechat_channels"`` 或带 ``decode_key`` → 视频号分支：注入
+    ``CHANNELS_DOWNLOAD_HEADERS`` 并透传 ``decode_key``；否则抖音分支，注入
+    ``DOUYIN_DOWNLOAD_HEADERS``。``headers=dict(...)`` 均复制新鲜字典，避免多个
+    ref 共享模块级可变 dict。``title``/``author`` 空串归一为 ``None``（下游空值更稳）。
     """
+    if v.platform == "wechat_channels" or v.decode_key:
+        return MediaRef(
+            platform="wechat_channels",
+            download_url=v.download_url,
+            headers=dict(CHANNELS_DOWNLOAD_HEADERS),
+            decode_key=v.decode_key,
+            title=v.title or None,
+            author=v.author or None,
+        )
     return MediaRef(
         platform="douyin",
         download_url=v.download_url,
