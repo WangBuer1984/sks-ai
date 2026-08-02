@@ -32,6 +32,10 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["app"]
 
+# 视频号 WASM 资产（非 .py）必须打进 wheel，否则 prod 镜像缺 decrypt runtime。
+[tool.hatch.build.targets.wheel.force-include]
+"app/datasource/media/wechat_wasm" = "app/datasource/media/wechat_wasm"
+
 [tool.uv]
 # 仅约束 dev 依赖（测试用）
 # 使用 PEP 735 dependency-groups（uv 0.11+ 推荐）；Dockerfile `uv sync --no-dev` 兼容。

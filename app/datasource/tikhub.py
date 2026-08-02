@@ -12,6 +12,10 @@
   - fetch_one_video_by_share:  GET /api/v1/douyin/web/fetch_one_video_by_share_url?url=
   - fetch_hot_total_list:      GET /api/v1/douyin/billboard/fetch_hot_total_list
 
+接口路径（视频号，单视频）：
+  - fetch_video_detail:        POST /api/v1/wechat_channels/v2/fetch_video_detail
+                               body ``{share_url, raw:false}`` → media.full_url + decode_key
+
 响应形状：TikHub 统一包络 ``{code, request_id, message, data: {...}}``；抖音 aweme 字段
 ``desc``（标题）/``statistics.play_count``/``statistics.digg_count``（收藏）/``video.play_addr.url_list``
 （下载直链）。**aweme_list / aweme_detail / hot_list 的精确嵌套层级需联调期用真实 key
@@ -26,8 +30,10 @@ Task 3.2/3.3 捕获后翻译（拆账号全量失败 → 全额退款 + 引导�
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import logging
+import re
 from dataclasses import dataclass
 from urllib.parse import urlparse
 
@@ -56,6 +62,15 @@ _PATH_GET_SEC_USER_ID = "/api/v1/douyin/web/get_sec_user_id"
 _PATH_USER_POST_VIDEOS = "/api/v1/douyin/app/v3/fetch_user_post_videos"
 _PATH_ONE_VIDEO_BY_SHARE = "/api/v1/douyin/web/fetch_one_video_by_share_url"
 _PATH_HOT_TOTAL_LIST = "/api/v1/douyin/billboard/fetch_hot_total_list"
+_PATH_CHANNELS_VIDEO_DETAIL = "/api/v1/wechat_channels/v2/fetch_video_detail"
+
+# 视频号 CDN 下载头（防盗链弱约束；完整鉴权已在 full_url = url+url_token）。
+CHANNELS_DOWNLOAD_HEADERS: dict[str, str] = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+    ),
+}
 
 # 阿里云录音文件识别用 OSS/public URL 直传，TikHub 下载直链多为短时签名 URL——
 # 联调期需确认阿里云侧能否拉到该直链；如不能，需在 transcribe 内先下载再传 file_link。
@@ -111,8 +126,15 @@ def _headers() -> dict[str, str]:
     return {"Authorization": f"Bearer {settings.TIKHUB_API_KEY}"}
 
 
-async def _get_json(client: httpx.AsyncClient, path: str, params: dict | None = None) -> dict:
-    """GET TikHub JSON，带瞬时错误有界重试。
+async def _request_json(
+    client: httpx.AsyncClient,
+    method: str,
+    path: str,
+    *,
+    params: dict | None = None,
+    json_body: dict | None = None,
+) -> dict:
+    """TikHub JSON 请求（GET/POST），带瞬时错误有界重试。
 
     重试仅覆盖瞬时传输错误（ConnectError/ReadTimeout/ConnectTimeout/
     RemoteProtocolError）与 HTTP 5xx。4xx 客户端错误与 TikHub 业务 code!=200
@@ -123,7 +145,14 @@ async def _get_json(client: httpx.AsyncClient, path: str, params: dict | None = 
     last_exc: Exception | None = None
     for attempt in range(_RETRY_ATTEMPTS):
         try:
-            resp = await client.get(url, params=params, headers=_headers(), timeout=_TIMEOUT)
+            resp = await client.request(
+                method,
+                url,
+                params=params,
+                json=json_body,
+                headers=_headers(),
+                timeout=_TIMEOUT,
+            )
         except _RETRYABLE_TRANSPORT_ERRORS as e:
             last_exc = e
             if attempt < _RETRY_ATTEMPTS - 1:
@@ -168,6 +197,16 @@ async def _get_json(client: httpx.AsyncClient, path: str, params: dict | None = 
     raise DataSourceError(
         f"tikhub retry loop exited unexpectedly ({path}): {last_exc}"
     )
+
+
+async def _get_json(client: httpx.AsyncClient, path: str, params: dict | None = None) -> dict:
+    """GET TikHub JSON（``_request_json`` 薄包装，保持既有调用点）。"""
+    return await _request_json(client, "GET", path, params=params)
+
+
+async def _post_json(client: httpx.AsyncClient, path: str, json_body: dict) -> dict:
+    """POST TikHub JSON（视频号 ``fetch_video_detail`` 等）。"""
+    return await _request_json(client, "POST", path, json_body=json_body)
 
 
 def _parse_video(item: dict) -> VideoMeta:
@@ -340,10 +379,84 @@ def _platform_of(url: str) -> str:
     return "unknown"
 
 
+def _channels_title(raw: object) -> str:
+    """视频号 ``title`` 字段归一：精简响应偶发返回 shortTitle 列表的 Python/JSON 串。"""
+    if raw is None:
+        return ""
+    if isinstance(raw, list) and raw and isinstance(raw[0], dict):
+        return str(raw[0].get("shortTitle") or raw[0].get("title") or "")
+    if not isinstance(raw, str):
+        return str(raw)
+    text = raw.strip()
+    if not text:
+        return ""
+    # raw=false 样例：``"[{'shortTitle': '职能部门正在杀死公司', ...}]"``
+    try:
+        parsed = ast.literal_eval(text)
+        if isinstance(parsed, list) and parsed and isinstance(parsed[0], dict):
+            return str(parsed[0].get("shortTitle") or parsed[0].get("title") or "")
+    except (ValueError, SyntaxError, MemoryError):
+        pass
+    m = re.search(r"shortTitle['\"]?\s*[:=]\s*['\"]([^'\"]+)", text)
+    if m:
+        return m.group(1)
+    return text
+
+
+async def channels_video_meta(url: str, *, client: httpx.AsyncClient | None = None) -> MediaRef:
+    """视频号分享短链 → ``MediaRef``（``full_url`` + ``decode_key`` + nickname/title）。
+
+    ``POST /api/v1/wechat_channels/v2/fetch_video_detail``，``raw=false`` 精简结构。
+    ``full_url`` 优先；否则 ``url + url_token``。``decode_key`` 与 URL 必须同一次响应配对。
+    """
+    if not _is_configured():
+        raise DataSourceError("TIKHUB_API_KEY not configured")
+    if _platform_of(url) != "wechat_channels":
+        raise DataSourceError(f"channels_video_meta: not a channels url {url}")
+    own = client is None
+    if own:
+        client = httpx.AsyncClient()
+    try:
+        body = await _post_json(
+            client,
+            _PATH_CHANNELS_VIDEO_DETAIL,
+            {"share_url": url, "raw": False},
+        )
+        data = body.get("data") or {}
+        if not isinstance(data, dict) or not data:
+            raise DataSourceError(f"channels_video_meta: empty data for url {url}")
+        media = data.get("media") or {}
+        if not isinstance(media, dict):
+            raise DataSourceError("channels_video_meta: media missing")
+        full_url = str(media.get("full_url") or "").strip()
+        if not full_url:
+            base = str(media.get("url") or "")
+            token = str(media.get("url_token") or media.get("urlToken") or "")
+            full_url = (base + token).strip()
+        if not full_url:
+            raise DataSourceError("channels_video_meta: empty download_url")
+        decode_key_raw = media.get("decode_key") or media.get("decodeKey")
+        decode_key = str(decode_key_raw).strip() if decode_key_raw not in (None, "") else None
+        raw_id = data.get("id")
+        return MediaRef(
+            platform="wechat_channels",
+            download_url=full_url,
+            headers=dict(CHANNELS_DOWNLOAD_HEADERS),
+            decode_key=decode_key,
+            title=_channels_title(data.get("title")) or None,
+            author=str(data.get("nickname") or "") or None,
+            raw_id=str(raw_id) if raw_id not in (None, "") else None,
+        )
+    finally:
+        if own:
+            await client.aclose()
+
+
 async def resolve_media(url: str, *, client: httpx.AsyncClient | None = None) -> MediaRef:
     """分享/短链 URL → ``MediaRef``（含下载直链 + 平台必带头 + author/title）。
 
     抖音 host → 调现有 ``video_meta(url, client=client)`` → ``video_meta_to_media_ref``；
+    视频号 host → ``channels_video_meta``（``full_url`` + ``decode_key``）；
     未知平台 → ``DataSourceError("unsupported url ...")``；
     ``video_meta`` 解析成功但 ``download_url`` 为空 → ``DataSourceError("empty download_url")``
     （高清 fallback 接口可选，本任务不实现——此即地板）。
@@ -352,6 +465,8 @@ async def resolve_media(url: str, *, client: httpx.AsyncClient | None = None) ->
     解析成 ``MediaRef`` 后，**原始分享链不再向下游传递**——``transcribe`` 只见直链 + 头。
     """
     platform = _platform_of(url)
+    if platform == "wechat_channels":
+        return await channels_video_meta(url, client=client)
     if platform != "douyin":
         raise DataSourceError(f"resolve_media: unsupported url {url}")
     vm = await video_meta(url, client=client)

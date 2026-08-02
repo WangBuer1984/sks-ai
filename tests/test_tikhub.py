@@ -16,12 +16,15 @@ from app.config import settings
 from app.datasource import DataSourceError
 from app.datasource.media import MediaRef
 from app.datasource.tikhub import (
+    CHANNELS_DOWNLOAD_HEADERS,
     DOUYIN_DOWNLOAD_HEADERS,
     HotItem,
     VideoMeta,
     _base_url,
+    _channels_title,
     _platform_of,
     account_top_videos,
+    channels_video_meta,
     hot_board,
     precheck,
     resolve_media,
@@ -444,11 +447,19 @@ async def test_platform_of_detects_douyin_hosts():
     assert _platform_of("https://v.douyin.com/abc/") == "douyin"
     assert _platform_of("https://www.douyin.com/video/123") == "douyin"
     assert _platform_of("https://www.iesdouyin.com/share/x") == "douyin"
-    # 微信视频号 host（Task 7 平台门预留）
+    # 微信视频号 host（sph 短链 + channels 子域）
     assert _platform_of("https://channels.weixin.qq.com/x") == "wechat_channels"
+    assert _platform_of("https://weixin.qq.com/sph/ADk6xBh2hq") == "wechat_channels"
     # 未知 host
     assert _platform_of("https://example.com/v") == "unknown"
     assert _platform_of("not-a-url") == "unknown"
+
+
+def test_channels_title_parses_short_title_repr():
+    raw = "[{'shortTitle': '职能部门正在杀死公司', 'pbRequestMsgInfo': None}]"
+    assert _channels_title(raw) == "职能部门正在杀死公司"
+    assert _channels_title([{"shortTitle": "直接列表"}]) == "直接列表"
+    assert _channels_title("普通标题") == "普通标题"
 
 
 async def test_resolve_media_douyin_calls_video_meta_and_returns_media_ref(monkeypatch):
@@ -515,6 +526,72 @@ async def test_resolve_media_empty_download_url_raises_datasource_error(monkeypa
 
     with pytest.raises(DataSourceError, match="empty download_url"):
         await resolve_media("https://v.douyin.com/abc")
+
+
+async def test_channels_video_meta_parses_full_url_and_decode_key(monkeypatch):
+    """raw=false 精简结构 → MediaRef(full_url, decode_key, author/title)。"""
+    monkeypatch.setattr(settings, "TIKHUB_API_KEY", "tk-test-key")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST"
+        assert request.url.path.endswith("/wechat_channels/v2/fetch_video_detail")
+        assert _auth_header(request).startswith("Bearer ")
+        body = json.loads(request.content.decode())
+        assert body["share_url"].startswith("https://weixin.qq.com/sph/")
+        assert body["raw"] is False
+        return httpx.Response(
+            200,
+            json={
+                "code": 200,
+                "message": "ok",
+                "data": {
+                    "id": "14919266588327413890",
+                    "nickname": "前进的胖掌柜",
+                    "title": "[{'shortTitle': '职能部门正在杀死公司', 'pbRequestMsgInfo': None}]",
+                    "media": {
+                        "url": "http://cdn.example/v",
+                        "url_token": "?t=1",
+                        "full_url": "http://cdn.example/v?t=1",
+                        "decode_key": "910035402",
+                        "file_size": 100,
+                    },
+                },
+            },
+        )
+
+    client = _mock_client(handler)
+    ref = await channels_video_meta(
+        "https://weixin.qq.com/sph/ADk6xBh2hq", client=client
+    )
+    assert isinstance(ref, MediaRef)
+    assert ref.platform == "wechat_channels"
+    assert ref.download_url == "http://cdn.example/v?t=1"
+    assert ref.decode_key == "910035402"
+    assert ref.author == "前进的胖掌柜"
+    assert ref.title == "职能部门正在杀死公司"
+    assert ref.raw_id == "14919266588327413890"
+    assert ref.headers == CHANNELS_DOWNLOAD_HEADERS
+    assert ref.headers is not CHANNELS_DOWNLOAD_HEADERS
+    await client.aclose()
+
+
+async def test_resolve_media_channels_dispatches_to_channels_video_meta(monkeypatch):
+    monkeypatch.setattr(settings, "TIKHUB_API_KEY", "tk-test-key")
+    import app.datasource.tikhub as tikhub_mod
+
+    async def _fake_channels(url, *, client=None):
+        return MediaRef(
+            platform="wechat_channels",
+            download_url="http://cdn/x",
+            decode_key="k1",
+            title="t",
+            author="a",
+        )
+
+    monkeypatch.setattr(tikhub_mod, "channels_video_meta", _fake_channels)
+    ref = await resolve_media("https://weixin.qq.com/sph/abc")
+    assert ref.platform == "wechat_channels"
+    assert ref.decode_key == "k1"
 
 
 # ---- Task 7 平台门禁：account_top_videos / precheck 抖音 only --------------

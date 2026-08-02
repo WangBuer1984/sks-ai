@@ -162,16 +162,45 @@ async def test_transcribe_not_configured_missing_ffmpeg(monkeypatch, tmp_path):
 @pytest.mark.asyncio
 async def test_transcribe_decode_key_without_decoder_errors(monkeypatch, tmp_path):
     _common_seams(monkeypatch, tmp_path)
-    # decode_media 默认 None（未注入）——确保未引用未定义符号。
+    # Task 8a 默认注入 decode_channels_media；本测显式卸掉 seam，断言守卫仍在。
+    monkeypatch.setattr(tr, "decode_media", None)
     assert tr.decode_media is None
     ref = MediaRef(
-        platform="shipinhao",
+        platform="wechat_channels",
         download_url="https://x/a.mp4",
         headers={},
         decode_key="some-decode-key",
     )
     with pytest.raises(DataSourceError, match="channels decode not enabled"):
         await tr.transcribe(ref)
+
+
+@pytest.mark.asyncio
+async def test_transcribe_decode_media_injected_and_called(monkeypatch, tmp_path):
+    """decode_key 非空时走注入的 decode_media，再进入 convert。"""
+    cap = _common_seams(monkeypatch, tmp_path)
+    called: dict = {}
+
+    def _fake_decode(src, key):
+        called["src"] = src
+        called["key"] = key
+        out = tmp_path / "decoded.mp4"
+        out.write_bytes(b"\x00\x00\x00\x20ftypisom")
+        return out
+
+    monkeypatch.setattr(tr, "decode_media", _fake_decode)
+    ref = MediaRef(
+        platform="wechat_channels",
+        download_url="https://x/a.mp4",
+        headers={},
+        decode_key="910035402",
+    )
+    text = await tr.transcribe(ref)
+    assert text == "你好"
+    assert called["key"] == "910035402"
+    assert Path(called["src"]).name == "dl_source.mp4"
+    # convert 收到的是 decode 产出，而非原始下载文件
+    assert cap["convert_calls"][0].name == "decoded.mp4"
 
 
 # ---- contract 新增测试 ------------------------------------------------------

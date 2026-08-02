@@ -39,6 +39,7 @@ from app.config import settings
 from app.datasource import DataSourceError
 from app.datasource.media import MediaRef
 from app.datasource.media.audio import convert_to_wav, get_audio_duration, slice_audio
+from app.datasource.media.channels_decode import decode_channels_media
 from app.datasource.media.download import download_url, gc_stale_tmp
 from app.datasource.media.merge import merge_transcript_parts
 from app.datasource.media.qwen_asr import recognize_wav
@@ -57,9 +58,9 @@ _TRANSCRIBE_TIMEOUT = 1200
 _WAV_SIZE_LIMIT = 10 * 1024 * 1024
 _SHORT_DURATION_LIMIT = 300.0
 
-# channels decode 可插拔 seam：Task 8a 注入 channels 解码函数；默认 None + 守卫。
-# 绝不引用未定义的 ``decode_channels_media`` 符号——本 seam 即是接入点。
-decode_media: Optional[Callable[[Path, str], Path]] = None
+# channels decode 可插拔 seam：Task 8a 注入 ``decode_channels_media``；
+# 测试可 monkeypatch 为 None / fake。缺注入且 ``decode_key`` 非空 → 守卫报错。
+decode_media: Optional[Callable[[Path, str], Path]] = decode_channels_media
 
 
 def _ffmpeg_available() -> bool:

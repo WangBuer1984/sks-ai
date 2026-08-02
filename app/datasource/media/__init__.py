@@ -12,3 +12,5 @@ from __future__ import annotations
 from app.datasource.media.types import MediaRef
 
 __all__ = ["MediaRef"]
+
+# channels_decode 不在此重导出——由 ``transcribe.decode_media`` seam 接入。
