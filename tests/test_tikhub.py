@@ -668,6 +668,47 @@ async def test_account_top_videos_channels_share_uses_video_detail_username(monk
     await client.aclose()
 
 
+async def test_account_top_videos_channels_share_paginates_until_n_or_max_pages(monkeypatch):
+    monkeypatch.setattr(settings, "TIKHUB_API_KEY", "tk")
+    pages_hit = {"n": 0}
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("fetch_video_detail"):
+            return httpx.Response(200, json={"code": 200, "data": {
+                "username": "v2_share@finder", "nickname": "前进的胖掌柜",
+            }})
+        if request.url.path.endswith("fetch_user_videos"):
+            pages_hit["n"] += 1
+            body = json.loads(request.content.decode())
+            assert body["username"] == "v2_share@finder"
+            assert body["raw"] is False
+            # 首页不带 last_buffer；后续页带上一页返回的 last_buffer
+            if pages_hit["n"] == 1:
+                assert "last_buffer" not in body
+            else:
+                assert body["last_buffer"] == f"buf{pages_hit['n'] - 1}"
+            vids = [{
+                "title": f"t{i}",
+                "nickname": "前进的胖掌柜",
+                "read_count": 10, "fav_count": 1, "like_count": 9,
+                "media": {"full_url": f"http://cdn/{pages_hit['n']}-{i}.mp4", "decode_key": f"k-{pages_hit['n']}-{i}"},
+            } for i in range(6)]
+            return httpx.Response(200, json={"code": 200, "data": {
+                "username": "v2_share@finder", "nickname": "前进的胖掌柜",
+                "videos": vids, "up_continue": True, "last_buffer": f"buf{pages_hit['n']}",
+            }})
+        return httpx.Response(500, text="no")
+    client = _mock_client(handler)
+    videos = await account_top_videos("https://weixin.qq.com/sph/ADk6xBh2hq", n=20, client=client)
+    assert len(videos) == 20
+    assert pages_hit["n"] == 4           # 6×4=24 ≥ 20，4 页截断（= max_pages 硬上限）
+    assert videos[0].platform == "wechat_channels"
+    assert videos[0].decode_key == "k-1-0"
+    assert videos[0].download_url.endswith("1-0.mp4")
+    assert videos[0].play_count == 10  # read_count 代理
+    assert videos[0].fav_count == 1    # fav 优先于 like
+    await client.aclose()
+
+
 # ---- video_meta_to_media_ref：channels 装配 decode_key ----------------------
 
 def test_video_meta_to_media_ref_channels_keeps_decode_key_pair():
