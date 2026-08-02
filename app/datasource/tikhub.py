@@ -89,10 +89,11 @@ CHANNELS_DOWNLOAD_HEADERS: dict[str, str] = {
 # TikHub HTTP 超时（元数据 API，非媒体 CDN 下载——下载见 media/download.py）。
 _TIMEOUT = httpx.Timeout(30.0, connect=10.0)
 
-# === TikHub GET 瞬时错误重试（仅幂等 GET；POST 计费接口默认不重试） ===
-# GET 端点瞬时网络抖动/5xx 重试安全。视频号 POST（fetch_video_detail /
-# fetch_user_videos）上游可能已记账，5xx 再打会放大账单 → ``_post_json`` retry=False。
-_RETRY_ATTEMPTS = 3  # GET 总尝试次数（首次 + 2 次重试）
+# === TikHub 瞬时错误重试（GET 默认重试；POST 默认不重试防翻页放大账单） ===
+# GET 端点瞬时网络抖动/5xx 重试安全。视频号翻页 POST（fetch_user_videos）上游可能
+# 已记账，5xx 再打会放大账单 → ``_post_json`` 默认 retry=False。单次非翻页 POST
+# （fetch_video_detail 一次性 detail）可显式传 retry=True，瞬时重试不构成放大。
+_RETRY_ATTEMPTS = 3  # 总尝试次数（首次 + 2 次重试）
 _RETRY_BACKOFFS = (0.5, 1.5)  # 每次重试前 sleep 秒数（attempt 0→0.5s, attempt 1→1.5s）
 # 仅瞬时传输错误 + 5xx 可重试；4xx（bad URL/auth）与业务 code!=200（确定性失败）不重试。
 _RETRYABLE_TRANSPORT_ERRORS = (
@@ -220,10 +221,18 @@ async def _get_json(client: httpx.AsyncClient, path: str, params: dict | None = 
     return await _request_json(client, "GET", path, params=params, retry=True)
 
 
-async def _post_json(client: httpx.AsyncClient, path: str, json_body: dict) -> dict:
-    """POST TikHub JSON（视频号计费接口，默认不重试）。"""
+async def _post_json(
+    client: httpx.AsyncClient, path: str, json_body: dict, *, retry: bool = False
+) -> dict:
+    """POST TikHub JSON。
+
+    默认 ``retry=False``（防翻页放大账单——``fetch_user_videos`` 等翻页 POST 上游
+    可能已记账，5xx 再打会重复计费）。单次非翻页 POST（如 ``fetch_video_detail``
+    一次性 detail 查询，precheck channels_share 路径）可传 ``retry=True``：瞬时
+    5xx 重试 3 次不构成放大，避免单次瞬时失败即 502（Java 不预扣、用户重试）。
+    """
     return await _request_json(
-        client, "POST", path, json_body=json_body, retry=False
+        client, "POST", path, json_body=json_body, retry=retry
     )
 
 
@@ -406,6 +415,7 @@ async def _fetch_channels_video_detail(
         client,
         _PATH_CHANNELS_VIDEO_DETAIL,
         {"share_url": key, "raw": False},
+        retry=True,
     )
     _channels_detail_cache_put(key, body)
     return body

@@ -521,6 +521,95 @@ async def test_get_json_does_not_retry_on_business_code_failure(monkeypatch):
     assert calls["n"] == 1, "business-code failure must not be retried"
 
 
+async def test_post_json_channels_detail_retries_5xx_then_succeeds(monkeypatch):
+    """单次 detail（fetch_video_detail）属非翻页 POST，可 retry=True：前两次 500 第三次 200 → 成功，call_count==3。"""
+    monkeypatch.setattr(settings, "TIKHUB_API_KEY", "tk-test-key")
+    import app.datasource.tikhub as tikhub_mod
+
+    async def _no_sleep(_s):
+        return None
+
+    monkeypatch.setattr(tikhub_mod, "_sleep", _no_sleep)
+
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("fetch_video_detail"):
+            calls["n"] += 1
+            if calls["n"] < 3:
+                return httpx.Response(500, text="upstream boom")
+            return httpx.Response(200, json={"code": 200, "data": {"username": "u"}})
+        return httpx.Response(500, text="unexpected path")
+
+    client = _mock_client(handler)
+    try:
+        body = await tikhub_mod._fetch_channels_video_detail(
+            client, "https://weixin.qq.com/sph/abc"
+        )
+    finally:
+        await client.aclose()
+    assert body["data"]["username"] == "u"
+    assert calls["n"] == 3, f"detail (retry=True) should retry 3x on 5xx, got {calls['n']}"
+
+
+async def test_post_json_channels_detail_exhausts_retries_then_raises(monkeypatch):
+    """retry=True 3 次全 500 → DataSourceError（而非单次即失败）。"""
+    monkeypatch.setattr(settings, "TIKHUB_API_KEY", "tk-test-key")
+    import app.datasource.tikhub as tikhub_mod
+
+    async def _no_sleep(_s):
+        return None
+
+    monkeypatch.setattr(tikhub_mod, "_sleep", _no_sleep)
+
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("fetch_video_detail"):
+            calls["n"] += 1
+            return httpx.Response(500, text="upstream boom")
+        return httpx.Response(500, text="unexpected path")
+
+    client = _mock_client(handler)
+    try:
+        with pytest.raises(DataSourceError):
+            await tikhub_mod._fetch_channels_video_detail(
+                client, "https://weixin.qq.com/sph/abc"
+            )
+    finally:
+        await client.aclose()
+    assert calls["n"] == 3, f"detail retry=True should attempt 3x, got {calls['n']}"
+
+
+async def test_post_json_pagination_user_videos_does_not_retry_5xx(monkeypatch):
+    """fetch_user_videos 翻页 POST 保持 retry=False：单次 500 即 DataSourceError，call_count==1（防翻页放大账单）。"""
+    monkeypatch.setattr(settings, "TIKHUB_API_KEY", "tk-test-key")
+    import app.datasource.tikhub as tikhub_mod
+
+    async def _no_sleep(_s):
+        return None
+
+    monkeypatch.setattr(tikhub_mod, "_sleep", _no_sleep)
+
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("fetch_video_detail"):
+            return httpx.Response(200, json={"code": 200, "data": {"username": "u"}})
+        if request.url.path.endswith("fetch_user_videos"):
+            calls["n"] += 1
+            return httpx.Response(500, text="upstream boom")
+        return httpx.Response(500, text="unexpected path")
+
+    client = _mock_client(handler)
+    try:
+        with pytest.raises(DataSourceError):
+            await precheck("https://weixin.qq.com/sph/abc", client=client)
+    finally:
+        await client.aclose()
+    assert calls["n"] == 1, f"pagination POST must not retry, got {calls['n']}"
+
+
 # ---- resolve_media：分享/短链 → MediaRef ----------------------------------
 
 async def test_platform_of_detects_douyin_hosts():
