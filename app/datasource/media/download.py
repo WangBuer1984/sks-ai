@@ -11,6 +11,9 @@ Task 3.2/3.3 捕获后翻译为退款/重试策略（PRD §11.3）。
 
 临时文件命名前缀 ``sks_asr_dl_``，落盘目录由 ``settings.ASR_TMP_DIR`` 决定
 （空 → 系统 tempfile 目录）。``gc_stale_tmp`` 清扫陈旧文件（默认 >2h）。
+
+下载用 ``stream`` + ``aiter_bytes`` 流式落盘，避免 ``resp.content`` 整包入内存
+（视频号/长视频可达数百 MB，``download_sem=5`` 并发时 RSS 会爆炸）。
 """
 
 from __future__ import annotations
@@ -31,12 +34,22 @@ from app.datasource import DataSourceError
 
 log = logging.getLogger(__name__)
 
-# httpx 请求超时（秒）。长音频可能较大，60s 覆盖首字节 + 传输；超大文件按需再调。
-_DOWNLOAD_TIMEOUT = 60.0
+# 连接 30s；读超时 600s——数百 MB CDN 在 60s 内常传不完。
+_DOWNLOAD_TIMEOUT = httpx.Timeout(600.0, connect=30.0)
+_CHUNK_SIZE = 256 * 1024
 # 临时文件名前缀——``gc_stale_tmp`` 按此前缀匹配清扫，避免误删其他模块的 temp 文件。
 _TMP_PREFIX = "sks_asr_dl_"
 # convert / slice 的 mkdtemp 目录前缀（见 audio.py）；须一并清扫，否则只漏 inode。
 _GC_PREFIXES = (_TMP_PREFIX, "sks_asr_wav_", "sks_asr_slice_")
+
+
+def _unlink_quiet(path: str | None) -> None:
+    if not path:
+        return
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
 
 
 async def download_url(
@@ -50,6 +63,7 @@ async def download_url(
     - ``headers``：下载所需请求头（Referer/UA 等），默认 None。
     - ``client``：测试注入 ``MockTransport`` 客户端；生产传 None，内部按
       timeout/``follow_redirects=True`` 新建。
+    - 流式写盘（``aiter_bytes``），不把整包 body 留在内存。
     - 非 2xx / 传输异常 / 超时 → ``DataSourceError``（绝不冒泡裸 httpx/网络异常）。
     """
     own_client = client is None
@@ -59,31 +73,36 @@ async def download_url(
             follow_redirects=True,
         )
 
+    tmp_path: str | None = None
     try:
         try:
-            resp = await client.get(url, headers=headers)
+            async with client.stream("GET", url, headers=headers) as resp:
+                if resp.status_code // 100 != 2:
+                    raise DataSourceError(
+                        f"download failed for {url}: HTTP {resp.status_code}"
+                    )
+
+                fd, tmp_path = tempfile.mkstemp(
+                    prefix=_TMP_PREFIX,
+                    dir=settings.ASR_TMP_DIR or None,
+                )
+                written = 0
+                with os.fdopen(fd, "wb") as f:
+                    async for chunk in resp.aiter_bytes(chunk_size=_CHUNK_SIZE):
+                        f.write(chunk)
+                        written += len(chunk)
         except httpx.HTTPError as exc:
-            # 传输/超时/协议异常 → 数据源故障（不冒泡裸 httpx 异常）。
             raise DataSourceError(f"download transport error for {url}: {exc}") from exc
+        except OSError as exc:
+            raise DataSourceError(f"failed to write tmp file for {url}") from exc
 
-        if resp.status_code // 100 != 2:
-            raise DataSourceError(
-                f"download failed for {url}: HTTP {resp.status_code}"
-            )
-
-        fd, tmp_path = tempfile.mkstemp(
-            prefix=_TMP_PREFIX,
-            dir=settings.ASR_TMP_DIR or None,
-        )
-        try:
-            with os.fdopen(fd, "wb") as f:
-                f.write(resp.content)
-        except OSError:
-            # 写盘失败也归一为数据源故障（磁盘满/权限等），调用方按统一路径处理。
-            raise DataSourceError(f"failed to write tmp file for {url}")
-
-        log.info("downloaded %s -> %s (%d bytes)", url, tmp_path, len(resp.content))
+        assert tmp_path is not None
+        log.info("downloaded %s -> %s (%d bytes)", url, tmp_path, written)
         return Path(tmp_path)
+    except Exception:
+        # 含 DataSourceError / 传输中断：清掉半截文件，避免 ASR_TMP 堆残骸。
+        _unlink_quiet(tmp_path)
+        raise
     finally:
         if own_client:
             await client.aclose()

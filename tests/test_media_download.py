@@ -1,7 +1,8 @@
 """download.py 测试：httpx MockTransport，绝不发真实网络请求。
 
 覆盖：
-  - 成功：GET 返回字节 → 写入 temp 文件、Path.exists()、内容匹配、前缀 sks_asr_dl_。
+  - 成功：stream GET → 写入 temp 文件、Path.exists()、内容匹配、前缀 sks_asr_dl_。
+  - 多块大体量内容仍完整落盘（流式路径）。
   - 4xx/5xx → DataSourceError。
   - 传输异常（httpx.ConnectError / timeout）→ DataSourceError，不冒泡裸异常。
   - headers 透传到请求（MockTransport handler 捕获 request.headers）。
@@ -43,6 +44,23 @@ async def test_download_url_writes_file(tmp_path, monkeypatch):
     assert path.exists()
     assert path.read_bytes() == b"fake-bytes"
     assert path.name.startswith("sks_asr_dl_")
+
+
+async def test_download_url_streams_large_body(tmp_path, monkeypatch):
+    """>1 个 chunk（256KiB）的 body 须完整落盘（覆盖 aiter_bytes 路径）。"""
+    monkeypatch.setattr(settings, "ASR_TMP_DIR", str(tmp_path))
+    payload = bytes((i % 256) for i in range(300 * 1024))
+
+    async def handler(request: httpx.Request):
+        return httpx.Response(200, content=payload)
+
+    client = _mock_client(handler)
+    try:
+        path = await download_url("https://cdn.example/big.mp4", client=client)
+    finally:
+        await client.aclose()
+
+    assert path.read_bytes() == payload
 
 
 async def test_download_url_forwards_headers(tmp_path, monkeypatch):
