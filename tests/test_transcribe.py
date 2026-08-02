@@ -56,8 +56,9 @@ def _common_seams(monkeypatch, tmp_path: Path) -> dict:
     def _duration(wav):
         return 10.0
 
-    async def _slice(wav, segment_duration=270, overlap=3):
+    async def _slice(wav, segment_duration=270, overlap=3, *, duration=None):
         cap.setdefault("slice_called", True)
+        cap["slice_duration"] = duration
         return [tmp_path / "seg_0.wav", tmp_path / "seg_1.wav"]
 
     async def _recognize(wav_path, *, title=None, author=None):

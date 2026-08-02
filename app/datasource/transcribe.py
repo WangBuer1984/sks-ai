@@ -155,8 +155,9 @@ async def _transcribe_inner(media: Union[MediaRef, str]) -> str:
                 )
         else:
             # 切片单段 270s≈8.24MB 天然 <10MB，无需逐段再检。
+            # 传入已测 duration，避免 slice_audio 再跑一次 ffprobe。
             async with get_convert_semaphore():
-                segs = await slice_audio(wav)
+                segs = await slice_audio(wav, duration=duration)
             temps.extend(segs)
             parts: list[str] = []
             for seg in segs:

@@ -46,4 +46,4 @@ decode_key → WxIsaac64 WASM → 131072-byte keystream → reverse()
 
 ## 账号路径
 
-视频号**只做单视频**；拆账号仍 douyin-only（Task 7 门禁不变）。
+单视频路径见上。拆账号已支持视频号分享链（见 `2026-08-02-channels-account-analyze-design.md`；裸 sph 短号已弃）。

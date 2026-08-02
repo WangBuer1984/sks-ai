@@ -18,6 +18,7 @@ Task 3.2/3.3 捕获后翻译为退款/重试策略（PRD §11.3）。
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import shutil
@@ -42,6 +43,10 @@ _TMP_PREFIX = "sks_asr_dl_"
 # convert / slice 的 mkdtemp 目录前缀（见 audio.py）；须一并清扫，否则只漏 inode。
 _GC_PREFIXES = (_TMP_PREFIX, "sks_asr_wav_", "sks_asr_slice_")
 
+# 进程内共享下载客户端（keepalive），拆账号 TOP N 复用连接；测试仍可注入 client。
+_shared_client: httpx.AsyncClient | None = None
+_shared_client_lock: asyncio.Lock | None = None
+
 
 def _unlink_quiet(path: str | None) -> None:
     if not path:
@@ -50,6 +55,29 @@ def _unlink_quiet(path: str | None) -> None:
         os.unlink(path)
     except OSError:
         pass
+
+
+def _client_lock() -> asyncio.Lock:
+    global _shared_client_lock
+    if _shared_client_lock is None:
+        _shared_client_lock = asyncio.Lock()
+    return _shared_client_lock
+
+
+async def _get_shared_client() -> httpx.AsyncClient:
+    """懒单例 AsyncClient；跨 download_url 调用复用连接。"""
+    global _shared_client
+    async with _client_lock():
+        if _shared_client is None or _shared_client.is_closed:
+            _shared_client = httpx.AsyncClient(
+                timeout=_DOWNLOAD_TIMEOUT,
+                follow_redirects=True,
+                limits=httpx.Limits(
+                    max_connections=10,
+                    max_keepalive_connections=5,
+                ),
+            )
+        return _shared_client
 
 
 async def download_url(
@@ -61,17 +89,13 @@ async def download_url(
     """下载直链到 temp 文件，返回 ``Path``。
 
     - ``headers``：下载所需请求头（Referer/UA 等），默认 None。
-    - ``client``：测试注入 ``MockTransport`` 客户端；生产传 None，内部按
-      timeout/``follow_redirects=True`` 新建。
+    - ``client``：测试注入 ``MockTransport`` 客户端；生产传 None → 用进程内
+      共享 client（keepalive，拆账号多视频复用）。
     - 流式写盘（``aiter_bytes``），不把整包 body 留在内存。
     - 非 2xx / 传输异常 / 超时 → ``DataSourceError``（绝不冒泡裸 httpx/网络异常）。
     """
-    own_client = client is None
-    if own_client:
-        client = httpx.AsyncClient(
-            timeout=_DOWNLOAD_TIMEOUT,
-            follow_redirects=True,
-        )
+    if client is None:
+        client = await _get_shared_client()
 
     tmp_path: str | None = None
     try:
@@ -111,9 +135,6 @@ async def download_url(
         # 含 DataSourceError / 传输中断：清掉半截文件，避免 ASR_TMP 堆残骸。
         _unlink_quiet(tmp_path)
         raise
-    finally:
-        if own_client:
-            await client.aclose()
 
 
 def gc_stale_tmp(*, max_age_hours: float = 2.0) -> int:

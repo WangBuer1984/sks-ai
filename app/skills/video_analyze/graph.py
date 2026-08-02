@@ -13,9 +13,9 @@
 进度语义（LOAD-BEARING，Task 3.3 按比例退款依赖）：单条 progress 0→100，``100`` 仅在结构化
 完成并写 result 后赋。无中间值（单条无中间条目概念）。
 
-心跳：``transcribe`` 可轮询阿里云长达 10min，Java running-timeout 是 5min——``_transcribe_with_heartbeat``
-在轮询间隙每 ``HEARTBEAT_INTERVAL``（60s）touch 一次 ``updated_at = now()``，防止 Java
-把正在转写的任务判为停滞。
+心跳：``transcribe``（Qwen 管线，最长约 20min）期间 ``_transcribe_with_heartbeat``
+每 ``HEARTBEAT_INTERVAL``（60s）touch 一次 ``updated_at = now()``，防止 Java
+5min running-timeout 把正在转写的任务判为停滞。
 
 模块级别名 ``chat`` / ``check`` / ``transcribe`` / ``update_task`` / ``heartbeat`` 是测试
 monkeypatch 目标（app.skills.video_analyze.graph.*），与 script_gen / card_gen 同模式。
@@ -46,7 +46,7 @@ update_task = _update_task
 heartbeat = _heartbeat
 resolve_media = _resolve_media
 
-# 心跳间隔：transcribe 轮询期间每 N 秒 touch updated_at，短于 Java running-timeout 5min。
+# 心跳间隔：长转写期间每 N 秒 touch updated_at，短于 Java running-timeout 5min。
 HEARTBEAT_INTERVAL = 60.0
 
 

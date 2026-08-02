@@ -86,8 +86,7 @@ CHANNELS_DOWNLOAD_HEADERS: dict[str, str] = {
     ),
 }
 
-# 阿里云录音文件识别用 OSS/public URL 直传，TikHub 下载直链多为短时签名 URL——
-# 联调期需确认阿里云侧能否拉到该直链；如不能，需在 transcribe 内先下载再传 file_link。
+# TikHub HTTP 超时（元数据 API，非媒体 CDN 下载——下载见 media/download.py）。
 _TIMEOUT = httpx.Timeout(30.0, connect=10.0)
 
 # === TikHub GET 瞬时错误重试（仅幂等 GET；POST 计费接口默认不重试） ===

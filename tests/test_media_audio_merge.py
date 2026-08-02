@@ -199,6 +199,25 @@ async def test_slice_audio_duration_zero_estimates_and_slices(tmp_path, monkeypa
         assert seg.exists()
 
 
+async def test_slice_audio_reuses_provided_duration(tmp_path, monkeypatch):
+    """facade 传入 duration>0 时不再调用 get_audio_duration。"""
+    from app.config import settings
+    monkeypatch.setattr(settings, "ASR_TMP_DIR", str(tmp_path))
+    calls = {"n": 0}
+
+    def _boom(_p):
+        calls["n"] += 1
+        raise AssertionError("should not ffprobe when duration provided")
+
+    monkeypatch.setattr(audio, "get_audio_duration", _boom)
+    wav = tmp_path / "short.wav"
+    wav.write_bytes(b"RIFF" + b"\x00" * 40)
+    # 真短：duration=10 ≤ 273 → 直接返回 [wav]，不切
+    segs = await slice_audio(wav, segment_duration=270, overlap=3, duration=10.0)
+    assert segs == [wav]
+    assert calls["n"] == 0
+
+
 async def test_slice_audio_duration_zero_oversized_unestimable_raises(
     tmp_path, monkeypatch
 ):

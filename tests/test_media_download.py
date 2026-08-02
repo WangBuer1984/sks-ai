@@ -63,6 +63,30 @@ async def test_download_url_streams_large_body(tmp_path, monkeypatch):
     assert path.read_bytes() == payload
 
 
+async def test_download_url_reuses_shared_client(tmp_path, monkeypatch):
+    """未注入 client 时复用进程内共享 AsyncClient。"""
+    import app.datasource.media.download as dl
+
+    monkeypatch.setattr(settings, "ASR_TMP_DIR", str(tmp_path))
+    monkeypatch.setattr(dl, "_shared_client", None)
+
+    async def handler(request: httpx.Request):
+        return httpx.Response(200, content=b"ok")
+
+    shared = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), follow_redirects=True
+    )
+    monkeypatch.setattr(dl, "_shared_client", shared)
+
+    p1 = await download_url("https://cdn.example/a.mp4")
+    p2 = await download_url("https://cdn.example/b.mp4")
+    assert p1.read_bytes() == b"ok"
+    assert p2.read_bytes() == b"ok"
+    assert dl._shared_client is shared
+    assert not shared.is_closed
+    await shared.aclose()
+
+
 async def test_download_url_forwards_headers(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "ASR_TMP_DIR", str(tmp_path))
     captured: dict[str, str] = {}

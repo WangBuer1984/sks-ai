@@ -176,21 +176,26 @@ def _slice_segment_sync(
 
 
 async def slice_audio(
-    wav: Path, segment_duration: int = 270, overlap: int = 3
+    wav: Path,
+    segment_duration: int = 270,
+    overlap: int = 3,
+    *,
+    duration: float | None = None,
 ) -> list[Path]:
     """长音频切片。每段约 ``segment_duration`` 秒，段间 ``overlap`` 秒重叠。
 
     返回切片文件路径列表（按时间顺序）。若音频时长
     ``<= segment_duration + overlap``，直接返回 ``[wav]``（不切片）。
 
-    ``duration == 0.0``（ffprobe 失败）**不得**当成「够短」：先按 PCM 体积估
-    时长再切片；仍无法估计且 ``wav > 10MB`` → ``DataSourceError``（避免整文件
-    直送 recognize 撞 DashScope 上限）。
+    ``duration``：facade 已测得的秒数时传入，避免二次 ffprobe；``None``/``<=0``
+    才自行探测。``duration == 0.0``（ffprobe 失败）**不得**当成「够短」：先按
+    PCM 体积估时长再切片；仍无法估计且 ``wav > 10MB`` → ``DataSourceError``。
 
     切片体积不变量：270s × 16k mono PCM ≈ 8.24MB < 10MB，
     单段天然满足 qwen ≤10MB 体积上限，无需再加每段 10MB 守卫。
     """
-    duration = await asyncio.to_thread(get_audio_duration, str(wav))
+    if duration is None or duration <= 0:
+        duration = await asyncio.to_thread(get_audio_duration, str(wav))
     if duration <= 0:
         duration = _estimate_pcm_wav_duration(wav)
         if duration > 0:
