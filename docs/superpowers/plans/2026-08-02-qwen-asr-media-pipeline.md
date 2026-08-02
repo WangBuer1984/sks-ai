@@ -569,22 +569,23 @@ ALIYUN_ASR_APP_KEY: str = ""
 现状：`FROM python:3.12-slim` + uv，**无** `apt-get`。必须增加，例如：
 
 ```dockerfile
-RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ffmpeg nodejs \
     && rm -rf /var/lib/apt/lists/*
 ```
 
-（放在 `uv sync` 前或后均可，建议靠前。）
+（放在 `uv sync` 前或后均可，建议靠前。`nodejs` 供视频号 WASM decrypt_cli。）
 
 **连带修复：** 现有 `asr.py` webm→pcm（pydub）在 prod 也依赖 ffmpeg；GO_LIVE 已标「第一处会坏」。本步同时修短 ASR prod 路径。
 
-- [ ] **Step 3: GO_LIVE** — 删/改 `ALIYUN_ASR_APP_KEY` 与 filetrans；加 `ALIYUN_ASR_KEY`（DashScope）、镜像含 ffmpeg、Qwen 长转写联调；保留/强化短 ASR webm 联检（ffmpeg 已装后应可勾）。
+- [x] **Step 3: GO_LIVE** — 删/改 `ALIYUN_ASR_APP_KEY` 与 filetrans；加 `ALIYUN_ASR_KEY`（DashScope）、镜像含 ffmpeg+nodejs、Qwen 长转写联调；短 ASR webm 联检（ffmpeg 已装后应可勾）。
 
 - [ ] **Step 4: Commit（sks-ai + sks-agent 分别）**
 
 ```bash
-git commit -m "chore: Dockerfile 安装 ffmpeg；废弃 ASR AppKey 文档"
+git commit -m "chore: Dockerfile 安装 ffmpeg+nodejs；废弃 ASR AppKey 文档"
 # sks-agent
-git commit -m "chore: GO_LIVE 长转写改为 Qwen + ffmpeg"
+git commit -m "chore: GO_LIVE 长转写改为 Qwen + ffmpeg/nodejs"
 ```
 
 ---

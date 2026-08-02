@@ -21,7 +21,7 @@
 
 ## 1. Goal
 
-拆账号支持**视频号**：用户粘贴视频号 ID（`sph…`）或该号任意一条分享链；后端解析出 finder `username`，拉 TOP N 作品并走现有转写/结构化/归纳管线。抖音主页链接路径不变。
+拆账号支持**视频号**：用户粘贴该号任意一条分享链；后端解析出 finder `username`，拉 TOP N 作品并走现有转写/结构化/归纳管线。抖音主页链接路径不变。
 
 ## 2. Non-goals
 
@@ -35,7 +35,7 @@
 | 平台 | 用户粘贴 |
 |------|----------|
 | 抖音 | 账号主页链接（现有） |
-| 视频号 | **短号** `sph…`（如 `sphi9BjV8GK0Zsl`），或 **分享链** `https://weixin.qq.com/sph/...` |
+| 视频号 | **分享链** `https://weixin.qq.com/sph/...` |
 
 前端（`sks-web` `/analyze` 拆账号）：placeholder + 辅助文案双平台提示；**无**平台下拉；仍 `POST /analyze/account {url}`。
 
@@ -46,7 +46,7 @@
 - Java：`precheck(url)` → 固定扣 10 → `POST /ai/analyze/account {task_id, url}`
 - Python：`precheck` / `account_top_videos` / `analyze_account`
 
-`url` 字段语义扩展为「账号入口字符串」（链接或短号）。
+`url` 字段语义扩展为「账号入口字符串」（分享链）。
 
 **Java 可不改**（§10）：不可达一律 200 + `{reachable:false, video_count:0}`（见 §5.2）；`AnalyzeService.startAccount` 在扣费前判断 `!reachable || videoCount<=0` 即拒绝。  
 （注：precheck **传输层**失败抛错时 Java 也不扣费——扣费在 precheck 成功之后；但业务不可达不得用抛错代替 `reachable:false`，以免与抖音文案/路径分叉。）
@@ -55,15 +55,14 @@
 
 ### 5.1 共享入口分类器（新函数，非仅 `_platform_of`）
 
-`_platform_of` 只看 host，对裸 `sph…` 会判 `unknown`。新增例如 `_account_entry_kind(raw: str) -> Literal["douyin","channels_id","channels_share","unknown"]`：
+`_platform_of` 只看 host，对裸 `sph…` 会判 `unknown`。新增例如 `_account_entry_kind(raw: str) -> Literal["douyin","channels_share","unknown"]`：
 
 识别顺序（对 trim 后字符串；无 netloc 时 host 检测必须安全 no-match，禁止因 `urlparse` 崩）：
 
 1. **抖音 host**（`douyin.com` / `iesdouyin.com`）→ `douyin`
-2. **视频号短号** `^sph[A-Za-z0-9_-]+$`（整串，无 scheme）→ `channels_id`
-3. **视频号分享链** host 以 `weixin.qq.com` 结尾且 path 含 `/sph/` → `channels_share`  
+2. **视频号分享链** host 以 `weixin.qq.com` 结尾且 path 含 `/sph/` → `channels_share`  
    （**禁止**把 path 段当成 `channel_id`）
-4. 其它 → `unknown`
+3. 其它 → `unknown`（含裸 `sph…` 短号：无 host/scheme → unknown，不发 HTTP）
 
 `account_top_videos` / `precheck` **共用**该分类器 + 下游解析。
 
@@ -72,7 +71,6 @@
 | kind | 动作 |
 |------|------|
 | `douyin` | 现有 `get_sec_user_id` + posts |
-| `channels_id` | `POST …/fetch_channel_id_to_username` → `username`；未命中（username null）→ 见 precheck/列表失败语义 |
 | `channels_share` | `fetch_video_detail(share_url)` → `data.username` |
 | `unknown` | `DataSourceError("unsupported …")`（配置错误类；precheck 可映射为 unreachable，见下） |
 
@@ -91,7 +89,7 @@
 
 - **只拉首页一页** `fetch_user_videos`（`last_buffer` 空），**不翻页**
 - `video_count = len(videos)`（本页条数；非全站 total）
-- 业务不可达（短号未命中 / 分享链无 username / 首页 0 条 / unknown 入口）→ **一律**  
+- 业务不可达（分享链无 username / 首页 0 条 / unknown 入口）→ **一律**  
   `{reachable: false, video_count: 0}`，**不抛** `DataSourceError`  
   （传输失败 / 未配置 key 仍可抛，与现抖音 precheck 一致）
 - 成功 → `{reachable: true, video_count}`
@@ -125,7 +123,7 @@ platform: str = "douyin"   # "douyin" | "wechat_channels"
 
 `sks-web/src/pages/Analyze.tsx`（拆账号 mode）：
 
-- placeholder：「抖音：账号主页链接。视频号：sph 开头的视频号 ID，或该号任意一条分享链接。」
+- placeholder：「抖音：账号主页链接。视频号：该号任意一条分享链接（weixin.qq.com/sph/…）。」
 - 输入框下增加一行辅助说明（同义、可更短）
 - 不改 API client 形状；校验保持非空 trim
 
@@ -140,8 +138,8 @@ platform: str = "douyin"   # "douyin" | "wechat_channels"
 
 ## 9. Tests
 
-- `_account_entry_kind`：裸 sph / 分享链 / 抖音 / 垃圾串；裸串不得因 urlparse 崩
-- 短号 → username mock；分享链 → detail mock；`fetch_user_videos` 含 `decode_key`；翻页在 `max_pages` 截断
+- `_account_entry_kind`：分享链 / 抖音 / 垃圾串；裸串不得因 urlparse 崩
+- 分享链 → detail mock；`fetch_user_videos` 含 `decode_key`；翻页在 `max_pages` 截断
 - precheck：未命中 → `{reachable:false, video_count:0}`（不抛）；首页有条 → reachable
 - 删除「channels → douyin only」门禁测试；改为 channels 可走通 mock
 - account_analyze：`VideoMeta(decode_key=…)` → `transcribe` 收到配对 `MediaRef`
@@ -161,3 +159,7 @@ platform: str = "douyin"   # "douyin" | "wechat_channels"
 | P2a | `account_top_videos` `max_pages=4` |
 | P2b | precheck 只拉首页、不翻页、`video_count=len(page)` |
 | P3 | play_count 代理说明；fav 优先序；新 `_account_entry_kind`；同条 decode 配对 |
+
+## 联调补丁（2026-08-02）
+
+弃 channels_id 短号入口，只保留 channels_share 分享链入口。联调证实：TikHub `fetch_channel_id_to_username` 对任意 `sph…` 串都派生 `@finder` username（从不返回 None），无法识别 bogus 短号；而分享链路径（`fetch_video_detail`）对假分享链正确返回空 username → unreachable。故短号入口不可靠，弃之。裸 `sph…` 串经 `_account_entry_kind` 落到 `unknown`（不发 HTTP），precheck → unreachable，`account_top_videos` → unsupported raise。

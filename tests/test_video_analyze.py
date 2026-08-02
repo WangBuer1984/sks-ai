@@ -139,25 +139,48 @@ async def test_video_text_blocked_llm_output_returns_blocked(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_video_link_done_transcribe_then_structure_then_done(monkeypatch):
-    """link：transcribe→结构化→写 done+result。progress 单条 0→100。"""
-    calls: list[dict] = []
+    """link：resolve_media→transcribe(MediaRef)→结构化→写 done+result。progress 单条 0→100。"""
+    import app.skills.video_analyze.graph as vg
+    from app.datasource.media import MediaRef
 
-    async def _transcribe(url):
+    calls: list[dict] = []
+    captured: dict = {}
+
+    async def _resolve(url):
+        captured["share_url"] = url
+        return MediaRef(
+            platform="douyin",
+            download_url="https://cdn.example/a.mp4",
+            headers={"Referer": "https://www.douyin.com/"},
+            title="t",
+            author="a",
+        )
+
+    async def _transcribe(media):
+        # 原始分享链不得传入 transcribe——必须收到 resolve_media 产出的 MediaRef。
+        captured["transcribe_arg"] = media
+        assert isinstance(media, MediaRef)
+        assert media.download_url.startswith("https://cdn")
         return "转写文本"
 
     async def _update_task(task_id, *, status=None, progress=None, result=None, error=None):
         calls.append({"status": status, "progress": progress, "result": result, "error": error})
 
-    monkeypatch.setattr("app.skills.video_analyze.graph.transcribe", _transcribe)
-    monkeypatch.setattr("app.skills.video_analyze.graph.check", _safe)
-    monkeypatch.setattr("app.skills.video_analyze.graph.chat", _fake_chat_structure)
-    monkeypatch.setattr("app.skills.video_analyze.graph.update_task", _update_task)
+    monkeypatch.setattr(vg, "resolve_media", _resolve)
+    monkeypatch.setattr(vg, "transcribe", _transcribe)
+    monkeypatch.setattr(vg, "check", _safe)
+    monkeypatch.setattr(vg, "chat", _fake_chat_structure)
+    monkeypatch.setattr(vg, "update_task", _update_task)
     # 心跳打到假 pool（不报错即可）
     pool = _FakePool()
     _patch_pool(monkeypatch, pool)
 
-    from app.skills.video_analyze.graph import analyze_video_link
-    await analyze_video_link(task_id=7, url="https://v.douyin.com/abc")
+    await vg.analyze_video_link(task_id=7, url="https://v.douyin.com/abc")
+
+    # resolve_media 收到的是原始分享链，transcribe 收到的是 MediaRef（直链 cdn）
+    assert captured["share_url"] == "https://v.douyin.com/abc"
+    assert isinstance(captured["transcribe_arg"], MediaRef)
+    assert captured["transcribe_arg"].download_url == "https://cdn.example/a.mp4"
 
     statuses = [c["status"] for c in calls]
     # running（bg 启动）→ done
@@ -171,21 +194,31 @@ async def test_video_link_done_transcribe_then_structure_then_done(monkeypatch):
 @pytest.mark.asyncio
 async def test_video_link_failed_on_transcribe_datasource_error(monkeypatch):
     """transcribe 抛 DataSourceError → status=failed+error。"""
+    import app.skills.video_analyze.graph as vg
+    from app.datasource.media import MediaRef
+
     calls: list[dict] = []
 
-    async def _transcribe(url):
+    async def _resolve(url):
+        return MediaRef(
+            platform="douyin",
+            download_url="https://cdn.example/a.mp4",
+            headers={"Referer": "https://www.douyin.com/"},
+        )
+
+    async def _transcribe(media):
         raise DataSourceError("asr boom")
 
     async def _update_task(task_id, *, status=None, progress=None, result=None, error=None):
         calls.append({"status": status, "progress": progress, "result": result, "error": error})
 
-    monkeypatch.setattr("app.skills.video_analyze.graph.transcribe", _transcribe)
-    monkeypatch.setattr("app.skills.video_analyze.graph.update_task", _update_task)
+    monkeypatch.setattr(vg, "resolve_media", _resolve)
+    monkeypatch.setattr(vg, "transcribe", _transcribe)
+    monkeypatch.setattr(vg, "update_task", _update_task)
     pool = _FakePool()
     _patch_pool(monkeypatch, pool)
 
-    from app.skills.video_analyze.graph import analyze_video_link
-    await analyze_video_link(task_id=7, url="https://v/x")
+    await vg.analyze_video_link(task_id=7, url="https://v/x")
 
     failed = [c for c in calls if c["status"] == "failed"]
     assert len(failed) == 1
@@ -204,6 +237,14 @@ async def test_video_link_sets_running_before_background(monkeypatch):
     async def _update_task(task_id, *, status=None, progress=None, result=None, error=None):
         order.append(f"update:{status}")
 
+    async def _resolve(url):
+        from app.datasource.media import MediaRef
+        return MediaRef(
+            platform="douyin",
+            download_url="https://cdn.example/a.mp4",
+            headers={"Referer": "https://www.douyin.com/"},
+        )
+
     async def _transcribe(url):
         order.append("transcribe")
         return "t"
@@ -212,6 +253,7 @@ async def test_video_link_sets_running_before_background(monkeypatch):
         order.append("chat")
         return {"structure": "s", "why_hot": "w", "framework": "f", "diff_hint": "d"}
 
+    monkeypatch.setattr(vg, "resolve_media", _resolve)
     monkeypatch.setattr(vg, "transcribe", _transcribe)
     monkeypatch.setattr(vg, "chat", _chat)
     monkeypatch.setattr(vg, "check", _safe)
@@ -257,10 +299,19 @@ async def test_heartbeat_touches_updated_at_during_long_transcribe(monkeypatch):
 
     monkeypatch.setattr(vg, "HEARTBEAT_INTERVAL", 0.01)
 
+    async def _resolve(url):
+        from app.datasource.media import MediaRef
+        return MediaRef(
+            platform="douyin",
+            download_url="https://cdn.example/a.mp4",
+            headers={"Referer": "https://www.douyin.com/"},
+        )
+
     async def _slow_transcribe(url):
         await asyncio.sleep(0.05)
         return "慢转写结果"
 
+    monkeypatch.setattr(vg, "resolve_media", _resolve)
     monkeypatch.setattr(vg, "transcribe", _slow_transcribe)
     monkeypatch.setattr(vg, "check", _safe)
     monkeypatch.setattr(vg, "chat", _fake_chat_structure)

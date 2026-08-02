@@ -14,14 +14,25 @@ import pytest
 
 from app.config import settings
 from app.datasource import DataSourceError
+from app.datasource.media import MediaRef
 from app.datasource.tikhub import (
+    CHANNELS_DOWNLOAD_HEADERS,
+    DOUYIN_DOWNLOAD_HEADERS,
     HotItem,
     VideoMeta,
+    _account_entry_kind,
     _base_url,
+    _channels_title,
+    _clear_channels_detail_cache,
+    _parse_channels_video,
+    _platform_of,
     account_top_videos,
+    channels_video_meta,
     hot_board,
     precheck,
+    resolve_media,
     video_meta,
+    video_meta_to_media_ref,
 )
 
 
@@ -31,6 +42,14 @@ def _mock_client(handler) -> httpx.AsyncClient:
 
 def _auth_header(request: httpx.Request) -> str:
     return request.headers.get("Authorization", "")
+
+
+@pytest.fixture(autouse=True)
+def _clear_channels_detail_cache_between_tests():
+    """分享链 detail 短缓存不得跨测串味。"""
+    _clear_channels_detail_cache()
+    yield
+    _clear_channels_detail_cache()
 
 
 async def test_base_url_is_api_tikhub_dev():
@@ -131,7 +150,7 @@ async def test_account_top_videos_caps_at_n(monkeypatch):
 
     client = _mock_client(handler)
     try:
-        videos = await account_top_videos("https://x", n=20, client=client)
+        videos = await account_top_videos("https://www.douyin.com/user/x", n=20, client=client)
     finally:
         await client.aclose()
     # 只解析 API 返回的 10 条（不足 N 时按实际返回）
@@ -247,6 +266,75 @@ async def test_precheck_unreachable_when_sec_user_id_missing(monkeypatch):
         await client.aclose()
     assert result["reachable"] is False
     assert result["video_count"] == 0
+
+
+async def test_precheck_channels_share_home_count_no_pagination(monkeypatch):
+    monkeypatch.setattr(settings, "TIKHUB_API_KEY", "tk")
+    calls = {"videos": 0}
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("fetch_video_detail"):
+            return httpx.Response(200, json={"code": 200, "data": {"username": "v2_x@finder"}})
+        if request.url.path.endswith("fetch_user_videos"):
+            calls["videos"] += 1
+            body = json.loads(request.content.decode())
+            assert not body.get("last_buffer")
+            return httpx.Response(200, json={"code": 200, "data": {
+                "videos": [{"media": {"full_url": "http://a", "decode_key": "1"}, "read_count": 1}] * 3,
+                "up_continue": True,
+                "last_buffer": "MORE",
+            }})
+        return httpx.Response(500)
+    client = _mock_client(handler)
+    r = await precheck("https://weixin.qq.com/sph/abc", client=client)
+    assert r["reachable"] is True
+    assert r["video_count"] == 3
+    assert calls["videos"] == 1  # 不翻页
+    await client.aclose()
+
+
+async def test_precheck_empty_home_page_unreachable(monkeypatch):
+    """首页 0 条 → reachable:false（抖音与视频号同口径）。"""
+    monkeypatch.setattr(settings, "TIKHUB_API_KEY", "tk")
+
+    def douyin_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("get_sec_user_id"):
+            return httpx.Response(200, json={"code": 200, "data": {"sec_user_id": "u1"}})
+        if request.url.path.endswith("fetch_user_post_videos"):
+            return httpx.Response(200, json={"code": 200, "data": {"aweme_list": []}})
+        return httpx.Response(500, text=request.url.path)
+
+    client = _mock_client(douyin_handler)
+    r = await precheck("https://www.douyin.com/user/x", client=client)
+    assert r == {"reachable": False, "video_count": 0}
+    await client.aclose()
+
+    def channels_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("fetch_video_detail"):
+            return httpx.Response(200, json={"code": 200, "data": {"username": "v2_x@finder"}})
+        if request.url.path.endswith("fetch_user_videos"):
+            return httpx.Response(200, json={"code": 200, "data": {"videos": []}})
+        return httpx.Response(500, text=request.url.path)
+
+    client = _mock_client(channels_handler)
+    r2 = await precheck("https://weixin.qq.com/sph/abc", client=client)
+    assert r2 == {"reachable": False, "video_count": 0}
+    await client.aclose()
+
+
+async def test_precheck_unknown_host_returns_unreachable_no_http_no_raise(monkeypatch):
+    """unknown 入口（裸 channels host 缺 /sph/、not-a-url、裸 sph 短号）→ unreachable dict，不抛、不打 HTTP。"""
+    monkeypatch.setattr(settings, "TIKHUB_API_KEY", "tk")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, text=f"unexpected {request.url.path}")
+
+    client = _mock_client(handler)
+    r = await precheck("https://channels.weixin.qq.com/no-sph-here", client=client)
+    assert r == {"reachable": False, "video_count": 0}
+    # 裸 sph 短号走 unknown（不发 HTTP），也 unreachable
+    r2 = await precheck("sphi9BjV8GK0Zsl", client=client)
+    assert r2 == {"reachable": False, "video_count": 0}
+    await client.aclose()
 
 
 async def test_hot_board_returns_list(monkeypatch):
@@ -431,3 +519,341 @@ async def test_get_json_does_not_retry_on_business_code_failure(monkeypatch):
     finally:
         await client.aclose()
     assert calls["n"] == 1, "business-code failure must not be retried"
+
+
+# ---- resolve_media：分享/短链 → MediaRef ----------------------------------
+
+async def test_platform_of_detects_douyin_hosts():
+    # 抖音分享短链 + 主域 + iesdouyin 变体均识别为 douyin。
+    assert _platform_of("https://v.douyin.com/abc/") == "douyin"
+    assert _platform_of("https://www.douyin.com/video/123") == "douyin"
+    assert _platform_of("https://www.iesdouyin.com/share/x") == "douyin"
+    # 微信视频号 host（sph 短链 + channels 子域）
+    assert _platform_of("https://channels.weixin.qq.com/x") == "wechat_channels"
+    assert _platform_of("https://weixin.qq.com/sph/ADk6xBh2hq") == "wechat_channels"
+    # 未知 host
+    assert _platform_of("https://example.com/v") == "unknown"
+    assert _platform_of("not-a-url") == "unknown"
+
+
+def test_channels_title_parses_short_title_repr():
+    raw = "[{'shortTitle': '职能部门正在杀死公司', 'pbRequestMsgInfo': None}]"
+    assert _channels_title(raw) == "职能部门正在杀死公司"
+    assert _channels_title([{"shortTitle": "直接列表"}]) == "直接列表"
+    assert _channels_title("普通标题") == "普通标题"
+
+
+async def test_resolve_media_douyin_calls_video_meta_and_returns_media_ref(monkeypatch):
+    """抖音 host → 调 video_meta → video_meta_to_media_ref（含 author + 新鲜头）。"""
+    monkeypatch.setattr(settings, "TIKHUB_API_KEY", "tk-test-key")
+    import app.datasource.tikhub as tikhub_mod
+
+    captured: dict = {}
+
+    async def _fake_video_meta(url, *, client=None):
+        captured["url"] = url
+        captured["client"] = client
+        return VideoMeta(
+            title="a video",
+            play_count=10,
+            fav_count=2,
+            download_url="https://dl/v1.mp4",
+            author="作者甲",
+        )
+
+    monkeypatch.setattr(tikhub_mod, "video_meta", _fake_video_meta)
+
+    ref = await resolve_media("https://v.douyin.com/abc")
+
+    assert isinstance(ref, MediaRef)
+    assert ref.platform == "douyin"
+    assert ref.download_url == "https://dl/v1.mp4"
+    # 抖音下载头注入（新鲜 dict，非模块级共享对象）
+    assert ref.headers == DOUYIN_DOWNLOAD_HEADERS
+    assert ref.headers is not DOUYIN_DOWNLOAD_HEADERS
+    assert ref.headers["Referer"] == "https://www.douyin.com/"
+    assert ref.author == "作者甲"
+    assert ref.title == "a video"
+    assert captured["url"] == "https://v.douyin.com/abc"
+
+
+async def test_resolve_media_unknown_host_raises_datasource_error(monkeypatch):
+    monkeypatch.setattr(settings, "TIKHUB_API_KEY", "tk-test-key")
+    import app.datasource.tikhub as tikhub_mod
+
+    called = {"n": 0}
+
+    async def _fail_video_meta(url, *, client=None):
+        called["n"] += 1
+        return VideoMeta("", 0, 0, "")
+
+    monkeypatch.setattr(tikhub_mod, "video_meta", _fail_video_meta)
+
+    with pytest.raises(DataSourceError, match="unsupported"):
+        await resolve_media("https://example.com/v")
+    # 未知平台不得调 video_meta（短路在平台门）
+    assert called["n"] == 0
+
+
+async def test_resolve_media_empty_download_url_raises_datasource_error(monkeypatch):
+    """video_meta 解析成功但 download_url 空 → DataSourceError（高清 fallback 地板）。"""
+    monkeypatch.setattr(settings, "TIKHUB_API_KEY", "tk-test-key")
+    import app.datasource.tikhub as tikhub_mod
+
+    async def _empty_video_meta(url, *, client=None):
+        return VideoMeta(title="t", play_count=0, fav_count=0, download_url="", author="")
+
+    monkeypatch.setattr(tikhub_mod, "video_meta", _empty_video_meta)
+
+    with pytest.raises(DataSourceError, match="empty download_url"):
+        await resolve_media("https://v.douyin.com/abc")
+
+
+async def test_channels_video_meta_parses_full_url_and_decode_key(monkeypatch):
+    """raw=false 精简结构 → MediaRef(full_url, decode_key, author/title)。"""
+    monkeypatch.setattr(settings, "TIKHUB_API_KEY", "tk-test-key")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST"
+        assert request.url.path.endswith("/wechat_channels/v2/fetch_video_detail")
+        assert _auth_header(request).startswith("Bearer ")
+        body = json.loads(request.content.decode())
+        assert body["share_url"].startswith("https://weixin.qq.com/sph/")
+        assert body["raw"] is False
+        return httpx.Response(
+            200,
+            json={
+                "code": 200,
+                "message": "ok",
+                "data": {
+                    "id": "14919266588327413890",
+                    "nickname": "前进的胖掌柜",
+                    "title": "[{'shortTitle': '职能部门正在杀死公司', 'pbRequestMsgInfo': None}]",
+                    "media": {
+                        "url": "http://cdn.example/v",
+                        "url_token": "?t=1",
+                        "full_url": "http://cdn.example/v?t=1",
+                        "decode_key": "910035402",
+                        "file_size": 100,
+                    },
+                },
+            },
+        )
+
+    client = _mock_client(handler)
+    ref = await channels_video_meta(
+        "https://weixin.qq.com/sph/ADk6xBh2hq", client=client
+    )
+    assert isinstance(ref, MediaRef)
+    assert ref.platform == "wechat_channels"
+    assert ref.download_url == "http://cdn.example/v?t=1"
+    assert ref.decode_key == "910035402"
+    assert ref.author == "前进的胖掌柜"
+    assert ref.title == "职能部门正在杀死公司"
+    assert ref.raw_id == "14919266588327413890"
+    assert ref.headers == CHANNELS_DOWNLOAD_HEADERS
+    assert ref.headers is not CHANNELS_DOWNLOAD_HEADERS
+    await client.aclose()
+
+
+async def test_resolve_media_channels_dispatches_to_channels_video_meta(monkeypatch):
+    monkeypatch.setattr(settings, "TIKHUB_API_KEY", "tk-test-key")
+    import app.datasource.tikhub as tikhub_mod
+
+    async def _fake_channels(url, *, client=None):
+        return MediaRef(
+            platform="wechat_channels",
+            download_url="http://cdn/x",
+            decode_key="k1",
+            title="t",
+            author="a",
+        )
+
+    monkeypatch.setattr(tikhub_mod, "channels_video_meta", _fake_channels)
+    ref = await resolve_media("https://weixin.qq.com/sph/abc")
+    assert ref.platform == "wechat_channels"
+    assert ref.decode_key == "k1"
+
+
+async def test_channels_video_meta_allows_missing_decode_key(monkeypatch):
+    """无 decode_key → MediaRef.decode_key=None（未加密/缺字段，跳过 WASM）。"""
+    monkeypatch.setattr(settings, "TIKHUB_API_KEY", "tk")
+    _clear_channels_detail_cache()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"code": 200, "data": {
+            "media": {"full_url": "http://cdn/v.mp4"},
+        }})
+
+    client = _mock_client(handler)
+    ref = await channels_video_meta("https://weixin.qq.com/sph/abc", client=client)
+    assert ref.platform == "wechat_channels"
+    assert ref.download_url == "http://cdn/v.mp4"
+    assert ref.decode_key is None
+    await client.aclose()
+
+
+def test_parse_channels_video_allows_missing_decode_key():
+    v = _parse_channels_video({
+        "title": "t", "read_count": 1, "nickname": "a",
+        "media": {"full_url": "http://cdn/v.mp4"},
+    })
+    assert v is not None
+    assert v.platform == "wechat_channels"
+    assert v.decode_key is None
+
+
+def test_video_meta_to_media_ref_channels_allows_missing_decode_key():
+    v = VideoMeta(
+        title="t", play_count=1, fav_count=0,
+        download_url="http://cdn/a.mp4",
+        author="a",
+        decode_key=None,
+        platform="wechat_channels",
+    )
+    ref = video_meta_to_media_ref(v)
+    assert ref.platform == "wechat_channels"
+    assert ref.decode_key is None
+
+
+async def test_channels_detail_cached_across_precheck_and_account(monkeypatch):
+    """#9：同一分享链 precheck → account_top_videos 只打一次 fetch_video_detail。"""
+    monkeypatch.setattr(settings, "TIKHUB_API_KEY", "tk")
+    _clear_channels_detail_cache()
+    calls = {"detail": 0, "videos": 0}
+    url = "https://weixin.qq.com/sph/cache-me"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("fetch_video_detail"):
+            calls["detail"] += 1
+            return httpx.Response(200, json={"code": 200, "data": {
+                "username": "v2_cache@finder",
+                "nickname": "n",
+                "media": {"full_url": "http://cdn/x", "decode_key": "k"},
+            }})
+        if request.url.path.endswith("fetch_user_videos"):
+            calls["videos"] += 1
+            return httpx.Response(200, json={"code": 200, "data": {
+                "videos": [{
+                    "title": "t", "read_count": 1, "nickname": "n",
+                    "media": {"full_url": "http://cdn/v.mp4", "decode_key": "k1"},
+                }],
+                "up_continue": False,
+            }})
+        return httpx.Response(500, text=request.url.path)
+
+    client = _mock_client(handler)
+    r = await precheck(url, client=client)
+    assert r == {"reachable": True, "video_count": 1}
+    videos = await account_top_videos(url, n=5, client=client)
+    assert len(videos) == 1
+    assert calls["detail"] == 1
+    assert calls["videos"] == 2  # precheck 首页 + account 再拉一页
+    await client.aclose()
+
+
+# ---- Task 7 平台门禁：account_top_videos / precheck 抖音 only --------------
+
+async def test_account_top_videos_channels_share_uses_video_detail_username(monkeypatch):
+    monkeypatch.setattr(settings, "TIKHUB_API_KEY", "tk")
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("fetch_video_detail"):
+            return httpx.Response(200, json={"code": 200, "data": {
+                "username": "v2_from_share@finder",
+                "nickname": "前进的胖掌柜",
+                "media": {"full_url": "http://x", "decode_key": "1"},
+            }})
+        if request.url.path.endswith("fetch_user_videos"):
+            body = json.loads(request.content.decode())
+            assert body["username"] == "v2_from_share@finder"
+            return httpx.Response(200, json={"code": 200, "data": {
+                "videos": [{
+                    "title": "[{'shortTitle': '职能部门正在杀死公司'}]",
+                    "read_count": 3, "fav_count": 0, "like_count": 2,
+                    "nickname": "前进的胖掌柜",
+                    "media": {"full_url": "http://cdn/v.mp4", "decode_key": "dk1"},
+                }],
+                "up_continue": False,
+            }})
+        return httpx.Response(500, text="no")
+    client = _mock_client(handler)
+    videos = await account_top_videos("https://weixin.qq.com/sph/ADk6xBh2hq", n=20, client=client)
+    assert len(videos) == 1
+    assert videos[0].title == "职能部门正在杀死公司"
+    assert videos[0].decode_key == "dk1"
+    await client.aclose()
+
+
+async def test_account_top_videos_channels_share_paginates_until_n_or_max_pages(monkeypatch):
+    monkeypatch.setattr(settings, "TIKHUB_API_KEY", "tk")
+    pages_hit = {"n": 0}
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("fetch_video_detail"):
+            return httpx.Response(200, json={"code": 200, "data": {
+                "username": "v2_share@finder", "nickname": "前进的胖掌柜",
+            }})
+        if request.url.path.endswith("fetch_user_videos"):
+            pages_hit["n"] += 1
+            body = json.loads(request.content.decode())
+            assert body["username"] == "v2_share@finder"
+            assert body["raw"] is False
+            # 首页不带 last_buffer；后续页带上一页返回的 last_buffer
+            if pages_hit["n"] == 1:
+                assert "last_buffer" not in body
+            else:
+                assert body["last_buffer"] == f"buf{pages_hit['n'] - 1}"
+            vids = [{
+                "title": f"t{i}",
+                "nickname": "前进的胖掌柜",
+                "read_count": 10, "fav_count": 1, "like_count": 9,
+                "media": {"full_url": f"http://cdn/{pages_hit['n']}-{i}.mp4", "decode_key": f"k-{pages_hit['n']}-{i}"},
+            } for i in range(6)]
+            return httpx.Response(200, json={"code": 200, "data": {
+                "username": "v2_share@finder", "nickname": "前进的胖掌柜",
+                "videos": vids, "up_continue": True, "last_buffer": f"buf{pages_hit['n']}",
+            }})
+        return httpx.Response(500, text="no")
+    client = _mock_client(handler)
+    videos = await account_top_videos("https://weixin.qq.com/sph/ADk6xBh2hq", n=20, client=client)
+    assert len(videos) == 20
+    assert pages_hit["n"] == 4           # 6×4=24 ≥ 20，4 页截断（= max_pages 硬上限）
+    assert videos[0].platform == "wechat_channels"
+    assert videos[0].decode_key == "k-1-0"
+    assert videos[0].download_url.endswith("1-0.mp4")
+    assert videos[0].play_count == 10  # read_count 代理
+    assert videos[0].fav_count == 1    # fav 优先于 like
+    await client.aclose()
+
+
+# ---- video_meta_to_media_ref：channels 装配 decode_key ----------------------
+
+def test_video_meta_to_media_ref_channels_keeps_decode_key_pair():
+    v = VideoMeta(
+        title="t", play_count=1, fav_count=2,
+        download_url="http://cdn/a.mp4?tok=1",
+        author="胖掌柜",
+        decode_key="910035402",
+        platform="wechat_channels",
+    )
+    ref = video_meta_to_media_ref(v)
+    assert ref.platform == "wechat_channels"
+    assert ref.download_url == v.download_url
+    assert ref.decode_key == "910035402"
+    assert ref.headers == CHANNELS_DOWNLOAD_HEADERS
+    assert ref.headers is not CHANNELS_DOWNLOAD_HEADERS
+    assert ref.author == "胖掌柜"
+
+
+# ---- _account_entry_kind：拆账号入口分类 ---------------------------------
+
+def test_account_entry_kind_classifies_inputs():
+    assert _account_entry_kind("https://v.douyin.com/abc/") == "douyin"
+    assert _account_entry_kind("https://weixin.qq.com/sph/ADk6xBh2hq") == "channels_share"
+    assert _account_entry_kind("not-a-url") == "unknown"
+    assert _account_entry_kind("https://example.com/x") == "unknown"
+    # 裸 sph 短号不再识别为 channels_id（TikHub fetch_channel_id_to_username 对任意 sph
+    # 派生 @finder username，无法识别 bogus）→ 走 unknown，不发 HTTP。
+    assert _account_entry_kind("sphi9BjV8GK0Zsl") == "unknown"
+    assert _account_entry_kind("  sphABC_123  ") == "unknown"
+    # 裸串不得崩
+    assert _account_entry_kind("sph") == "unknown"

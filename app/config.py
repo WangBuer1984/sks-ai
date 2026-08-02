@@ -31,8 +31,9 @@ class Settings(BaseSettings):
     ALIYUN_ACCESS_KEY_SECRET: str = ""
     # 内容安全 Green 文本审核端点（按 region 选择）。
     ALIYUN_CONTENT_SAFETY_ENDPOINT: str = "https://green.cn-shanghai.aliyuncs.com"
-    # 一句话识别（短音频 ≤60s 同步）——dashscope SDK 用此 key（阿里云百炼 API key）。
-    # 未配置时 /ai/asr 返回 503（懒初始化失败，per-request，不阻断启动）。
+    # 一句话识别（短 ASR）+ 长转写（qwen3-asr-flash）共用——DashScope/百炼 API Key，
+    # 非阿里云 ISI。未配置时 /ai/asr 与 transcribe 懒失败（per-request，不阻断启动）。
+    # 生产镜像须含 ffmpeg/ffprobe（短 ASR pydub + 长转写管线）与 nodejs（视频号 decode）。
     ALIYUN_ASR_KEY: str = ""
 
     # TikHub 数据 API（拆账号/拆视频取数）。
@@ -40,10 +41,11 @@ class Settings(BaseSettings):
     TIKHUB_API_KEY: str = ""
     TIKHUB_BASE_URL: str = "https://api.tikhub.dev"
 
-    # 阿里云 ISI 录音文件识别（长音频异步批量，与短音频 dashscope 一句话识别不同 API）。
-    # AccessKey ID/Secret 用于 AcsClient 鉴权；AppKey 是 NLS 项目维度，联调期在控制台获取。
-    # 未配置时 transcribe 懒初始化失败，per-request 报错（不阻断 import）。
+    # deprecated：长转写已硬切 Qwen，不再读此字段。保留仅为兼容旧 .env，可留空。
     ALIYUN_ASR_APP_KEY: str = ""
+
+    # ASR 媒体下载临时文件目录（空 → 系统 tempfile 目录）。download.py 落盘 + gc_stale_tmp 清扫。
+    ASR_TMP_DIR: str = ""
 
 
 settings = Settings()

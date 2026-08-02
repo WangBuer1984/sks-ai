@@ -35,7 +35,9 @@ import logging
 from typing import Any
 
 from app.datasource import DataSourceError
+from app.datasource.media import MediaRef
 from app.datasource.tikhub import account_top_videos as _account_top_videos
+from app.datasource.tikhub import video_meta_to_media_ref
 from app.datasource.tikhub import VideoMeta
 from app.llm.client import glm_client
 from app.safety.content_safety import check as _check
@@ -149,9 +151,9 @@ async def _summarize(items: list[dict[str, Any]]) -> dict[str, Any] | None:
 
 # ---- 心跳包裹的转写（与 video_analyze 同实现，保持独立便于单测） -----------
 
-async def _transcribe_with_heartbeat(task_id: int, download_url: str) -> str:
+async def _transcribe_with_heartbeat(task_id: int, media: MediaRef | str) -> str:
     """transcribe + 周期心跳：长转写期间每 HEARTBEAT_INTERVAL touch updated_at。"""
-    task = asyncio.create_task(transcribe(download_url))
+    task = asyncio.create_task(transcribe(media))
     while True:
         await heartbeat(task_id)
         if task.done():
@@ -190,7 +192,8 @@ async def analyze_account(task_id: int, url: str) -> None:
     for v in videos:
         try:
             # UGC 安全（transcript 来自抖音创作者，仍按 UGC 处理 §5.1）
-            transcript = await _transcribe_with_heartbeat(task_id, v.download_url)
+            ref = video_meta_to_media_ref(v)  # author 已在 VideoMeta（Task 1）
+            transcript = await _transcribe_with_heartbeat(task_id, ref)
             if not await check(transcript):
                 log.warning("account item transcript blocked by safety, skipping: %s", v.title)
                 continue  # 本条不算完成

@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** 在现有拆账号契约上支持视频号：短号 `sph…` 或分享链 → finder username → TOP≤20（`max_pages=4`）→ 带 `decode_key` 的转写管线；前端双平台提示。
+**Goal:** 在现有拆账号契约上支持视频号：分享链 → finder username → TOP≤20（`max_pages=4`）→ 带 `decode_key` 的转写管线；前端双平台提示。**不支持**短号 `sph…` 入口（TikHub `fetch_channel_id_to_username` 对任意 sph 派生 @finder username，无法识别 bogus）。
 
-**Architecture:** `tikhub` 新增 `_account_entry_kind` 分发；视频号走 `fetch_channel_id_to_username` / `fetch_video_detail` → `fetch_user_videos`；扩展 `VideoMeta.decode_key/platform`；`video_meta_to_media_ref` 产出 channels `MediaRef`。`analyze_account` 锚点不动。`sks-web` 仅文案。`sks-server` 不改。
+**Architecture:** `tikhub` 新增 `_account_entry_kind` 分发；视频号走 `fetch_video_detail` → `fetch_user_videos`；扩展 `VideoMeta.decode_key/platform`；`video_meta_to_media_ref` 产出 channels `MediaRef`。`analyze_account` 锚点不动。`sks-web` 仅文案。`sks-server` 不改。
 
 **Tech Stack:** Python 3.12 / httpx / pytest；前端 React `Analyze.tsx`；依赖已落地 Task 8（`decode_media` + WASM + node）。
 
@@ -16,7 +16,7 @@
 - `account_top_videos` 翻页 **`max_pages=4`**；precheck **只拉首页、不翻页**。
 - 同条 `download_url` + `decode_key` 配对；禁止跨条目混用。
 - **禁止**把分享链 path 段当 `channel_id`。
-- 新增 `_account_entry_kind`；裸 `sph…` **不得**只靠 `_platform_of`。
+- 新增 `_account_entry_kind`；裸 `sph…` 视为 unknown（不支持短号入口，不发 HTTP）。
 - `analyze_account`：**只**依赖 `video_meta_to_media_ref` 升级；禁止重写循环锚点。
 - 运行目录（后端）：`/Users/rick/work/sks-ai/.claude/worktrees/qwen-asr-media-pipeline`；测试：`.venv/bin/python -m pytest …`
 - 前端：`/Users/rick/work/sks-web`（独立 commit）。
@@ -121,40 +121,35 @@ git commit -m "feat: VideoMeta.decode_key/platform + channels MediaRef 装配"
 - Test: `tests/test_tikhub.py`
 
 **Interfaces:**
-- Produces: `_account_entry_kind(raw: str) -> Literal["douyin","channels_id","channels_share","unknown"]`
+- Produces: `_account_entry_kind(raw: str) -> Literal["douyin","channels_share","unknown"]`
 
 - [ ] **Step 1: 写失败测试**
 
 ```python
 def test_account_entry_kind_classifies_inputs():
     assert _account_entry_kind("https://v.douyin.com/abc/") == "douyin"
-    assert _account_entry_kind("sphi9BjV8GK0Zsl") == "channels_id"
     assert _account_entry_kind("https://weixin.qq.com/sph/ADk6xBh2hq") == "channels_share"
-    assert _account_entry_kind("  sphABC_123  ") == "channels_id"
     assert _account_entry_kind("not-a-url") == "unknown"
     assert _account_entry_kind("https://example.com/x") == "unknown"
+    # 裸 sph 短号不再识别为 channels_id（TikHub fetch_channel_id_to_username 对任意 sph
+    # 派生 @finder username，无法识别 bogus）→ 走 unknown，不发 HTTP。
+    assert _account_entry_kind("sphi9BjV8GK0Zsl") == "unknown"
+    assert _account_entry_kind("  sphABC_123  ") == "unknown"
     # 裸串不得崩
-    assert _account_entry_kind("sph") == "unknown"  # 过短 / 不匹配完整 pattern 则 unknown；按 ^sph[A-Za-z0-9_-]+$，「sph」仅前缀不够 → unknown
+    assert _account_entry_kind("sph") == "unknown"
 ```
-
-（若采用 `^sph[A-Za-z0-9_-]+$`，`sph` 单独不匹配 → `unknown`。示例短号须含 `sph` + 后续字符。）
 
 - [ ] **Step 2: Run → FAIL**
 
 - [ ] **Step 3: 实现**
 
 ```python
-import re
 from typing import Literal
 
-_SPH_ID_RE = re.compile(r"^sph[A-Za-z0-9_-]+$")
-
-def _account_entry_kind(raw: str) -> Literal["douyin", "channels_id", "channels_share", "unknown"]:
+def _account_entry_kind(raw: str) -> Literal["douyin", "channels_share", "unknown"]:
     s = (raw or "").strip()
     if not s:
         return "unknown"
-    if _SPH_ID_RE.fullmatch(s):
-        return "channels_id"
     host = (urlparse(s).hostname or "").lower()
     if host.endswith("douyin.com") or host.endswith("iesdouyin.com"):
         return "douyin"
@@ -164,12 +159,12 @@ def _account_entry_kind(raw: str) -> Literal["douyin", "channels_id", "channels_
     return "unknown"
 ```
 
-注意：短号检测在 host 之前（裸串无 host）。
+注意：裸 `sph…` 不再匹配——无短号入口，归 `unknown`，不发 HTTP。
 
 - [ ] **Step 4: PASS + Commit**
 
 ```bash
-git commit -m "feat: _account_entry_kind 拆账号入口分类（含裸 sph）"
+git commit -m "feat: _account_entry_kind 拆账号入口分类（短号归 unknown）"
 ```
 
 ---
@@ -185,54 +180,44 @@ git commit -m "feat: _account_entry_kind 拆账号入口分类（含裸 sph）"
 **Interfaces:**
 - Consumes: `_account_entry_kind`、`_post_json`、`_channels_title`、`CHANNELS_DOWNLOAD_HEADERS`
 - Produces: `account_top_videos` 对 channels 返回 `list[VideoMeta]`（`platform=wechat_channels`，配对 `decode_key`）
-- Constants: `_PATH_CHANNELS_ID_TO_USER = "/api/v1/wechat_channels/v2/fetch_channel_id_to_username"`；`_PATH_CHANNELS_USER_VIDEOS = "/api/v1/wechat_channels/v2/fetch_user_videos"`；`_CHANNELS_MAX_PAGES = 4`
+- Constants: `_PATH_CHANNELS_USER_VIDEOS = "/api/v1/wechat_channels/v2/fetch_user_videos"`；`_CHANNELS_MAX_PAGES = 4`（`_PATH_CHANNELS_VIDEO_DETAIL` 已存在）
 
 - [ ] **Step 1: 写失败测试（MockTransport）**
 
 ```python
-async def test_account_top_videos_channels_id_paginates_until_n_or_max_pages(monkeypatch):
+async def test_account_top_videos_channels_share_paginates_until_n_or_max_pages(monkeypatch):
     monkeypatch.setattr(settings, "TIKHUB_API_KEY", "tk")
     pages_hit = {"n": 0}
-
     def handler(request: httpx.Request) -> httpx.Response:
-        path = request.url.path
-        if path.endswith("fetch_channel_id_to_username"):
+        if request.url.path.endswith("fetch_video_detail"):
             return httpx.Response(200, json={"code": 200, "data": {
-                "channel_id": "sphi9BjV8GK0Zsl",
-                "username": "v2_abc@finder",
-                "nickname": "人民日报",
+                "username": "v2_share@finder", "nickname": "前进的胖掌柜",
             }})
-        if path.endswith("fetch_user_videos"):
+        if request.url.path.endswith("fetch_user_videos"):
             pages_hit["n"] += 1
             body = json.loads(request.content.decode())
+            assert body["username"] == "v2_share@finder"
             assert body["raw"] is False
-            assert body["username"] == "v2_abc@finder"
+            # 首页不带 last_buffer；后续页带上一页返回的 last_buffer
+            if pages_hit["n"] == 1:
+                assert "last_buffer" not in body
+            else:
+                assert body["last_buffer"] == f"buf{pages_hit['n'] - 1}"
             # 每页 6 条；第 4 页仍 up_continue，但 max_pages=4 应停 → 最多 24，再切到 n=20
             vids = [{
-                "id": f"id-{pages_hit['n']}-{i}",
-                "title": f"t{i}",
-                "nickname": "人民日报",
-                "read_count": 10,
-                "fav_count": 1,
-                "like_count": 9,
-                "media": {
-                    "full_url": f"http://cdn/{pages_hit['n']}-{i}.mp4",
-                    "decode_key": f"k-{pages_hit['n']}-{i}",
-                },
+                "title": f"t{i}", "nickname": "前进的胖掌柜",
+                "read_count": 10, "fav_count": 1, "like_count": 9,
+                "media": {"full_url": f"http://cdn/{pages_hit['n']}-{i}.mp4", "decode_key": f"k-{pages_hit['n']}-{i}"},
             } for i in range(6)]
             return httpx.Response(200, json={"code": 200, "data": {
-                "username": "v2_abc@finder",
-                "nickname": "人民日报",
-                "videos": vids,
-                "up_continue": True,
-                "last_buffer": f"buf{pages_hit['n']}",
+                "username": "v2_share@finder", "nickname": "前进的胖掌柜",
+                "videos": vids, "up_continue": True, "last_buffer": f"buf{pages_hit['n']}",
             }})
-        return httpx.Response(404, json={"code": 404})
-
+        return httpx.Response(500, text="no")
     client = _mock_client(handler)
-    videos = await account_top_videos("sphi9BjV8GK0Zsl", n=20, client=client)
+    videos = await account_top_videos("https://weixin.qq.com/sph/ADk6xBh2hq", n=20, client=client)
     assert len(videos) == 20
-    assert pages_hit["n"] <= 4
+    assert pages_hit["n"] == 4           # 6×4=24 ≥ 20，4 页截断（= max_pages 硬上限）
     assert videos[0].platform == "wechat_channels"
     assert videos[0].decode_key == "k-1-0"
     assert videos[0].download_url.endswith("1-0.mp4")
@@ -276,15 +261,10 @@ async def test_account_top_videos_channels_share_uses_video_detail_username(monk
 - [ ] **Step 3: 实现要点**
 
 ```python
-_PATH_CHANNELS_ID_TO_USER = "/api/v1/wechat_channels/v2/fetch_channel_id_to_username"
 _PATH_CHANNELS_USER_VIDEOS = "/api/v1/wechat_channels/v2/fetch_user_videos"
 _CHANNELS_MAX_PAGES = 4
 
 async def _resolve_channels_username(client, kind: str, raw: str) -> str | None:
-    if kind == "channels_id":
-        body = await _post_json(client, _PATH_CHANNELS_ID_TO_USER, {"channel_id": raw.strip(), "raw": False})
-        u = (body.get("data") or {}).get("username")
-        return u if isinstance(u, str) and u.endswith("@finder") else None
     if kind == "channels_share":
         body = await _post_json(client, _PATH_CHANNELS_VIDEO_DETAIL, {"share_url": raw.strip(), "raw": False})
         u = (body.get("data") or {}).get("username")
@@ -330,7 +310,7 @@ def _parse_channels_video(item: dict, *, fallback_author: str = "") -> VideoMeta
 - [ ] **Step 5: PASS + Commit**
 
 ```bash
-git commit -m "feat: 视频号 account_top_videos（短号/分享链→TOP N，max_pages=4）"
+git commit -m "feat: 视频号 account_top_videos（分享链→TOP N，max_pages=4）"
 ```
 
 ---
@@ -347,29 +327,6 @@ git commit -m "feat: 视频号 account_top_videos（短号/分享链→TOP N，m
 - [ ] **Step 1: 写失败测试**
 
 ```python
-async def test_precheck_channels_id_miss_returns_unreachable(monkeypatch):
-    """username=None 必须短路，不得再打 fetch_user_videos。"""
-    monkeypatch.setattr(settings, "TIKHUB_API_KEY", "tk")
-    calls = {"id": 0, "videos": 0}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path.endswith("fetch_channel_id_to_username"):
-            calls["id"] += 1
-            return httpx.Response(200, json={"code": 200, "data": {
-                "channel_id": "sphNope123456", "username": None, "error": "not found",
-            }})
-        if request.url.path.endswith("fetch_user_videos"):
-            calls["videos"] += 1
-            return httpx.Response(200, json={"code": 200, "data": {"videos": [{"media": {}}]}})
-        return httpx.Response(500, text=f"unexpected {request.url.path}")
-
-    client = _mock_client(handler)
-    r = await precheck("sphNope123456", client=client)  # 满足 sph regex
-    assert r == {"reachable": False, "video_count": 0}
-    assert calls["id"] == 1
-    assert calls["videos"] == 0  # miss 短路：禁止再拉作品列表
-    await client.aclose()
-
 async def test_precheck_channels_share_home_count_no_pagination(monkeypatch):
     monkeypatch.setattr(settings, "TIKHUB_API_KEY", "tk")
     calls = {"videos": 0}
@@ -467,7 +424,7 @@ async def test_analyze_account_passes_channels_decode_key_to_transcribe(monkeypa
     monkeypatch.setattr("app.skills.account_analyze.graph.insert_benchmark_video", _insert_bench)
 
     from app.skills.account_analyze.graph import analyze_account
-    await analyze_account(task_id=1, url="sphi9BjV8GK0Zsl")
+    await analyze_account(task_id=1, url="https://weixin.qq.com/sph/ADk6xBh2hq")
     assert isinstance(captured["media"], MediaRef)
     assert captured["media"].decode_key == "dk-pair-1"
 ```
@@ -506,12 +463,12 @@ const placeholder =
     ? '粘贴视频完整文案…'
     : mode === 'videoLink'
       ? '粘贴单条视频链接（抖音或视频号分享链）…'
-      : '抖音：账号主页链接。视频号：sph 开头的视频号 ID，或该号任意一条分享链接。';
+      : '抖音：账号主页链接。视频号：该账号下任意一条分享链接。';
 
 // 在提交按钮与「异步任务…」说明之间（或并列）增加：
 {mode === 'account' && (
   <p className="mt-2 text-[11.5px] text-paper-muted">
-    抖音请粘贴主页链接；视频号请粘贴视频号 ID（以 sph 开头）或该账号下任意一条分享链接（weixin.qq.com/sph/…）。
+    抖音请粘贴主页链接；视频号请粘贴该账号下任意一条分享链接（weixin.qq.com/sph/…）。
   </p>
 )}
 ```
@@ -523,7 +480,7 @@ const placeholder =
 ```bash
 cd /Users/rick/work/sks-web
 git add src/pages/Analyze.tsx
-git commit -m "fix: 拆账号支持视频号短号/分享链提示文案"
+git commit -m "fix: 拆账号支持视频号分享链提示文案"
 ```
 
 ---
@@ -541,10 +498,10 @@ Expected: 既有 3 个环境失败可保留；本计划相关全部 PASS；无�
 
 - [ ] **Step 2: 手工联调 checklist（有 key 时）**
 
-1. precheck `sphi9BjV8GK0Zsl`（或真实短号）→ reachable  
-2. precheck 垃圾短号 → unreachable、Java 不扣费  
-3. precheck / account 分享链 `https://weixin.qq.com/sph/...` → 可拉列表  
-4. 单条 decode 需 node 在 PATH  
+1. precheck 真实视频号分享链 `https://weixin.qq.com/sph/...` → reachable
+2. precheck 垃圾分享链 → unreachable、Java 不扣费
+3. precheck / account 分享链 `https://weixin.qq.com/sph/...` → 可拉列表
+4. 单条 decode 需 node 在 PATH
 
 - [ ] **Step 3: 若有文档漂移，一行备注进 spec Status「Implemented」**（可选 commit）
 
@@ -576,3 +533,7 @@ Expected: 既有 3 个环境失败可保留；本计划相关全部 PASS；无�
 | P2-2 | Task 4 miss 测加 `calls["videos"]==0` 证明短路 |
 | P3 | Task 5 补全可运行测试草图；Task 6 钉死对照 Analyze.tsx 行号/勿删异步说明 |
 | P3 | 最终 whole-branch review 须覆盖 `3d0d23a`（Task 8） |
+
+## Follow-up（2026-08-02）
+
+弃短号补丁（`6932c89`）后 follow-up：`max_pages=4` 翻页截断覆盖从 channels_id 路径挪到 channels_share（`test_account_top_videos_channels_share_paginates_until_n_or_max_pages`，已删 `短号`/`channels_id`/`fetch_channel_id_to_username` 代码路径）；本 plan 文本对齐弃短号代码现状（Goal/Architecture/Global Constraints/Task 2-6 去短号与 channels_id 引用，裸 `sph…` 归 unknown）。spec 文档未动（worktree spec 已在 `6932c89` 更新）。

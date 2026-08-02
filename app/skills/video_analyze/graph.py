@@ -28,6 +28,8 @@ import logging
 from typing import Any
 
 from app.datasource import DataSourceError
+from app.datasource.media import MediaRef
+from app.datasource.tikhub import resolve_media as _resolve_media
 from app.datasource.transcribe import transcribe as _transcribe
 from app.llm.client import glm_client
 from app.safety.content_safety import check as _check
@@ -42,6 +44,7 @@ check = _check
 transcribe = _transcribe
 update_task = _update_task
 heartbeat = _heartbeat
+resolve_media = _resolve_media
 
 # 心跳间隔：transcribe 轮询期间每 N 秒 touch updated_at，短于 Java running-timeout 5min。
 HEARTBEAT_INTERVAL = 60.0
@@ -99,13 +102,16 @@ async def _structure_transcript(transcript: str) -> dict[str, Any] | None:
 
 # ---- 心跳包裹的转写 --------------------------------------------------------
 
-async def _transcribe_with_heartbeat(task_id: int, download_url: str) -> str:
+async def _transcribe_with_heartbeat(task_id: int, media: MediaRef | str) -> str:
     """transcribe + 周期心跳：长转写（最长 10min）期间每 HEARTBEAT_INTERVAL touch updated_at。
 
     用 asyncio.shield 保护内层 task 不被 wait_for 超时取消——超时仅跳出本轮 wait，
     下一轮继续 await 同一 task，transcribe 真实进度不丢。
+
+    ``media``：经 ``resolve_media`` 解析后的 ``MediaRef``（直链 + 平台头），
+    或裸直链 str（兼容旧调用方/文本路径）。
     """
-    task = asyncio.create_task(transcribe(download_url))
+    task = asyncio.create_task(transcribe(media))
     while True:
         await heartbeat(task_id)  # 本轮先 touch，再 wait
         if task.done():
@@ -149,7 +155,8 @@ async def analyze_video_link(task_id: int, url: str) -> None:
     """
     await update_task(task_id, status="running", progress=0)
     try:
-        transcript = await _transcribe_with_heartbeat(task_id, url)
+        ref = await resolve_media(url)
+        transcript = await _transcribe_with_heartbeat(task_id, ref)
         result = await _structure_transcript(transcript)
     except DataSourceError as e:
         await update_task(task_id, status="failed", error=str(e))

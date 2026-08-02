@@ -1,174 +1,172 @@
-"""阿里云录音文件识别（长音频异步批量）。
+"""转写门面：编排 Qwen ASR 媒体管线（download → convert → duration 分支 → recognize）。
 
-与 ``app/datasource/asr.py`` 的「一句话识别」（短音频 ≤60s，dashscope 同步）是**不同
-API**：本模块走阿里云 ISI 录音文件识别（filetrans POP API，异步 submit→poll→fetch），
-面向 P3 拆视频/拆账号的完整音频下载转写。
+**与旧阿里云长音频异步 POP 路径彻底切割**：本模块不再走旧版录音文件识别异步
+submit→poll→fetch POP API，不再持有域名/版本/区域/轮询常量，也不再暴露提交/取结果
+模块级 seam。编排逻辑统一交给 Task 2–4 的媒体子模块：
+``download`` / ``audio`` / ``qwen_asr`` / ``merge`` / ``semaphores``。
 
-SDK 选型：``aliyun-python-sdk-core`` 的 ``AcsClient`` + ``CommonRequest``（官方文档
-https://help.aliyun.com/zh/isi/developer-reference/sdk-for-python-3 的标准路径）。
-域 ``filetrans.cn-shanghai.aliyuncs.com``，版本 ``2018-08-17``，action ``SubmitTask`` /
-``GetTaskResult``。lazy-import：未配置 key 时不触发 SDK 加载，import 不崩溃。
+接口（对齐 brief / contract）：
+  - ``async def transcribe(media: MediaRef | str) -> str``
+  - ``def _is_configured() -> bool`` —— ``ALIYUN_ASR_KEY`` 且 ffmpeg/ffprobe 在 PATH
+  - 模块级 ``decode_media: Callable[[Path, str], Path] | None = None`` —— 可插拔
+    channels decode seam；Task 8a 注入，默认 None + 守卫（绝不引用未定义符号）。
 
-file_link 直传：阿里云录音文件识别**只接受公网可访问 URL**（不支持本地文件）。因此
-``transcribe(download_url)`` 直接把 ``download_url`` 作为 ``file_link`` 透传给阿里云，
-**不下载到临时文件**（brief §7 resolution：API 接受 URL 即直传，省去下载→OSS 中转）。
-若联调期发现 TikHub 签名直链阿里云拉不到，需在此处先下载→上传 OSS→传 OSS URL（待联调）。
+P0 不变量（20min 超时 → DataSourceError）：
+  ``transcribe`` 外层包 ``asyncio.wait_for(_transcribe_inner(media), timeout=1200)``。
+  ``wait_for`` 超时抛裸 ``asyncio.TimeoutError``，skill 层只 catch ``DataSourceError`` +
+  宽 ``except Exception``，故此处必须捕获并翻译为 ``DataSourceError("transcribe timed out …")``。
+  超时时内层 task 被 cancel，CPython 仍执行内层 ``finally`` → temp 文件被 unlink。
 
-鉴权：``AcsClient(ALIYUN_ACCESS_KEY_ID, ALIYUN_ACCESS_KEY_SECRET, "cn-shanghai")``。
-AppKey 是 NLS 项目维度（``ALIYUN_ASR_APP_KEY``），联调期在 ISI 控制台获取，与 AccessKey 不同。
+配置校验在 ``transcribe()`` 中、``wait_for`` **之前**执行，缺 key / 缺 ffmpeg 立即 fail-fast
+（不在 20min 超时后才报错）。
 
-模块级 seam ``_submit_task`` / ``_get_task_result`` 是测试 monkeypatch 目标
-（app.datasource.transcribe._submit_task / ._get_task_result）——测试 mock 它们，
-不发真实网络请求。真实 阿里云 调用需联调期用真实 key + AppKey 核对（POP 签名 / 状态机时序）。
-
-失败语义：未配置 / 提交异常 / 任务 FAILED / 解析失败 → ``DataSourceError``，
-Task 3.2/3.3 捕获后翻译（拆账号转写失败 → 全额退款 + 引导视频粘贴，PRD §11.3）。
+seam 全部模块级绑定（与 ``tikhub.py`` 同模式），测试 monkeypatch 目标：
+``app.datasource.transcribe.download_url`` / ``.convert_to_wav`` /
+``.get_audio_duration`` / ``.slice_audio`` / ``.recognize_wav`` /
+``.merge_transcript_parts`` / ``.gc_stale_tmp`` / ``._ffmpeg_available`` /
+``._TRANSCRIBE_TIMEOUT``。
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
-import time
+import shutil
+from pathlib import Path
+from typing import Callable, Optional, Union
 
 from app.config import settings
 from app.datasource import DataSourceError
+from app.datasource.media import MediaRef
+from app.datasource.media.audio import convert_to_wav, get_audio_duration, slice_audio
+from app.datasource.media.channels_decode import decode_channels_media
+from app.datasource.media.download import download_url, gc_stale_tmp
+from app.datasource.media.merge import merge_transcript_parts
+from app.datasource.media.qwen_asr import recognize_wav
+from app.datasource.media.semaphores import (
+    get_asr_semaphore,
+    get_convert_semaphore,
+    get_download_semaphore,
+)
 
 log = logging.getLogger(__name__)
 
-# filetrans POP API 固定参数（联调期如阿里云改域/版本仅改这里）。
-_DOMAIN = "filetrans.cn-shanghai.aliyuncs.com"
-_VERSION = "2018-08-17"
-_REGION = "cn-shanghai"
-# 轮询间隔与上限：长音频通常数分钟内完成，上限 10min 兜底（超时抛 DataSourceError）。
-_POLL_INTERVAL = 5.0
-_POLL_TIMEOUT = 600.0
+# 20min 硬上限（单条转写墙钟）。module-level 以便测试 monkeypatch 缩短。
+_TRANSCRIBE_TIMEOUT = 1200
+
+# 10MB（qwen3-asr-flash 单次 wav 体积上限）——整段守卫；切片单段 270s≈8.24MB 天然满足。
+_WAV_SIZE_LIMIT = 10 * 1024 * 1024
+_SHORT_DURATION_LIMIT = 300.0
+
+# channels decode 可插拔 seam：Task 8a 注入 ``decode_channels_media``；
+# 测试可 monkeypatch 为 None / fake。缺注入且 ``decode_key`` 非空 → 守卫报错。
+decode_media: Optional[Callable[[Path, str], Path]] = decode_channels_media
+
+
+def _ffmpeg_available() -> bool:
+    """``ffmpeg`` 与 ``ffprobe`` 均在 PATH 才视为可用。"""
+    return bool(shutil.which("ffmpeg") and shutil.which("ffprobe"))
 
 
 def _is_configured() -> bool:
-    return bool(
-        getattr(settings, "ALIYUN_ACCESS_KEY_ID", "")
-        and getattr(settings, "ALIYUN_ACCESS_KEY_SECRET", "")
-        and getattr(settings, "ALIYUN_ASR_APP_KEY", "")
-    )
+    """转写可用：DashScope key 配置 且 ffmpeg/ffprobe 在 PATH。"""
+    return bool(settings.ALIYUN_ASR_KEY) and _ffmpeg_available()
 
 
-def _submit_task(file_link: str) -> str:
-    """同步阻塞：提交录音文件识别任务，返回 TaskId。
+async def transcribe(media: Union[MediaRef, str]) -> str:
+    """下载 → 转码 → 时长分支 → 识别 → 拼接，返回完整文案。
 
-    联调注意：POP RPC 风格 CommonRequest，Task 体 JSON 序列化后塞 body 参数 ``Task``。
-    签名由 aliyunsdkcore 内部完成。此处实现按官方 demo 结构正确，未用真实 key 验证。
+    入参 ``media``：``MediaRef``（携带下载直链/请求头/解码键/标题/作者）或裸 str
+    URL（裸 str 时构造 ``MediaRef(platform="unknown", download_url=media, headers={})``，
+    **绝不猜测 douyin Referer/UA**——裸 str 视为无特殊请求头）。
+
+    P0：外层 ``wait_for(timeout=1200)``，超时翻译为 ``DataSourceError``（非裸 TimeoutError）。
+    配置校验（key + ffmpeg）在 ``wait_for`` 之前，缺一即 fail-fast。
     """
-    from aliyunsdkcore.client import AcsClient
-    from aliyunsdkcore.request import CommonRequest
-
-    client = AcsClient(
-        settings.ALIYUN_ACCESS_KEY_ID,
-        settings.ALIYUN_ACCESS_KEY_SECRET,
-        _REGION,
-    )
-    req = CommonRequest()
-    req.set_method("POST")
-    req.set_domain(_DOMAIN)
-    req.set_version(_VERSION)
-    req.set_action_name("SubmitTask")
-    task = {
-        "appkey": settings.ALIYUN_ASR_APP_KEY,
-        "file_link": file_link,
-        "version": "4.0",
-        "enable_words": False,
-        "enable_sample_rate_adaptive": True,
-    }
-    req.add_body_params("Task", json.dumps(task, ensure_ascii=False))
+    # 配置校验优先——缺 key / 缺 ffmpeg 立即失败，不进入 20min 超时后才报错。
+    if not settings.ALIYUN_ASR_KEY:
+        raise DataSourceError("ALIYUN_ASR_KEY not configured")
+    if not _ffmpeg_available():
+        raise DataSourceError("ffmpeg/ffprobe not found on PATH")
     try:
-        raw = client.do_action_with_exception(req)
-    except Exception as e:  # noqa: BLE001
-        raise DataSourceError(f"asr submit_task transport failed: {e}") from e
-    try:
-        result = json.loads(raw)
-    except ValueError as e:
-        raise DataSourceError(f"asr submit_task bad json: {e}") from e
-    if result.get("StatusText") != "SUCCESS":
-        raise DataSourceError(
-            f"asr submit_task not SUCCESS: {result.get('StatusText')} / {result.get('ErrorMessage', '')}"
+        return await asyncio.wait_for(
+            _transcribe_inner(media), timeout=_TRANSCRIBE_TIMEOUT
         )
-    task_id = result.get("TaskId")
-    if not task_id:
-        raise DataSourceError(f"asr submit_task: no TaskId in response {result}")
-    return str(task_id)
+    except asyncio.TimeoutError as e:
+        # P0：裸 TimeoutError 不可泄漏到 skill 层（只 catch DataSourceError）。
+        raise DataSourceError(
+            f"transcribe timed out after {_TRANSCRIBE_TIMEOUT}s"
+        ) from e
 
 
-def _get_task_result(task_id: str) -> dict:
-    """同步阻塞：查询任务结果，返回原始 result dict。
+async def _transcribe_inner(media: Union[MediaRef, str]) -> str:
+    """管线编排本体：own temps 列表 + try/finally 清理。
 
-    StatusText ∈ {QUEUEING, RUNNING, SUCCESS, FAILED}；由 ``transcribe`` 解释状态并决策
-    重试 / 抛错 / 拼接。本函数仅做 POP 调用 + JSON 解析，业务态判断在调用方。
+    ``transcribe`` 的 ``wait_for`` 超时会 cancel 本协程，CPython 仍运行本 ``finally``
+    → ``temps`` 中的下载/转码/切片产物均被 unlink（``missing_ok=True``）。
     """
-    from aliyunsdkcore.client import AcsClient
-    from aliyunsdkcore.request import CommonRequest
+    gc_stale_tmp()
 
-    client = AcsClient(
-        settings.ALIYUN_ACCESS_KEY_ID,
-        settings.ALIYUN_ACCESS_KEY_SECRET,
-        _REGION,
+    # str → MediaRef（裸 str：unknown 平台、空 headers，绝不猜 douyin 头）。
+    ref = media if isinstance(media, MediaRef) else MediaRef(
+        platform="unknown", download_url=media, headers={}
     )
-    req = CommonRequest()
-    req.set_method("GET")
-    req.set_domain(_DOMAIN)
-    req.set_version(_VERSION)
-    req.set_action_name("GetTaskResult")
-    req.add_query_param("TaskId", task_id)
+
+    temps: list[Path] = []
     try:
-        raw = client.do_action_with_exception(req)
-    except Exception as e:  # noqa: BLE001
-        raise DataSourceError(f"asr get_task_result transport failed: {e}") from e
-    try:
-        return json.loads(raw)
-    except ValueError as e:
-        raise DataSourceError(f"asr get_task_result bad json: {e}") from e
+        # 下载：裸 str 时 headers 为 {} → ``ref.headers or None`` 传 None 给 download_url。
+        async with get_download_semaphore():
+            src = await download_url(ref.download_url, headers=ref.headers or None)
+        temps.append(src)
 
+        # channels decode：有 decode_key 才解密（to_thread）；缺 key 视为未加密，直进 ffmpeg。
+        if ref.decode_key:
+            if decode_media is None:
+                raise DataSourceError("channels decode not enabled")
+            src = await asyncio.to_thread(decode_media, src, ref.decode_key)
+            temps.append(src)
 
-async def transcribe(download_url: str) -> str:
-    """下载 URL → 完整文案（阿里云录音文件识别异步转写）。
+        # 转码到 WAV 16k mono。
+        async with get_convert_semaphore():
+            wav = await convert_to_wav(src)
+        temps.append(wav)
 
-    阿里云 filetrans 接受公网 URL，``download_url`` 直传为 ``file_link``（不下载临时文件）。
-    submit → poll(5s) → SUCCESS 后拼接所有 Sentence.Text 返回全文。
+        # ffprobe 同步 subprocess：必须 to_thread，避免堵事件循环/心跳。
+        duration = await asyncio.to_thread(get_audio_duration, wav)
+        size = wav.stat().st_size
 
-    未配置 AppKey/AccessKey → DataSourceError（懒初始化失败，per-request，不阻断 import）。
-    任务 FAILED / 超时(10min) / 解析失败 → DataSourceError。
-    """
-    if not _is_configured():
-        raise DataSourceError("ALIYUN_ASR_APP_KEY / AccessKey not configured")
+        # 时长分支（contract 表）：
+        #   0 < d <= 300 → 单段 recognize；若 wav>10MB（unexpected）→ DataSourceError
+        #   d > 300 或 d == 0.0（ffprobe 失败/未知）→ 切片路径（slice_audio 估时长）
+        if 0 < duration <= _SHORT_DURATION_LIMIT:
+            if size > _WAV_SIZE_LIMIT:
+                raise DataSourceError(
+                    "wav exceeds 10MB within 300s — unexpected"
+                )
+            async with get_asr_semaphore():
+                text = await recognize_wav(
+                    wav, title=ref.title, author=ref.author
+                )
+        else:
+            # 切片单段 270s≈8.24MB 天然 <10MB，无需逐段再检。
+            async with get_convert_semaphore():
+                segs = await slice_audio(wav)
+            temps.extend(segs)
+            parts: list[str] = []
+            for seg in segs:
+                async with get_asr_semaphore():
+                    parts.append(
+                        await recognize_wav(seg, title=ref.title, author=ref.author)
+                    )
+            text = merge_transcript_parts(parts)
 
-    # _submit_task / _get_task_result 是同步 POP 调用，经 to_thread 避免阻塞事件循环。
-    # 模块级别名使测试可 monkeypatch（app.datasource.transcribe._submit_task / ._get_task_result）。
-    # seam 抛出的非 DataSourceError 异常（如 SDK RuntimeError）统一包成 DataSourceError，
-    # 上游只依赖单一领域异常做退款/重试分诊。
-    try:
-        task_id = await asyncio.to_thread(_submit_task, download_url)
-    except DataSourceError:
-        raise
-    except Exception as e:  # noqa: BLE001
-        raise DataSourceError(f"asr submit_task failed: {e}") from e
-
-    deadline = time.monotonic() + _POLL_TIMEOUT
-    while True:
-        try:
-            result = await asyncio.to_thread(_get_task_result, task_id)
-        except DataSourceError:
-            raise
-        except Exception as e:  # noqa: BLE001
-            raise DataSourceError(f"asr get_task_result failed: {e}") from e
-        status = result.get("StatusText")
-        if status == "FAILED":
-            raise DataSourceError(
-                f"asr task {task_id} FAILED: {result.get('ErrorMessage', '') or result}"
-            )
-        if status == "SUCCESS":
-            sentences = (result.get("Result") or {}).get("Sentences") or []
-            return "".join(str(s.get("Text") or "") for s in sentences)
-        # QUEUEING / RUNNING / 其它 → 仍运行中
-        if time.monotonic() >= deadline:
-            raise DataSourceError(f"asr task {task_id} timed out after {_POLL_TIMEOUT}s")
-        await asyncio.sleep(_POLL_INTERVAL)
+        if not text.strip():
+            raise DataSourceError("asr produced empty transcript")
+        return text
+    finally:
+        # 任何路径（成功/异常/cancel）均 unlink temps；missing_ok 容忍已被删的。
+        for p in temps:
+            try:
+                p.unlink(missing_ok=True)
+            except OSError:
+                pass
