@@ -412,8 +412,11 @@ async def video_meta(url: str, *, client: httpx.AsyncClient | None = None) -> Vi
 async def precheck(url: str, *, client: httpx.AsyncClient | None = None) -> dict:
     """轻量可达性 + 视频条数预检（Java 预扣额度门槛，Task 3.3）。
 
-    解析 sec_user_id 成功即 reachable=True；再拉一次首页视频列表（count=20，
-    与 ``account_top_videos`` 默认 ``n=20`` 对齐），按返回条数记 video_count。
+    按 ``_account_entry_kind(url)`` 分发：douyin → ``_resolve_sec_user_id`` +
+    ``fetch_user_post_videos``（count=20，与 ``account_top_videos`` 默认 ``n=20``
+    对齐）；视频号 sph 短号 / 分享链 → ``_resolve_channels_username`` +
+    ``fetch_user_videos`` **单页**（不翻页，仅取首页条数估规模）。未配置 /
+    入口未知 / 解析 miss → ``{"reachable": False, "video_count": 0}``（不抛）。
 
     video_count 是**首页视频数（≤20），非精确总数**；TikHub 为分页接口，如需精确
     总数需翻页聚合。Task 3.3 按此估算扣费 ``max(1, min(10, floor(N/2)))``——
@@ -423,24 +426,36 @@ async def precheck(url: str, *, client: httpx.AsyncClient | None = None) -> dict
     """
     if not _is_configured():
         raise DataSourceError("TIKHUB_API_KEY not configured")
-    # 平台门禁：拆账号仅支持抖音主页；视频号 host 走拆视频链路。
-    if _platform_of(url) != "douyin":
-        raise DataSourceError("account analyze supports douyin only; use video link for channels")
     own = client is None
     if own:
         client = httpx.AsyncClient()
     try:
-        sec_uid = await _resolve_sec_user_id(client, url)
-        if not sec_uid:
-            return {"reachable": False, "video_count": 0}
-        body = await _get_json(
-            client,
-            _PATH_USER_POST_VIDEOS,
-            {"sec_user_id": sec_uid, "count": 20, "max_cursor": 0, "sort_type": 0},
-        )
-        data = body.get("data") or {}
-        items = data.get("aweme_list") or data.get("list") or []
-        return {"reachable": True, "video_count": len(items)}
+        kind = _account_entry_kind(url)
+        if kind == "douyin":
+            sec_uid = await _resolve_sec_user_id(client, url)
+            if not sec_uid:
+                return {"reachable": False, "video_count": 0}
+            body = await _get_json(
+                client,
+                _PATH_USER_POST_VIDEOS,
+                {"sec_user_id": sec_uid, "count": 20, "max_cursor": 0, "sort_type": 0},
+            )
+            data = body.get("data") or {}
+            items = data.get("aweme_list") or data.get("list") or []
+            return {"reachable": True, "video_count": len(items)}
+        if kind in ("channels_id", "channels_share"):
+            username = await _resolve_channels_username(client, kind, url)
+            if not username:
+                return {"reachable": False, "video_count": 0}
+            body = await _post_json(
+                client,
+                _PATH_CHANNELS_USER_VIDEOS,
+                {"username": username, "raw": False},
+            )
+            data = body.get("data") or {}
+            videos = data.get("videos") or []
+            return {"reachable": True, "video_count": len(videos)}
+        return {"reachable": False, "video_count": 0}
     finally:
         if own:
             await client.aclose()

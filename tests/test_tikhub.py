@@ -258,6 +258,67 @@ async def test_precheck_unreachable_when_sec_user_id_missing(monkeypatch):
     assert result["video_count"] == 0
 
 
+async def test_precheck_channels_id_miss_returns_unreachable(monkeypatch):
+    """username=None 必须短路，不得再打 fetch_user_videos。"""
+    monkeypatch.setattr(settings, "TIKHUB_API_KEY", "tk")
+    calls = {"id": 0, "videos": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("fetch_channel_id_to_username"):
+            calls["id"] += 1
+            return httpx.Response(200, json={"code": 200, "data": {
+                "channel_id": "sphNope123456", "username": None, "error": "not found",
+            }})
+        if request.url.path.endswith("fetch_user_videos"):
+            calls["videos"] += 1
+            return httpx.Response(200, json={"code": 200, "data": {"videos": [{"media": {}}]}})
+        return httpx.Response(500, text=f"unexpected {request.url.path}")
+
+    client = _mock_client(handler)
+    r = await precheck("sphNope123456", client=client)  # 满足 sph regex
+    assert r == {"reachable": False, "video_count": 0}
+    assert calls["id"] == 1
+    assert calls["videos"] == 0  # miss 短路：禁止再拉作品列表
+    await client.aclose()
+
+
+async def test_precheck_channels_share_home_count_no_pagination(monkeypatch):
+    monkeypatch.setattr(settings, "TIKHUB_API_KEY", "tk")
+    calls = {"videos": 0}
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("fetch_video_detail"):
+            return httpx.Response(200, json={"code": 200, "data": {"username": "v2_x@finder"}})
+        if request.url.path.endswith("fetch_user_videos"):
+            calls["videos"] += 1
+            body = json.loads(request.content.decode())
+            assert not body.get("last_buffer")
+            return httpx.Response(200, json={"code": 200, "data": {
+                "videos": [{"media": {"full_url": "http://a", "decode_key": "1"}, "read_count": 1}] * 3,
+                "up_continue": True,
+                "last_buffer": "MORE",
+            }})
+        return httpx.Response(500)
+    client = _mock_client(handler)
+    r = await precheck("https://weixin.qq.com/sph/abc", client=client)
+    assert r["reachable"] is True
+    assert r["video_count"] == 3
+    assert calls["videos"] == 1  # 不翻页
+    await client.aclose()
+
+
+async def test_precheck_unknown_host_returns_unreachable_no_http_no_raise(monkeypatch):
+    """unknown 入口（裸 channels host 缺 /sph/、not-a-url）→ unreachable dict，不抛、不打 HTTP。"""
+    monkeypatch.setattr(settings, "TIKHUB_API_KEY", "tk")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, text=f"unexpected {request.url.path}")
+
+    client = _mock_client(handler)
+    r = await precheck("https://channels.weixin.qq.com/no-sph-here", client=client)
+    assert r == {"reachable": False, "video_count": 0}
+    await client.aclose()
+
+
 async def test_hot_board_returns_list(monkeypatch):
     monkeypatch.setattr(settings, "TIKHUB_API_KEY", "tk-test-key")
 
@@ -677,13 +738,6 @@ async def test_account_top_videos_channels_share_uses_video_detail_username(monk
     assert videos[0].title == "职能部门正在杀死公司"
     assert videos[0].decode_key == "dk1"
     await client.aclose()
-
-
-async def test_precheck_rejects_channels_host_before_http(monkeypatch):
-    """precheck 同样门禁：视频号 host → DataSourceError(douyin only)，无 HTTP 请求。"""
-    monkeypatch.setattr(settings, "TIKHUB_API_KEY", "tk-test-key")
-    with pytest.raises(DataSourceError, match="douyin only"):
-        await precheck("https://channels.weixin.qq.com/x")
 
 
 # ---- video_meta_to_media_ref：channels 装配 decode_key ----------------------
