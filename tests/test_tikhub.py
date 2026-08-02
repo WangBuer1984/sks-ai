@@ -135,7 +135,7 @@ async def test_account_top_videos_caps_at_n(monkeypatch):
 
     client = _mock_client(handler)
     try:
-        videos = await account_top_videos("https://x", n=20, client=client)
+        videos = await account_top_videos("https://www.douyin.com/user/x", n=20, client=client)
     finally:
         await client.aclose()
     # 只解析 API 返回的 10 条（不足 N 时按实际返回）
@@ -515,3 +515,19 @@ async def test_resolve_media_empty_download_url_raises_datasource_error(monkeypa
 
     with pytest.raises(DataSourceError, match="empty download_url"):
         await resolve_media("https://v.douyin.com/abc")
+
+
+# ---- Task 7 平台门禁：account_top_videos / precheck 抖音 only --------------
+
+async def test_account_top_videos_rejects_channels_host_before_http(monkeypatch):
+    """视频号 host → DataSourceError(douyin only)，门禁在 _is_configured 之后、HTTP 之前。"""
+    monkeypatch.setattr(settings, "TIKHUB_API_KEY", "tk-test-key")
+    with pytest.raises(DataSourceError, match="douyin only"):
+        await account_top_videos("https://channels.weixin.qq.com/x")
+
+
+async def test_precheck_rejects_channels_host_before_http(monkeypatch):
+    """precheck 同样门禁：视频号 host → DataSourceError(douyin only)，无 HTTP 请求。"""
+    monkeypatch.setattr(settings, "TIKHUB_API_KEY", "tk-test-key")
+    with pytest.raises(DataSourceError, match="douyin only"):
+        await precheck("https://channels.weixin.qq.com/x")

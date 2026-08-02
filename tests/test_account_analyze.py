@@ -18,6 +18,7 @@ import pytest
 
 from app.config import settings
 from app.datasource import DataSourceError
+from app.datasource.media import MediaRef
 from app.datasource.tikhub import VideoMeta
 
 
@@ -83,8 +84,11 @@ async def test_account_done_status_benchmark_rows_three_layers(monkeypatch):
     async def _top(url, n=20):
         return _videos(3)
 
-    async def _transcribe(url):
-        return f"转写-{url}"
+    async def _transcribe(media):
+        # transcribe 收到的是 video_meta_to_media_ref 产出的 MediaRef（直链 + 抖音头），
+        # 不再是裸 download_url 字符串。
+        assert isinstance(media, MediaRef)
+        return f"转写-{media.download_url}"
 
     async def _update_task(task_id, *, status=None, progress=None, result=None, error=None):
         calls.append({"status": status, "progress": progress, "result": result, "error": error})
@@ -134,10 +138,11 @@ async def test_account_partial_progress_reflects_finished_ratio(monkeypatch):
     async def _top(url, n=20):
         return _videos(3)
 
-    async def _transcribe(url):
-        if "dl/1" in url:
+    async def _transcribe(media):
+        assert isinstance(media, MediaRef)
+        if "dl/1" in media.download_url:
             raise DataSourceError("asr fail on item 1")
-        return f"转写-{url}"
+        return f"转写-{media.download_url}"
 
     async def _update_task(task_id, *, status=None, progress=None, result=None, error=None):
         calls.append({"status": status, "progress": progress, "result": result, "error": error})
@@ -187,7 +192,7 @@ async def test_account_failed_on_full_scrape_datasource_error(monkeypatch):
     monkeypatch.setattr("app.skills.account_analyze.graph.account_top_videos", _top)
     monkeypatch.setattr("app.skills.account_analyze.graph.update_task", _update_task)
     monkeypatch.setattr("app.skills.account_analyze.graph.insert_benchmark_video", _insert_bench)
-    monkeypatch.setattr("app.skills.account_analyze.graph.transcribe", lambda url: _ret("t"))
+    monkeypatch.setattr("app.skills.account_analyze.graph.transcribe", lambda media: _ret("t"))
     monkeypatch.setattr("app.skills.account_analyze.graph.chat", _fake_chat_summary)
     monkeypatch.setattr("app.skills.account_analyze.graph.check", _safe)
     pool = _FakePool()
@@ -211,7 +216,8 @@ async def test_account_failed_when_all_items_fail(monkeypatch):
     async def _top(url, n=20):
         return _videos(2)
 
-    async def _transcribe(url):
+    async def _transcribe(media):
+        assert isinstance(media, MediaRef)
         raise DataSourceError("asr fail")
 
     async def _update_task(task_id, *, status=None, progress=None, result=None, error=None):
@@ -248,7 +254,8 @@ async def test_account_heartbeat_during_long_transcribe(monkeypatch):
     async def _top(url, n=20):
         return _videos(1)
 
-    async def _slow_transcribe(url):
+    async def _slow_transcribe(media):
+        assert isinstance(media, MediaRef)
         await asyncio.sleep(0.05)
         return "慢转写"
 

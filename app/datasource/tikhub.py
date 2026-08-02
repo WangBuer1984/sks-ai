@@ -216,6 +216,9 @@ async def account_top_videos(url: str, n: int = 20, *, client: httpx.AsyncClient
     """
     if not _is_configured():
         raise DataSourceError("TIKHUB_API_KEY not configured")
+    # 平台门禁：拆账号仅支持抖音主页；视频号 host 走拆视频链路。
+    if _platform_of(url) != "douyin":
+        raise DataSourceError("account analyze supports douyin only; use video link for channels")
     own = client is None
     if own:
         client = httpx.AsyncClient()
@@ -270,6 +273,9 @@ async def precheck(url: str, *, client: httpx.AsyncClient | None = None) -> dict
     """
     if not _is_configured():
         raise DataSourceError("TIKHUB_API_KEY not configured")
+    # 平台门禁：拆账号仅支持抖音主页；视频号 host 走拆视频链路。
+    if _platform_of(url) != "douyin":
+        raise DataSourceError("account analyze supports douyin only; use video link for channels")
     own = client is None
     if own:
         client = httpx.AsyncClient()
