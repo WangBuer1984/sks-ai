@@ -34,6 +34,8 @@ log = logging.getLogger(__name__)
 MODEL_NAME = "qwen3-asr-flash"
 # 瞬态重试上限（共 3 次尝试）。空文本不在此计数——空被视为不可重试的数据源故障。
 _MAX_ATTEMPTS = 3
+# 重试间隔（秒）：attempt 失败后、下一次前 sleep，避免限流连打。
+_RETRY_BACKOFFS = (0.5, 1.5)
 
 
 def _build_messages(wav_path_abs: str, title: str | None, author: str | None) -> list[dict]:
@@ -146,6 +148,8 @@ async def recognize_wav(
         except Exception as exc:
             last_exc = exc
             log.warning("Qwen ASR attempt %d/%d failed: %s", attempt + 1, _MAX_ATTEMPTS, exc)
+            if attempt < _MAX_ATTEMPTS - 1:
+                await asyncio.sleep(_RETRY_BACKOFFS[attempt])
             continue
     else:
         # 全部 3 次均抛（瞬态耗尽）→ 统一 DataSourceError，禁止裸异常冒泡。

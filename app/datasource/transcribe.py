@@ -149,6 +149,14 @@ async def _transcribe_inner(media: MediaRef | str) -> str:
         temps.append(wav)
         log.info("transcribe step convert_wav done: elapsed=%.2fs", time.monotonic() - t0)
 
+        # WAV 就绪后尽早丢掉下载/decode 中间文件（峰值磁盘，尤其视频号百 MB 级）。
+        for early in list(temps[:-1]):
+            try:
+                early.unlink(missing_ok=True)
+            except OSError:
+                pass
+        temps[:] = [wav]
+
         # ffprobe 同步 subprocess：必须 to_thread，避免堵事件循环/心跳。
         t0 = time.monotonic()
         duration = await asyncio.to_thread(get_audio_duration, wav)
@@ -178,18 +186,49 @@ async def _transcribe_inner(media: MediaRef | str) -> str:
             t0 = time.monotonic()
             async with get_convert_semaphore():
                 segs = await slice_audio(wav, duration=duration)
-            temps.extend(segs)
-            log.info("transcribe step slice done: %d segs elapsed=%.2fs",
+            log.info("slice done: %d segs elapsed=%.2fs",
                      len(segs), time.monotonic() - t0)
-            parts: list[str] = []
-            for i, seg in enumerate(segs):
+            # 真实切片（非原 wav）纳入 temps；识别后尽早删以压峰值磁盘。
+            real_slices = [s for s in segs if s.resolve() != wav.resolve()]
+            temps.extend(real_slices)
+
+            async def _recognize_seg(i: int, seg: Path) -> str:
                 tseg = time.monotonic()
                 async with get_asr_semaphore():
-                    parts.append(
-                        await recognize_wav(seg, title=ref.title, author=ref.author)
+                    part = await recognize_wav(
+                        seg, title=ref.title, author=ref.author
                     )
-                log.info("transcribe step asr(seg %d/%d) done: elapsed=%.2fs",
-                         i + 1, len(segs), time.monotonic() - tseg)
+                log.info(
+                    "transcribe step asr(seg %d/%d) done: elapsed=%.2fs",
+                    i + 1, len(segs), time.monotonic() - tseg,
+                )
+                if seg.resolve() != wav.resolve():
+                    try:
+                        seg.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                    try:
+                        temps.remove(seg)
+                    except ValueError:
+                        pass
+                return part
+
+            # 有界并发：吃满 asr_sem（默认 3）。return_exceptions 隔离单段失败——
+            # 失败段跳过不参与 merge；全部失败才 raise。gather 返回序 = 输入序 → 保序。
+            t0 = time.monotonic()
+            raw = await asyncio.gather(
+                *[_recognize_seg(i, seg) for i, seg in enumerate(segs)],
+                return_exceptions=True,
+            )
+            parts = [r for r in raw if isinstance(r, str) and r.strip()]
+            if not parts:
+                raise DataSourceError(
+                    f"all ASR segments failed for {ref.download_url[:50]}"
+                )
+            log.info(
+                "transcribe step asr(all segs) done: n_ok=%d/%d elapsed=%.2fs",
+                len(parts), len(segs), time.monotonic() - t0,
+            )
             t0 = time.monotonic()
             text = merge_transcript_parts(parts)
             log.info("transcribe step merge done: elapsed=%.2fs", time.monotonic() - t0)

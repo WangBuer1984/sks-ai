@@ -155,14 +155,17 @@ def _estimate_pcm_wav_duration(wav: Path | str) -> float:
 def _slice_segment_sync(
     src_path: Path | str, start: float, duration: float, output_dir: str, index: int
 ) -> Path:
-    """同步切出一段音频（由 ``slice_audio`` 经 ``asyncio.to_thread`` 调用）。"""
+    """同步切出一段音频（由 ``slice_audio`` 经 ``asyncio.to_thread`` 调用）。
+
+    输入已是 ``convert_to_wav`` 产出的 16k mono WAV，用 ``-c:a copy`` 避免
+    每段 PCM 重编码（CPU / convert 槽占用大头）。
+    """
     _require_ffmpeg()
     seg_path = Path(output_dir) / f"seg_{index}.wav"
     cmd = [
         "ffmpeg", "-y", "-ss", str(start), "-t", str(duration),
         "-i", str(src_path),
-        "-ar", str(_SAMPLE_RATE),
-        "-ac", str(_CHANNELS),
+        "-c:a", "copy",
         "-vn",
         str(seg_path),
     ]

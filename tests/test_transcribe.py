@@ -112,12 +112,12 @@ async def test_transcribe_str_is_bare_download_no_headers_guess(monkeypatch, tmp
 async def test_transcribe_slices_when_duration_over_300(monkeypatch, tmp_path):
     cap = _common_seams(monkeypatch, tmp_path)
     monkeypatch.setattr(tr, "get_audio_duration", lambda wav: 600.0)
-    # recognize per segment returns distinct parts so merge is observable.
-    parts_iter = iter(["段落一", "段落二"])
+    # 段级有界并发：按文件名映射，禁止用共享 iter（会竞态）。
+    by_name = {"seg_0.wav": "段落一", "seg_1.wav": "段落二"}
 
     async def _recognize(wav_path, *, title=None, author=None):
         cap.setdefault("recognize_calls", []).append({"wav": str(wav_path)})
-        return next(parts_iter)
+        return by_name[Path(wav_path).name]
 
     monkeypatch.setattr(tr, "recognize_wav", _recognize)
 

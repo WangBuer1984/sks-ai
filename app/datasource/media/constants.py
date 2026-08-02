@@ -11,3 +11,6 @@ WAV_SIZE_LIMIT: int = 10 * 1024 * 1024
 
 # 心跳间隔（秒）：长转写/scrape 期间每 N 秒 touch updated_at，短于 Java running-timeout 5min。
 HEARTBEAT_INTERVAL: float = 60.0
+
+# 拆账号逐条（转写+结构化）有界并发——吃满 asr_sem=3，避免 TOP20 纯串行墙钟。
+ACCOUNT_ITEM_CONCURRENCY: int = 3

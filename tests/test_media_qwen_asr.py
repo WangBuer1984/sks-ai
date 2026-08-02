@@ -97,6 +97,7 @@ async def test_recognize_wav_transient_retries_then_raises(monkeypatch):
     from app.datasource.media import qwen_asr
 
     monkeypatch.setattr(settings, "ALIYUN_ASR_KEY", "fake-key")
+    monkeypatch.setattr(qwen_asr, "_RETRY_BACKOFFS", (0, 0))
 
     call_count = {"n": 0}
 
@@ -117,6 +118,8 @@ async def test_recognize_wav_retries_non_runtime_network_errors(monkeypatch):
     from app.datasource.media import qwen_asr
 
     monkeypatch.setattr(settings, "ALIYUN_ASR_KEY", "fake-key")
+    monkeypatch.setattr(qwen_asr, "_RETRY_BACKOFFS", (0, 0))
+
     call_count = {"n": 0}
 
     def fake_call(**kwargs):

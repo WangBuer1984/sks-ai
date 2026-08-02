@@ -2,10 +2,9 @@
 
 入口（被 app/api/analyze.py 调用）：
 - ``analyze_account(task_id, url)`` **后台**（FastAPI BackgroundTasks）：
-  set running → account_top_videos(url, n=20) → 逐条：心跳 + transcribe(download_url) +
-  结构化（account_analyze_item）→ 写 benchmark_video 行 + 进度递增 → 全部完成后
-  规律归纳（account_analyze_summary，深度归纳/迁移建议）→ 三层 result 写 analyze_task，
-  TOP20 明细写 benchmark_video。异常 → partial/failed。
+  set running → account_top_videos(url, n=20) → 有界并发（默认 3）逐条：心跳 +
+  transcribe + 结构化 → 写 benchmark_video + 进度递增 → 全部完成后规律归纳 →
+  三层 result。异常 → partial/failed。
 
 模型档位（MODEL_FOR）：
 - account_analyze_item: glm-4.5-air（轻量抽取，逐条结构化快省）。
@@ -32,11 +31,12 @@ running-timeout 误判（与 video_analyze 共享实现，见
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
 from app.datasource import DataSourceError
-from app.datasource.media.constants import HEARTBEAT_INTERVAL
+from app.datasource.media.constants import ACCOUNT_ITEM_CONCURRENCY, HEARTBEAT_INTERVAL
 from app.datasource.media.heartbeat import run_with_heartbeat
 from app.datasource.tikhub import account_top_videos as _account_top_videos
 from app.datasource.tikhub import video_meta_to_media_ref
@@ -63,6 +63,8 @@ heartbeat = _heartbeat
 # 自 ``app.datasource.media.constants`` import（共享常量）；调用 ``run_with_heartbeat``
 # 时传 ``interval=HEARTBEAT_INTERVAL``，故测试 monkeypatch ``ag.HEARTBEAT_INTERVAL`` 仍生效。
 _TOP_N = 20
+# 有界并发：模块级别名便于测试 monkeypatch 为 1（串行）验证进度语义。
+_ITEM_CONCURRENCY = ACCOUNT_ITEM_CONCURRENCY
 
 _ITEM_FIELDS = ("structure", "why_hot", "framework", "diff_hint")
 _SUMMARY_FIELDS = ("account_profile", "patterns", "migration_advice")
@@ -163,7 +165,7 @@ async def _summarize(items: list[dict[str, Any]]) -> dict[str, Any] | None:
 # ---- 入口：后台异步 --------------------------------------------------------
 
 async def analyze_account(task_id: int, url: str) -> None:
-    """后台：running → TOP20 → 逐条转写+结构化→benchmark_video → summary → done/partial/failed。
+    """后台：running → TOP20 → 有界并发转写+结构化→benchmark_video → summary → done/partial/failed。
 
     状态语义见模块 docstring。endpoint 在 202 前已写一次 running，本函数开头再写一次
     保证 background 启动瞬间 updated_at 最新。
@@ -185,31 +187,51 @@ async def analyze_account(task_id: int, url: str) -> None:
 
     total = len(videos)
     done = 0
+    # 按输入顺序占位——并发完成顺序不影响回填次序（保序回填）。
+    results: list[tuple[dict[str, Any], str] | None] = [None] * total
+    item_sem = asyncio.Semaphore(_ITEM_CONCURRENCY)
+
+    async def _process_item(idx: int, v: VideoMeta) -> None:
+        async with item_sem:
+            try:
+                # UGC 安全（transcript 来自抖音创作者，仍按 UGC 处理 §5.1）
+                ref = video_meta_to_media_ref(v)
+                transcript = await run_with_heartbeat(
+                    task_id, transcribe(ref), interval=HEARTBEAT_INTERVAL
+                )
+                if not await check(transcript):
+                    log.warning(
+                        "account item transcript blocked by safety, skipping: %s",
+                        v.title,
+                    )
+                    return
+                item = await _structure_item(transcript)
+                if item is None:
+                    log.warning(
+                        "account item structured output blocked by safety, skipping: %s",
+                        v.title,
+                    )
+                    return
+            except DataSourceError as e:
+                log.warning("account item transcribe failed, skipping: %s", e)
+                return  # continue 语义
+            except Exception:  # noqa: BLE001 — 单条 LLM/未预期错误跳过，不拖垮整任务
+                log.exception("account item unexpected error, skipping")
+                return  # continue 语义
+            results[idx] = (item, transcript)
+
+    await asyncio.gather(*(
+        _process_item(i, v) for i, v in enumerate(videos)
+    ))
+
+    # 按输入顺序回填：insert 逐条串行（避免 DB 连接池争用）+ 进度递增 + 摘要累积。
     structured: list[dict[str, Any]] = []
     video_summary: list[dict[str, Any]] = []
-
-    for v in videos:
-        try:
-            # UGC 安全（transcript 来自抖音创作者，仍按 UGC 处理 §5.1）
-            ref = video_meta_to_media_ref(v)  # author 已在 VideoMeta（Task 1）
-            transcript = await run_with_heartbeat(
-                task_id, transcribe(ref), interval=HEARTBEAT_INTERVAL
-            )
-            if not await check(transcript):
-                log.warning("account item transcript blocked by safety, skipping: %s", v.title)
-                continue  # 本条不算完成
-            item = await _structure_item(transcript)
-            if item is None:
-                log.warning("account item structured output blocked by safety, skipping: %s", v.title)
-                continue
-        except DataSourceError as e:
-            log.warning("account item transcribe failed, skipping: %s", e)
+    for i, v in enumerate(videos):
+        r = results[i]
+        if r is None:
             continue
-        except Exception as e:  # noqa: BLE001 — 单条 LLM/未预期错误跳过，不让一条拖垮整任务
-            log.exception("account item unexpected error, skipping")
-            continue
-
-        # 写 benchmark_video 明细行 + 累计进度
+        item, transcript = r
         try:
             await insert_benchmark_video(
                 task_id, v.title, v.play_count, v.fav_count, transcript, item,
