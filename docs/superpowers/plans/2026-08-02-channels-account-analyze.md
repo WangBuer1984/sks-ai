@@ -180,6 +180,8 @@ git commit -m "feat: _account_entry_kind 拆账号入口分类（含裸 sph）"
 - Modify: `app/datasource/tikhub.py` — 路径常量、`_resolve_channels_username`、`_parse_channels_video`、`_channels_top_videos`；改写 `account_top_videos` 去掉 douyin-only、按 kind 分发
 - Test: `tests/test_tikhub.py`
 
+**锚点（LOAD-BEARING）：** 抖音分支体不变——保留 `_resolve_sec_user_id` + `fetch_user_post_videos` + `_parse_video` 循环原文；**仅**删除 `douyin-only` gate，外包一层 `kind = _account_entry_kind(url)` 分发（`douyin` → 原主体；channels → 新路径）。**禁止**重写/「顺手重构」抖音取号逻辑。
+
 **Interfaces:**
 - Consumes: `_account_entry_kind`、`_post_json`、`_channels_title`、`CHANNELS_DOWNLOAD_HEADERS`
 - Produces: `account_top_videos` 对 channels 返回 `list[VideoMeta]`（`platform=wechat_channels`，配对 `decode_key`）
@@ -315,9 +317,12 @@ def _parse_channels_video(item: dict, *, fallback_author: str = "") -> VideoMeta
 # account_top_videos:
 #   kind = _account_entry_kind(url)
 #   if kind == "unknown": raise DataSourceError(...)
-#   if kind == "douyin": <existing>
-#   else: username = await _resolve...; if not username: raise DataSourceError("channels username unresolved")
-#         loop pages 0..max_pages-1 with last_buffer; append until n
+#   if kind == "douyin":
+#       <EXISTING BODY VERBATIM — _resolve_sec_user_id + fetch_user_post_videos + _parse_video>
+#       # 禁止改动上述抖音主体
+#   else:
+#       username = await _resolve...; if not username: raise DataSourceError("channels username unresolved")
+#       loop pages 0..max_pages-1 with last_buffer; append until n
 ```
 
 - [ ] **Step 4: 删除/改写** `test_account_top_videos_rejects_channels_host_before_http`（不再 douyin-only）
@@ -343,14 +348,26 @@ git commit -m "feat: 视频号 account_top_videos（短号/分享链→TOP N，m
 
 ```python
 async def test_precheck_channels_id_miss_returns_unreachable(monkeypatch):
+    """username=None 必须短路，不得再打 fetch_user_videos。"""
     monkeypatch.setattr(settings, "TIKHUB_API_KEY", "tk")
+    calls = {"id": 0, "videos": 0}
+
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"code": 200, "data": {
-            "channel_id": "sphNope", "username": None, "error": "not found",
-        }})
+        if request.url.path.endswith("fetch_channel_id_to_username"):
+            calls["id"] += 1
+            return httpx.Response(200, json={"code": 200, "data": {
+                "channel_id": "sphNope123456", "username": None, "error": "not found",
+            }})
+        if request.url.path.endswith("fetch_user_videos"):
+            calls["videos"] += 1
+            return httpx.Response(200, json={"code": 200, "data": {"videos": [{"media": {}}]}})
+        return httpx.Response(500, text=f"unexpected {request.url.path}")
+
     client = _mock_client(handler)
     r = await precheck("sphNope123456", client=client)  # 满足 sph regex
     assert r == {"reachable": False, "video_count": 0}
+    assert calls["id"] == 1
+    assert calls["videos"] == 0  # miss 短路：禁止再拉作品列表
     await client.aclose()
 
 async def test_precheck_channels_share_home_count_no_pagination(monkeypatch):
@@ -400,17 +417,70 @@ git commit -m "feat: 视频号 precheck 单页 + reachable:false 对齐抖音"
 **Interfaces:**
 - Consumes: Task 1 `video_meta_to_media_ref`
 
-- [ ] **Step 1: 扩展现有 fake videos / transcribe 断言**
+- [ ] **Step 1: 写完整测试**（对齐现有 `test_account_analyze.py` 的 monkeypatch 风格）
 
 ```python
-# 在构造 VideoMeta 的 helper 增加一条 channels fixture，或单独测试：
 async def test_analyze_account_passes_channels_decode_key_to_transcribe(monkeypatch):
-    # monkeypatch account_top_videos → [VideoMeta(..., decode_key="dk", platform="wechat_channels", download_url="http://cdn/x")]
-    # fake transcribe 断言 isinstance(MediaRef) and media.decode_key == "dk" and media.platform == "wechat_channels"
-    ...
+    """Task 1 升级 video_meta_to_media_ref 后，未改 graph 循环也应透传 decode_key。"""
+    from app.datasource.media import MediaRef
+    from app.datasource.tikhub import VideoMeta
+
+    captured: dict = {}
+
+    async def _top(url, n=20):
+        return [VideoMeta(
+            title="频道一条",
+            play_count=3,
+            fav_count=1,
+            download_url="http://cdn/channels/a.mp4",
+            author="前进的胖掌柜",
+            decode_key="dk-pair-1",
+            platform="wechat_channels",
+        )]
+
+    async def _transcribe(media):
+        captured["media"] = media
+        assert isinstance(media, MediaRef)
+        assert media.platform == "wechat_channels"
+        assert media.decode_key == "dk-pair-1"
+        assert media.download_url == "http://cdn/channels/a.mp4"
+        return "转写文案"
+
+    async def _update_task(task_id, *, status=None, progress=None, result=None, error=None):
+        return None
+
+    async def _insert_bench(task_id, title, play_count, fav_count, transcript, structure):
+        return None
+
+    async def _chat(skill, messages, json_schema=None):
+        if skill == "account_analyze_item":
+            return await _fake_chat_item()
+        if skill == "account_analyze_summary":
+            return await _fake_chat_summary()
+        raise AssertionError(skill)
+
+    monkeypatch.setattr("app.skills.account_analyze.graph.account_top_videos", _top)
+    monkeypatch.setattr("app.skills.account_analyze.graph.transcribe", _transcribe)
+    monkeypatch.setattr("app.skills.account_analyze.graph.check", _safe)
+    monkeypatch.setattr("app.skills.account_analyze.graph.chat", _chat)
+    monkeypatch.setattr("app.skills.account_analyze.graph.update_task", _update_task)
+    monkeypatch.setattr("app.skills.account_analyze.graph.insert_benchmark_video", _insert_bench)
+
+    from app.skills.account_analyze.graph import analyze_account
+    await analyze_account(task_id=1, url="sphi9BjV8GK0Zsl")
+    assert isinstance(captured["media"], MediaRef)
+    assert captured["media"].decode_key == "dk-pair-1"
 ```
 
-- [ ] **Step 2: Run → 应已 PASS**（若 Task 1 完成）；若 FAIL 仅修 `video_meta_to_media_ref`，**禁止**重写 `analyze_account` 循环
+（复用文件顶层已有 `_safe` / `_fake_chat_item` / `_fake_chat_summary`；与 `test_account_done_status_…` 同 monkeypatch 风格。）
+
+- [ ] **Step 2: Run**
+
+```bash
+.venv/bin/python -m pytest tests/test_account_analyze.py::test_analyze_account_passes_channels_decode_key_to_transcribe -v
+```
+
+Expected: PASS（Task 1 完成后）。若 FAIL 仅修 `video_meta_to_media_ref`，**禁止**重写 `analyze_account` 循环。
 
 - [ ] **Step 3: Commit**
 
@@ -426,6 +496,8 @@ git commit -m "test: 拆账号透传视频号 MediaRef.decode_key"
 - Modify: `/Users/rick/work/sks-web/src/pages/Analyze.tsx`
 - Test: 无单测则手工 checklist
 
+**对照现状（执行前必读组件）：** `Mode = 'videoText' | 'videoLink' | 'account'`；placeholder 约 L124–129；提交按钮下已有 `mode !== 'videoText'` 的异步说明（`text-[11.5px] text-paper-muted`，约 L217–221）——**保留该段**，另加 `mode === 'account'` 辅助行（可紧挨其前/后）。
+
 - [ ] **Step 1: 改 placeholder + 辅助行**
 
 ```tsx
@@ -436,15 +508,13 @@ const placeholder =
       ? '粘贴单条视频链接（抖音或视频号分享链）…'
       : '抖音：账号主页链接。视频号：sph 开头的视频号 ID，或该号任意一条分享链接。';
 
-// 在拆账号提交按钮下方（或 textarea 下）增加：
+// 在提交按钮与「异步任务…」说明之间（或并列）增加：
 {mode === 'account' && (
   <p className="mt-2 text-[11.5px] text-paper-muted">
     抖音请粘贴主页链接；视频号请粘贴视频号 ID（以 sph 开头）或该账号下任意一条分享链接（weixin.qq.com/sph/…）。
   </p>
 )}
 ```
-
-（若已有「异步任务…」段落，可并列保留，勿删进度说明。）
 
 - [ ] **Step 2: 本地目视 `/analyze` 拆账号 tab**
 
@@ -497,3 +567,12 @@ Expected: 既有 3 个环境失败可保留；本计划相关全部 PASS；无�
 ## Placeholder scan
 
 无 TBD /「类似 Task N」省略实现。
+
+## Plan review patch（2026-08-02）
+
+| ID | 处理 |
+|----|------|
+| P2-1 | Task 3 增加 LOAD-BEARING：抖音分支体 verbatim，仅删 gate + dispatch 包裹 |
+| P2-2 | Task 4 miss 测加 `calls["videos"]==0` 证明短路 |
+| P3 | Task 5 补全可运行测试草图；Task 6 钉死对照 Analyze.tsx 行号/勿删异步说明 |
+| P3 | 最终 whole-branch review 须覆盖 `3d0d23a`（Task 8） |
