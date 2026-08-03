@@ -55,6 +55,7 @@ Java 每个请求带两个头：
 | POST | `/ai/card_gen` | 需 | 补卡：抽卡 + 缺口 + 冲突 | `AiClient.cardGen` |
 | POST | `/ai/interview/step` | 需 | 定位访谈推进一轮（免费） | `AiClient.interviewStep` |
 | GET | `/ai/interview/result` | 需 | 只读取访谈产出 | `AiClient.interviewResult` |
+| POST | `/ai/interview/sample-opening` | 需 | 试试效果：产无档案/有档案两版开场钩子 | `AiClient.sampleOpening` |
 | POST | `/ai/asr` | 需 | 短音频转文字（multipart） | `AiClient.asr` |
 | POST | `/ai/analyze/precheck` | 需 | 拆账号预检（免费，不扣费） | `AiClient.precheck` |
 | GET | `/ai/hot_board` | 需 | 平台热点榜 | `AiClient.hotBoard` |
@@ -168,6 +169,18 @@ Query 参数 `thread_id`（必填）。Java 侧须自行拼 `"userId:sessionId"`
 > **弱契约提醒**：Python 侧 `a_cards` 声明为 `list[dict[str, Any]]`，形状不受 pydantic 约束；Java 侧按 `CardGenCard {card_type, title, content}` 反序列化。两边靠约定而非类型对齐，改 `summarize` 产出形状时必须同步 Java。
 
 `found=false` 由 `ProfileService.confirm` 翻译为 `PARAM_INVALID`（4005）。
+
+### POST /ai/interview/sample-opening
+
+```jsonc
+// 入参 SampleOpeningRequest
+{ "user_id": 1, "thread_id": "1:sess", "topic": null }
+// topic 省略时默认「报价为什么差一倍」。Java 侧须自行拼 thread_id = "userId:sessionId"。
+
+// 出参 SampleOpeningResponse（exclude_unset）
+{ "found": true, "topic": "报价为什么差一倍", "without": "…", "with": "…" }
+// 无 checkpoint / 无 profile：{ "found": false }
+```
 
 ### POST /ai/asr
 

@@ -557,3 +557,75 @@ def test_ai_interview_result_accepts_token(token, monkeypatch):
         )
     assert r.status_code == 200
     assert "profile" in r.json()
+
+
+# ---- /ai/interview/sample-opening（试试效果对比块）-------------------------
+
+class _FakeGraph:
+    """假 LangGraph，可控 aget_state 返回值。monkeypatch 替 sample_opening 模块的 _graph。"""
+    def __init__(self, values):
+        self._values = values
+
+    async def aget_state(self, config):
+        class _SV:
+            pass
+        sv = _SV()
+        sv.values = self._values
+        return sv
+
+
+@pytest.mark.asyncio
+async def test_sample_opening_returns_two_hooks(monkeypatch):
+    """有 profile 的 checkpoint → 一次 chat 产 {topic, without, with}。"""
+    from app.skills.interview import sample_opening as so
+
+    captured = {}
+
+    async def _chat(skill, messages, json_schema=None, **kwargs):
+        captured["skill"] = skill
+        captured["schema"] = json_schema
+        return {"without": "今天教大家看懂报价单", "with": "别人报3万我报1万6，我在做慈善吗"}
+
+    monkeypatch.setattr("app.skills.interview.sample_opening.chat", _chat)
+    inner = {"人设": "说真话的工厂人", "人群": "30-45 业主", "差异化": "工厂直营",
+             "变现": "到店", "红线": "不贬同行", "支柱配比": "4:2:2:2"}
+    monkeypatch.setattr(
+        "app.skills.interview.sample_opening._graph",
+        _FakeGraph({"profile": {"profile": inner, "a_cards": []}}),
+    )
+
+    r = await so.sample_opening("1:sess", None)
+    assert r is not None
+    assert r["topic"] == "报价为什么差一倍"  # 默认 topic
+    assert r["without"] and r["with"]
+    assert captured["skill"] == "interview"
+    assert captured["schema"] is so.SAMPLE_OPENING_SCHEMA
+
+
+@pytest.mark.asyncio
+async def test_sample_opening_no_checkpoint_returns_none(monkeypatch):
+    """无 checkpoint → None（路由层返 found=false）。"""
+    from app.skills.interview import sample_opening as so
+
+    async def _chat(*a, **k):  # 不应被调
+        raise AssertionError("不应调 LLM")
+
+    monkeypatch.setattr("app.skills.interview.sample_opening.chat", _chat)
+    monkeypatch.setattr("app.skills.interview.sample_opening._graph", _FakeGraph(None))
+
+    r = await so.sample_opening("nobody:none", "某选题")
+    assert r is None
+
+
+def test_sample_opening_endpoint_requires_token(monkeypatch):
+    """无 token → 422（照 step 端点鉴权测）。"""
+    from fastapi.testclient import TestClient
+    from app.main import app
+    monkeypatch.setattr("app.main._init_checkpointer", _noop_checkpointer)
+    async def _fake(*a, **k):
+        return {"found": True, "topic": "x", "without": "a", "with": "b"}
+    monkeypatch.setattr("app.api.interview.sample_opening", _fake)
+    with TestClient(app) as c:
+        r = c.post("/ai/interview/sample-opening",
+                   json={"user_id": 1, "thread_id": "1:s", "topic": None})
+    assert r.status_code == 422

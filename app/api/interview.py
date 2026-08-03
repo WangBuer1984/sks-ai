@@ -18,6 +18,7 @@ from pydantic import BaseModel, Field
 
 from app.api.deps import verify_service_token
 from app.skills.interview.graph import fetch_result, interview_step
+from app.skills.interview.sample_opening import sample_opening
 
 router = APIRouter(prefix="/ai/interview", tags=["ai"], dependencies=[Depends(verify_service_token)])
 
@@ -69,3 +70,29 @@ async def get_interview_result(thread_id: str = Query(...)) -> InterviewResultRe
         a_cards=data.get("a_cards"),
         found=True,
     )
+
+
+# ---- /ai/interview/sample-opening（只读，试试效果）-----------------------
+
+class SampleOpeningRequest(BaseModel):
+    user_id: int
+    thread_id: str
+    topic: str | None = None
+
+
+class SampleOpeningResponse(BaseModel):
+    found: bool = True
+    topic: str | None = None
+    without: str | None = None
+    with_: str | None = Field(default=None, alias="with")
+
+    model_config = {"populate_by_name": True}
+
+
+@router.post("/sample-opening", response_model=SampleOpeningResponse, response_model_exclude_unset=True)
+async def post_sample_opening(req: SampleOpeningRequest) -> SampleOpeningResponse:
+    """只读：取 checkpoint profile，产「无档案/有档案」两版开场钩子，不推进状态机。"""
+    data = await sample_opening(thread_id=req.thread_id, topic=req.topic)
+    if data is None:
+        return SampleOpeningResponse(found=False)
+    return SampleOpeningResponse(found=True, **data)
