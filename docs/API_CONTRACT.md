@@ -59,6 +59,7 @@ Java 每个请求带两个头：
 | POST | `/ai/asr` | 需 | 短音频转文字（multipart） | `AiClient.asr` |
 | POST | `/ai/analyze/precheck` | 需 | 拆账号预检（免费，不扣费） | `AiClient.precheck` |
 | GET | `/ai/hot_board` | 需 | 平台热点榜 | `AiClient.hotBoard` |
+| GET | `/ai/analyze/video/metrics` | 需 | 单视频互动五码（抖音+视频号） | `AiClient.fetchVideoMetrics` |
 | POST | `/ai/analyze/video/text` | 需 | 拆视频（同步，文案直传） | `AiClient.analyzeVideoText` |
 | POST | `/ai/analyze/video/link` | 需 | 拆视频（异步 202，链接） | `AiClient.analyzeVideoLink` |
 | POST | `/ai/analyze/account` | 需 | 拆账号（异步 202） | `AiClient.analyzeAccount` |
@@ -219,6 +220,17 @@ Query 参数 `thread_id`（必填）。Java 侧须自行拼 `"userId:sessionId"`
 上游 `DataSourceError` → **502** `{"detail":{"error":"HOT_BOARD_FAILED","message":"..."}}`。
 
 Java `HotItem` 把 `hot_index`/`video_count` 声明为可空 `Integer`，Python 侧则是必填 `int`。目前 Java 只用 `title` 打分入库，两字段留给后续排序/配额。
+
+### GET /ai/analyze/video/metrics
+
+Query `url`（视频分享链）。
+
+```jsonc
+{ "found": true, "play_count": 1234, "like_count": 56, "comment_count": 7, "share_count": 8, "collect_count": 9 }
+// 非视频/不可达/未知平台：{ "found": false, "play_count": 0, ... }
+```
+
+抖音走 `video_meta`；视频号走 `channels_video_metrics`（detail 解析）；未知平台 → `found=false`。上游 `DataSourceError` → **502** `{"detail":{"error":"VIDEO_METRICS_FAILED","message":"..."}}`（message 截断 200 字符）。
 
 ### POST /ai/analyze/video/text（同步）
 

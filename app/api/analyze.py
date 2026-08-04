@@ -28,9 +28,11 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from pydantic import BaseModel
 
 from app.api.deps import verify_service_token
+from app.config import settings
 from app.datasource import DataSourceError
 from app.datasource.tikhub import hot_board as _hot_board
 from app.datasource.tikhub import precheck as _precheck
+from app.datasource.tikhub import video_metrics as _video_metrics
 from app.skills.account_analyze import graph as account_graph
 from app.skills.account_analyze.graph import analyze_account
 from app.skills.video_analyze import graph as video_graph
@@ -41,9 +43,10 @@ log = logging.getLogger(__name__)
 router = APIRouter(prefix="/ai", tags=["ai"], dependencies=[Depends(verify_service_token)])
 
 # 模块级别名——测试 monkeypatch 目标（app.api.analyze.precheck / .hot_board /
-# .structure_video / .analyze_video_link / .analyze_account）
+# .structure_video / .analyze_video_link / .analyze_account / .video_metrics）
 precheck = _precheck
 hot_board = _hot_board
+video_metrics = _video_metrics
 
 
 # ---- /ai/analyze/precheck --------------------------------------------------
@@ -92,6 +95,40 @@ async def get_hot_board() -> list[HotItemResponse]:
         HotItemResponse(title=i.title, hot_index=i.hot_index, video_count=i.video_count)
         for i in items
     ]
+
+
+# ---- /ai/analyze/video/metrics ---------------------------------------------
+
+class VideoMetricsResponse(BaseModel):
+    found: bool = False
+    play_count: int = 0
+    like_count: int = 0
+    comment_count: int = 0
+    share_count: int = 0
+    collect_count: int = 0
+
+
+@router.get("/analyze/video/metrics", response_model=VideoMetricsResponse)
+async def get_video_metrics(url: str) -> VideoMetricsResponse:
+    """单视频互动五码（抖音+视频号）。非视频/不可达/未知平台 → found=false。"""
+    try:
+        m = await video_metrics(url)
+    except DataSourceError as e:
+        log.warning("video_metrics failed: %s", e)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail={"error": "VIDEO_METRICS_FAILED", "message": str(e)[:200]},
+        )
+    if m is None:
+        return VideoMetricsResponse(found=False)
+    return VideoMetricsResponse(
+        found=True,
+        play_count=m.play_count,
+        like_count=m.like_count,
+        comment_count=m.comment_count,
+        share_count=m.share_count,
+        collect_count=m.collect_count,
+    )
 
 
 # ---- /ai/analyze/video/text ------------------------------------------------

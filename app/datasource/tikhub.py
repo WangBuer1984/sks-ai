@@ -485,6 +485,48 @@ async def video_meta(url: str, *, client: httpx.AsyncClient | None = None) -> Vi
             await client.aclose()
 
 
+async def channels_video_metrics(
+    url: str, *, client: httpx.AsyncClient | None = None
+) -> VideoMeta | None:
+    """视频号单视频互动指标（按分享链）。
+
+    复用 ``_fetch_channels_video_detail`` 拿 detail 响应，再交 ``_parse_channels_video``
+    取数（read→play / like→like / fav→collect / forward→share / comment→comment）。
+    detail 响应 ``data`` 字段结构与 ``fetch_user_videos`` 单条同源（同 ``read_count``/
+    ``like_count``/``fav_count``/``comment_count``/``forward_count`` 顶层取数点）；
+    若实际 detail 把指标嵌在子层，需在此调整取数路径（见核对风险注）。
+    无 data / 无 media+full_url → None（``_parse_channels_video`` 返回 None 即如此）。
+    """
+    if not _is_configured():
+        raise DataSourceError("TIKHUB_API_KEY not configured")
+    own = client is None
+    if own:
+        client = httpx.AsyncClient()
+    try:
+        body = await _fetch_channels_video_detail(client, url)
+        item = body.get("data") or body
+        if not isinstance(item, dict) or not item:
+            return None
+        return _parse_channels_video(item)
+    finally:
+        if own:
+            await client.aclose()
+
+
+async def video_metrics(url: str, *, client: httpx.AsyncClient | None = None) -> VideoMeta | None:
+    """单视频互动五码（双平台分发）。
+
+    抖音 host → ``video_meta``；视频号 host → ``channels_video_metrics``；
+    未知平台 → None（非视频/不可达，端点翻译 found=false）。上游 DataSourceError 透传给端点。
+    """
+    plat = _platform_of(url)
+    if plat == "douyin":
+        return await video_meta(url, client=client)
+    if plat == "wechat_channels":
+        return await channels_video_metrics(url, client=client)
+    return None
+
+
 async def precheck(url: str, *, client: httpx.AsyncClient | None = None) -> dict:
     """轻量可达性 + 视频条数预检（Java 预扣额度门槛，Task 3.3）。
 
