@@ -81,3 +81,62 @@ def test_video_metrics_endpoint_not_found(monkeypatch):
                   headers={"X-Service-Token": "test-secret"})
     assert r.status_code == 200
     assert r.json()["found"] is False
+
+
+@pytest.mark.asyncio
+async def test_channels_video_metrics_parses_real_detail_fixture(monkeypatch):
+    """真实视频号 detail 响应结构 fixture（来自 smoke https://weixin.qq.com/sph/ADk6xBh2hq）。
+
+    锁住 detail `data` 顶层取数点（read_count/like_count/fav_count/forward_count/
+    comment_count + media.url），防 TikHub 改字段名或嵌套子层时 5 码静默返 0。
+    read_count=0 是视频号 detail API 限制（不返真实播放量），非 parser bug。
+    """
+    from app.datasource import tikhub
+
+    detail = {
+        "code": 200,
+        "data": {
+            "id": 14919266588327413890,
+            "nickname": "前进的胖掌柜",
+            "title": [{"shortTitle": "职能部门正在杀死公司"}],
+            "create_time": 1778515170,
+            "read_count": 0,  # 视频号 detail 不返真实播放量
+            "like_count": 13702,
+            "fav_count": 12202,
+            "forward_count": 20510,
+            "comment_count": 681,
+            "media": {
+                "url": "http://wxapp.tc.qq.com/251/20302/stodownload?enc=xxx",
+                "decode_key": "abc",
+                "duration": 570,
+            },
+        },
+    }
+
+    async def _fake_fetch(client, share_url):
+        return detail
+
+    monkeypatch.setattr(tikhub, "_fetch_channels_video_detail", _fake_fetch)
+    m = await tikhub.channels_video_metrics("https://weixin.qq.com/sph/ADk6xBh2hq")
+    assert m is not None
+    assert m.platform == "wechat_channels"
+    assert m.play_count == 0  # read_count=0（API 限制）
+    assert m.like_count == 13702
+    assert m.comment_count == 681
+    assert m.share_count == 20510  # forward_count → share
+    assert m.collect_count == 12202  # fav_count → collect
+    assert m.fav_count == 12202
+    assert m.download_url  # media.url 非空 → 不返 None
+
+
+@pytest.mark.asyncio
+async def test_channels_video_metrics_no_media_returns_none(monkeypatch):
+    """detail 无 media（或 media 无 url）→ None（_parse_channels_video 跳过）。"""
+    from app.datasource import tikhub
+
+    async def _fake_fetch(client, share_url):
+        return {"code": 200, "data": {"read_count": 1, "like_count": 2}}
+
+    monkeypatch.setattr(tikhub, "_fetch_channels_video_detail", _fake_fetch)
+    m = await tikhub.channels_video_metrics("https://weixin.qq.com/sph/x")
+    assert m is None
