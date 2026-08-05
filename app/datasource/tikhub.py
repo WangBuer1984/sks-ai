@@ -113,7 +113,7 @@ async def _sleep(seconds: float) -> None:
 class VideoMeta:
     """单个视频元数据。供 Task 3.2 拆视频/拆账号消费。"""
     title: str
-    play_count: int
+    play_count: int | None
     fav_count: int
     download_url: str
     author: str = ""  # aweme author.nickname / author.nick_name
@@ -455,9 +455,11 @@ def _parse_channels_video(item: dict, *, fallback_author: str = "") -> VideoMeta
     fav = item.get("fav_count")
     if fav is None:
         fav = item.get("like_count")
+    _read = _safe_int(item.get("read_count"))
+    play_count = _read if _read > 0 else None
     return VideoMeta(
         title=_channels_title(item.get("title")),
-        play_count=_safe_int(item.get("read_count")),
+        play_count=play_count,
         fav_count=_safe_int(fav),
         download_url=full,
         author=str(item.get("nickname") or fallback_author or ""),

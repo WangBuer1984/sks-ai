@@ -120,7 +120,7 @@ async def test_channels_video_metrics_parses_real_detail_fixture(monkeypatch):
     m = await tikhub.channels_video_metrics("https://weixin.qq.com/sph/ADk6xBh2hq")
     assert m is not None
     assert m.platform == "wechat_channels"
-    assert m.play_count == 0  # read_count=0（API 限制）
+    assert m.play_count is None  # read_count=0 → 不可用信号（非真 0）
     assert m.like_count == 13702
     assert m.comment_count == 681
     assert m.share_count == 20510  # forward_count → share
@@ -140,3 +140,66 @@ async def test_channels_video_metrics_no_media_returns_none(monkeypatch):
     monkeypatch.setattr(tikhub, "_fetch_channels_video_detail", _fake_fetch)
     m = await tikhub.channels_video_metrics("https://weixin.qq.com/sph/x")
     assert m is None
+
+
+@pytest.mark.asyncio
+async def test_channels_video_metrics_positive_read_kept(monkeypatch):
+    """罕见 read_count>0 → 保留真值（不强制 None）。"""
+    from app.datasource import tikhub
+
+    detail = {
+        "code": 200,
+        "data": {
+            "nickname": "x",
+            "title": [{"shortTitle": "t"}],
+            "read_count": 1234,
+            "like_count": 10,
+            "fav_count": 1,
+            "forward_count": 2,
+            "comment_count": 3,
+            "media": {"url": "http://example.com/v", "decode_key": "k", "duration": 10},
+        },
+    }
+
+    async def _fake_fetch(client, share_url):
+        return detail
+
+    monkeypatch.setattr(tikhub, "_fetch_channels_video_detail", _fake_fetch)
+    m = await tikhub.channels_video_metrics("https://weixin.qq.com/sph/x")
+    assert m is not None
+    assert m.play_count == 1234
+
+
+def test_video_metrics_endpoint_channels_play_null(monkeypatch):
+    from fastapi.testclient import TestClient
+    from app.main import app
+    from app.api import analyze
+    from app.datasource.tikhub import VideoMeta
+
+    monkeypatch.setattr(analyze.settings, "SERVICE_TOKEN", "test-secret")
+
+    async def _vm(url):
+        return VideoMeta(
+            title="c",
+            play_count=None,
+            fav_count=5,
+            download_url="http://x",
+            platform="wechat_channels",
+            like_count=20,
+            comment_count=4,
+            share_count=6,
+            collect_count=5,
+        )
+
+    monkeypatch.setattr(analyze, "video_metrics", _vm)
+    with TestClient(app) as c:
+        r = c.get(
+            "/ai/analyze/video/metrics",
+            params={"url": "https://weixin.qq.com/sph/x"},
+            headers={"X-Service-Token": "test-secret"},
+        )
+    assert r.status_code == 200
+    j = r.json()
+    assert j["found"] is True
+    assert j["play_count"] is None
+    assert j["like_count"] == 20

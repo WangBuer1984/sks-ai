@@ -101,7 +101,7 @@ async def get_hot_board() -> list[HotItemResponse]:
 
 class VideoMetricsResponse(BaseModel):
     found: bool = False
-    play_count: int = 0
+    play_count: int | None = None
     like_count: int = 0
     comment_count: int = 0
     share_count: int = 0

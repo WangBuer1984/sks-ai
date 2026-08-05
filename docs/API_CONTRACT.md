@@ -227,7 +227,8 @@ Query `url`（视频分享链）。
 
 ```jsonc
 { "found": true, "play_count": 1234, "like_count": 56, "comment_count": 7, "share_count": 8, "collect_count": 9 }
-// 非视频/不可达/未知平台：{ "found": false, "play_count": 0, ... }
+// play_count: int | null（抖音真值含 0；视频号 read_count<=0 视为不可用 → null）
+// 非视频/不可达/未知平台：{ "found": false, "play_count": null, ... }
 ```
 
 抖音走 `video_meta`；视频号走 `channels_video_metrics`（detail 解析）；未知平台 → `found=false`。上游 `DataSourceError` → **502** `{"detail":{"error":"VIDEO_METRICS_FAILED","message":"..."}}`（message 截断 200 字符）。
