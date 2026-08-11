@@ -21,11 +21,25 @@ import pytest
 
 from app.config import settings
 from app.datasource import DataSourceError
-from app.datasource.media.download import download_url, gc_stale_tmp
+from app.datasource.media.download import download_url, gc_stale_tmp, _DOWNLOAD_TIMEOUT
 
 
 def _mock_client(handler) -> httpx.AsyncClient:
     return httpx.AsyncClient(transport=httpx.MockTransport(handler), follow_redirects=True)
+
+
+def test_download_read_timeout_is_30s_not_600():
+    """read=30s 锁：stall 30s 即 DataSourceError，不烧到旧 600s。
+
+    httpx read 是「块间无数据上限」非整段总时长——0.7MB/s 持续流每块间隔 <1s 永不触
+    30s；真 stall（0 字节）30s 即 ReadTimeout。connect 维持 30s；write/pool 留 600s
+    不动（不把整段 total 砍成 30s，否则 50s+ 的正常长视频下载会被误杀）。
+    """
+    assert _DOWNLOAD_TIMEOUT.read == 30.0, "read 必须 30s：stall 早死，不能回到 600s"
+    assert _DOWNLOAD_TIMEOUT.connect == 30.0
+    # total 不被砍：write/pool 仍 600s（正常长视频下载 50s+ 不被误杀）
+    assert _DOWNLOAD_TIMEOUT.write == 600.0
+    assert _DOWNLOAD_TIMEOUT.pool == 600.0
 
 
 async def test_download_url_writes_file(tmp_path, monkeypatch):
@@ -208,3 +222,26 @@ def test_gc_stale_tmp_swallows_unlink_errors(tmp_path, monkeypatch):
     monkeypatch.setattr(os, "unlink", boom)
     # 不应抛异常；删不掉返回 0
     assert gc_stale_tmp() == 0
+
+
+def test_gc_stale_tmp_ignores_vanished_entries(tmp_path, monkeypatch, caplog):
+    """listdir 后被并发 finally 删掉 → FileNotFoundError 静默，不刷 warning。"""
+    import logging
+
+    monkeypatch.setattr(settings, "ASR_TMP_DIR", str(tmp_path))
+    vanished = tmp_path / "sks_asr_wav_gone"
+    vanished.mkdir()
+    now = time.time()
+    os.utime(vanished, (now - 5 * 3600, now - 5 * 3600))
+
+    real_stat = os.stat
+
+    def race_stat(path, *a, **k):
+        if str(path).endswith("sks_asr_wav_gone"):
+            raise FileNotFoundError(path)
+        return real_stat(path, *a, **k)
+
+    monkeypatch.setattr(os, "stat", race_stat)
+    with caplog.at_level(logging.WARNING, logger="app.datasource.media.download"):
+        assert gc_stale_tmp() == 0
+    assert not any("cannot stat/delete" in r.message for r in caplog.records)

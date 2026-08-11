@@ -13,7 +13,7 @@ Task 3.2/3.3 捕获后翻译为退款/重试策略（PRD §11.3）。
 （空 → 系统 tempfile 目录）。``gc_stale_tmp`` 清扫陈旧文件（默认 >2h）。
 
 下载用 ``stream`` + ``aiter_bytes`` 流式落盘，避免 ``resp.content`` 整包入内存
-（视频号/长视频可达数百 MB，``download_sem=5`` 并发时 RSS 会爆炸）。
+（视频号/长视频可达数百 MB，``download_sem=2`` 并发时 RSS 会爆炸）。
 """
 
 from __future__ import annotations
@@ -34,8 +34,11 @@ from app.datasource import DataSourceError
 
 log = logging.getLogger(__name__)
 
-# 连接 30s；读超时 600s——数百 MB CDN 在 60s 内常传不完。
-_DOWNLOAD_TIMEOUT = httpx.Timeout(600.0, connect=30.0)
+# 连接 30s；read 30s = 块间无数据上限（stall 早死），write/pool 600s 不动（不砍 total）。
+# httpx read 是「上一块到下一块的最大间隔」非「整段总时长」——0.7MB/s 持续有块流每块间隔
+# <1s 永不触 30s；真 stall（0 字节）30s 即 ReadTimeout → DataSourceError，不烧到旧 600s。
+# 实测抖音/视频号 CDN 聚合限速 ~0.7/1.1 MB/s，长视频正常下载 50s+ 能完（块密集，不触 read）。
+_DOWNLOAD_TIMEOUT = httpx.Timeout(600.0, connect=30.0, read=30.0)
 _CHUNK_SIZE = 256 * 1024
 # 临时文件名前缀——``gc_stale_tmp`` 按此前缀匹配清扫，避免误删其他模块的 temp 文件。
 _TMP_PREFIX = "sks_asr_dl_"
@@ -175,8 +178,12 @@ def gc_stale_tmp(*, max_age_hours: float = 2.0) -> int:
                 os.unlink(path)
                 deleted += 1
             elif stat.S_ISDIR(st.st_mode):
-                shutil.rmtree(path, ignore_errors=False)
+                # ignore_errors：并发 transcribe finally/早删可能已清掉同路径。
+                shutil.rmtree(path, ignore_errors=True)
                 deleted += 1
+        except FileNotFoundError:
+            # listdir → 他协程已 unlink/rmtree：竞态，静默跳过。
+            continue
         except OSError as exc:
             log.warning("gc_stale_tmp: cannot stat/delete %s: %s", path, exc)
             continue

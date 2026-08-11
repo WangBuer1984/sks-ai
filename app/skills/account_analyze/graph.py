@@ -1,14 +1,16 @@
-"""拆账号 skill：TikHub TOP20 → 逐条转写+结构化 → 规律归纳 → 三层结果。
+"""拆账号 skill：TikHub TOP10 → 逐条转写+结构化 → 规律归纳 → 三层结果。
 
 入口（被 app/api/analyze.py 调用）：
 - ``analyze_account(task_id, url)`` **后台**（FastAPI BackgroundTasks）：
-  set running → account_top_videos(url, n=20) → 有界并发（默认 3）逐条：心跳 +
+  set running → account_top_videos(url, n=10) → 有界并发（默认 3）逐条：心跳 +
   transcribe + 结构化 → 写 benchmark_video + 进度递增 → 全部完成后规律归纳 →
   三层 result。异常 → partial/failed。
 
 模型档位（MODEL_FOR）：
 - account_analyze_item: glm-4.5-air（轻量抽取，逐条结构化快省）。
-- account_analyze_summary: glm-4.7 thinking on（深度归纳/归因，需全局推理）。
+- account_analyze_summary: glm-4.7 thinking off（thinking 开与结构化输出在 GLM-4.7
+  冲突——function_calling 触发 1210、json_schema 返回散文、json_mode 不强制 schema；
+  关 thinking 保 function_calling 强制字段类型，见 git log）。
 
 进度语义（LOAD-BEARING，Task 3.3 按比例退款依赖）：
 ``progress = floor(已完成条数 / 总条数 × 100)``，整数 0-100。「已完成」= 该条转写+结构化
@@ -25,7 +27,10 @@
 running-timeout 误判（与 video_analyze 共享实现，见
 ``app.datasource.media.heartbeat``）。
 
-模块级别名 ``chat`` / ``check`` / ``transcribe`` / ``account_top_videos`` / ``update_task`` /
+**不做阿里云内容安全**：拆账号解析的是竞品/对标视频转写与结构化产出，过审会误杀
+（引流话术、超长文案等）；内容安全留给文案生成等用户可见创作链路。
+
+模块级别名 ``chat`` / ``transcribe`` / ``account_top_videos`` / ``update_task`` /
 ``insert_benchmark_video`` / ``heartbeat`` 是测试 monkeypatch 目标。
 """
 
@@ -42,7 +47,6 @@ from app.datasource.tikhub import account_top_videos as _account_top_videos
 from app.datasource.tikhub import video_meta_to_media_ref
 from app.datasource.tikhub import VideoMeta
 from app.llm.client import glm_client
-from app.safety.content_safety import check as _check
 from app.skills.analyze_store import heartbeat as _heartbeat
 from app.skills.analyze_store import insert_benchmark_video as _insert_benchmark_video
 from app.skills.analyze_store import update_task as _update_task
@@ -52,7 +56,6 @@ log = logging.getLogger(__name__)
 
 # 模块级别名——测试 monkeypatch 目标
 chat = glm_client.chat
-check = _check
 transcribe = _transcribe
 account_top_videos = _account_top_videos
 update_task = _update_task
@@ -62,7 +65,7 @@ heartbeat = _heartbeat
 # 心跳间隔：与 video_analyze 一致，短于 Java running-timeout 5min。
 # 自 ``app.datasource.media.constants`` import（共享常量）；调用 ``run_with_heartbeat``
 # 时传 ``interval=HEARTBEAT_INTERVAL``，故测试 monkeypatch ``ag.HEARTBEAT_INTERVAL`` 仍生效。
-_TOP_N = 20
+_TOP_N = 10
 # 有界并发：模块级别名便于测试 monkeypatch 为 1（串行）验证进度语义。
 _ITEM_CONCURRENCY = ACCOUNT_ITEM_CONCURRENCY
 
@@ -73,6 +76,7 @@ _SUMMARY_FIELDS = ("account_profile", "patterns", "migration_advice")
 # ---- 结构化输出 schema ----------------------------------------------------
 
 _ITEM_SCHEMA: dict[str, Any] = {
+    "title": "account_analyze_item",
     "type": "object",
     "properties": {
         "structure": {"type": "string", "description": "该条视频文案结构拆解"},
@@ -84,6 +88,7 @@ _ITEM_SCHEMA: dict[str, Any] = {
 }
 
 _SUMMARY_SCHEMA: dict[str, Any] = {
+    "title": "account_analyze_summary",
     "type": "object",
     "properties": {
         "account_profile": {"type": "string", "description": "账号画像归纳（人设/定位/受众）"},
@@ -127,30 +132,21 @@ def _build_summary_messages(items: list[dict[str, Any]]) -> list[dict[str, str]]
 
 # ---- 内部：单条结构化 ------------------------------------------------------
 
-async def _structure_item(transcript: str) -> dict[str, Any] | None:
-    """单条结构化（account_analyze_item）+ LLM 输出过审。命中安全返回 None。
-
-    调用方负责先对 transcript 做 UGC 安全检查。
-    """
+async def _structure_item(transcript: str) -> dict[str, Any]:
+    """单条结构化（account_analyze_item）。不做内容安全。"""
     messages = _build_item_messages(transcript)
     result = await chat("account_analyze_item", messages, json_schema=_ITEM_SCHEMA)
     if not isinstance(result, dict):
         result = {}
-    text = " ".join(str(result.get(k, "")) for k in _ITEM_FIELDS)
-    if not await check(text):
-        return None
     return {k: result.get(k, "") for k in _ITEM_FIELDS}
 
 
-async def _summarize(items: list[dict[str, Any]]) -> dict[str, Any] | None:
-    """规律归纳（account_analyze_summary，thinking on）+ 输出过审。命中安全返回 None。"""
+async def _summarize(items: list[dict[str, Any]]) -> dict[str, Any]:
+    """规律归纳（account_analyze_summary，thinking off——与结构化输出冲突，见 models.py 注释）。不做内容安全。"""
     messages = _build_summary_messages(items)
     result = await chat("account_analyze_summary", messages, json_schema=_SUMMARY_SCHEMA)
     if not isinstance(result, dict):
         result = {}
-    text = " ".join(str(result.get(k, "")) for k in _SUMMARY_FIELDS)
-    if not await check(text):
-        return None
     return {k: result.get(k, "") for k in _SUMMARY_FIELDS}
 
 
@@ -165,7 +161,7 @@ async def _summarize(items: list[dict[str, Any]]) -> dict[str, Any] | None:
 # ---- 入口：后台异步 --------------------------------------------------------
 
 async def analyze_account(task_id: int, url: str) -> None:
-    """后台：running → TOP20 → 有界并发转写+结构化→benchmark_video → summary → done/partial/failed。
+    """后台：running → TOP10 → 有界并发转写+结构化→benchmark_video → summary → done/partial/failed。
 
     状态语义见模块 docstring。endpoint 在 202 前已写一次 running，本函数开头再写一次
     保证 background 启动瞬间 updated_at 最新。
@@ -190,41 +186,59 @@ async def analyze_account(task_id: int, url: str) -> None:
     # 按输入顺序占位——并发完成顺序不影响回填次序（保序回填）。
     results: list[tuple[dict[str, Any], str] | None] = [None] * total
     item_sem = asyncio.Semaphore(_ITEM_CONCURRENCY)
+    # insert 串行锁：保原「逐条串行避免 DB 连接池争用」不变量。insert 留在 _process_item
+    # 内是为了「该条转写+结构化+写行全成即递增 progress」——原先 insert+进度递增放在 gather
+    # 之后的串行回填循环，导致整段并发慢转写期间 progress 恒 0（12min 0%、视频号同路径复现）。
+    insert_lock = asyncio.Lock()
 
     async def _process_item(idx: int, v: VideoMeta) -> None:
         async with item_sem:
             try:
-                # UGC 安全（transcript 来自抖音创作者，仍按 UGC 处理 §5.1）
                 ref = video_meta_to_media_ref(v)
                 transcript = await run_with_heartbeat(
                     task_id, transcribe(ref), interval=HEARTBEAT_INTERVAL
                 )
-                if not await check(transcript):
-                    log.warning(
-                        "account item transcript blocked by safety, skipping: %s",
-                        v.title,
-                    )
-                    return
                 item = await _structure_item(transcript)
-                if item is None:
-                    log.warning(
-                        "account item structured output blocked by safety, skipping: %s",
-                        v.title,
-                    )
-                    return
             except DataSourceError as e:
                 log.warning("account item transcribe failed, skipping: %s", e)
                 return  # continue 语义
             except Exception:  # noqa: BLE001 — 单条 LLM/未预期错误跳过，不拖垮整任务
                 log.exception("account item unexpected error, skipping")
                 return  # continue 语义
+            # insert 逐条串行（锁）——与原回填循环同语义，仅迁入并发条目内以便逐条递增进度。
+            async with insert_lock:
+                try:
+                    await insert_benchmark_video(
+                        task_id,
+                        v.title,
+                        v.play_count,
+                        v.collect_count or v.fav_count,
+                        transcript,
+                        item,
+                        description=v.description or "",
+                        tags=v.tags or [],
+                        published_at=v.published_at,
+                        like_count=v.like_count,
+                        comment_count=v.comment_count,
+                        share_count=v.share_count,
+                        collect_count=v.collect_count or v.fav_count,
+                        duration_sec=v.duration_sec,
+                    )
+                except Exception:  # noqa: BLE001 — benchmark 写失败不抹掉已做的结构化
+                    log.exception("insert_benchmark_video failed, continuing")
             results[idx] = (item, transcript)
+            # 进度递增：该条转写+结构化+写行全成（LOAD-BEARING：Java 按比例退款 + 前端进度条）。
+            # done+=1 无 await 夹在读写之间，asyncio 单线程下原子；progress 经 insert_lock 串行化单调。
+            nonlocal done
+            done += 1
+            progress = int(done * 100 / total)
+            await update_task(task_id, progress=progress)
 
     await asyncio.gather(*(
         _process_item(i, v) for i, v in enumerate(videos)
     ))
 
-    # 按输入顺序回填：insert 逐条串行（避免 DB 连接池争用）+ 进度递增 + 摘要累积。
+    # 按输入顺序累积结构化结果给 summary（保序；insert+进度递增已在 _process_item 内逐条完成）。
     structured: list[dict[str, Any]] = []
     video_summary: list[dict[str, Any]] = []
     for i, v in enumerate(videos):
@@ -232,19 +246,20 @@ async def analyze_account(task_id: int, url: str) -> None:
         if r is None:
             continue
         item, transcript = r
-        try:
-            await insert_benchmark_video(
-                task_id, v.title, v.play_count, v.fav_count, transcript, item,
-            )
-        except Exception:  # noqa: BLE001 — benchmark 写失败不抹掉已做的结构化
-            log.exception("insert_benchmark_video failed, continuing")
-        done += 1
         structured.append(item)
         video_summary.append({
-            "title": v.title, "play_count": v.play_count, "fav_count": v.fav_count,
+            "title": v.title,
+            "description": v.description or "",
+            "tags": list(v.tags or []),
+            "published_at": v.published_at,
+            "play_count": v.play_count,
+            "like_count": v.like_count,
+            "comment_count": v.comment_count,
+            "share_count": v.share_count,
+            "collect_count": v.collect_count or v.fav_count,
+            "fav_count": v.collect_count or v.fav_count,  # 兼容旧 Java 读 fav
+            "duration_sec": v.duration_sec,
         })
-        progress = int(done * 100 / total)
-        await update_task(task_id, progress=progress)
 
     # 全部条目失败 → failed
     if done == 0:
@@ -256,7 +271,7 @@ async def analyze_account(task_id: int, url: str) -> None:
 
     progress = int(done * 100 / total)
 
-    # 2. 规律归纳（thinking on）——summary 失败/命中 → partial（条目明细已写 benchmark）
+    # 2. 规律归纳（thinking off，见 models.py 不变量）——summary 失败 → partial（条目明细已写 benchmark）
     try:
         summary = await _summarize(structured)
     except Exception as e:  # noqa: BLE001 — summary LLM 失败：条目已产出，降级 partial
@@ -265,14 +280,6 @@ async def analyze_account(task_id: int, url: str) -> None:
             task_id, status="partial", progress=progress,
             result={"videos": video_summary},
             error=f"summary generation failed: {type(e).__name__}: {e}",
-        )
-        return
-
-    if summary is None:
-        await update_task(
-            task_id, status="partial", progress=progress,
-            result={"videos": video_summary},
-            error="summary blocked by content safety",
         )
         return
 

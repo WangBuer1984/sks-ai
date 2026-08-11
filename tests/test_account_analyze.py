@@ -1,4 +1,4 @@
-"""拆账号 skill 测试：mock tikhub/transcribe/llm/safety/db seam，绝不发真实网络/DB 请求。
+"""拆账号 skill 测试：mock tikhub/transcribe/llm/db seam，绝不发真实网络/DB 请求。
 
 覆盖：
 - 跑完后 analyze_task.status='done'、benchmark_video 有 N 行、result 含 账号画像/规律归纳/迁移建议 三层
@@ -23,14 +23,6 @@ from app.datasource.tikhub import VideoMeta
 
 
 # ---- fakes -----------------------------------------------------------------
-
-async def _safe(_t):
-    return True
-
-
-async def _unsafe(_t):
-    return False
-
 
 def _videos(n: int) -> list[VideoMeta]:
     return [VideoMeta(title=f"t{i}", play_count=100 * i, fav_count=i,
@@ -93,12 +85,11 @@ async def test_account_done_status_benchmark_rows_three_layers(monkeypatch):
     async def _update_task(task_id, *, status=None, progress=None, result=None, error=None):
         calls.append({"status": status, "progress": progress, "result": result, "error": error})
 
-    async def _insert_bench(task_id, title, play_count, fav_count, transcript, structure):
+    async def _insert_bench(task_id, title, play_count, fav_count, transcript, structure, **kwargs):
         bench.append({"title": title, "play_count": play_count})
 
     monkeypatch.setattr("app.skills.account_analyze.graph.account_top_videos", _top)
     monkeypatch.setattr("app.skills.account_analyze.graph.transcribe", _transcribe)
-    monkeypatch.setattr("app.skills.account_analyze.graph.check", _safe)
     # chat 按 skill 名分流
     async def _chat(skill, messages, json_schema=None):
         if skill == "account_analyze_item":
@@ -147,12 +138,11 @@ async def test_account_partial_progress_reflects_finished_ratio(monkeypatch):
     async def _update_task(task_id, *, status=None, progress=None, result=None, error=None):
         calls.append({"status": status, "progress": progress, "result": result, "error": error})
 
-    async def _insert_bench(task_id, title, play_count, fav_count, transcript, structure):
+    async def _insert_bench(task_id, title, play_count, fav_count, transcript, structure, **kwargs):
         bench.append({"title": title})
 
     monkeypatch.setattr("app.skills.account_analyze.graph.account_top_videos", _top)
     monkeypatch.setattr("app.skills.account_analyze.graph.transcribe", _transcribe)
-    monkeypatch.setattr("app.skills.account_analyze.graph.check", _safe)
     monkeypatch.setattr("app.skills.account_analyze.graph.chat", _fake_chat_summary)
     monkeypatch.setattr("app.skills.account_analyze.graph.update_task", _update_task)
     monkeypatch.setattr("app.skills.account_analyze.graph.insert_benchmark_video", _insert_bench)
@@ -194,7 +184,6 @@ async def test_account_failed_on_full_scrape_datasource_error(monkeypatch):
     monkeypatch.setattr("app.skills.account_analyze.graph.insert_benchmark_video", _insert_bench)
     monkeypatch.setattr("app.skills.account_analyze.graph.transcribe", lambda media: _ret("t"))
     monkeypatch.setattr("app.skills.account_analyze.graph.chat", _fake_chat_summary)
-    monkeypatch.setattr("app.skills.account_analyze.graph.check", _safe)
     pool = _FakePool()
     _patch_pool(monkeypatch, pool)
 
@@ -229,7 +218,6 @@ async def test_account_failed_when_all_items_fail(monkeypatch):
     monkeypatch.setattr("app.skills.account_analyze.graph.account_top_videos", _top)
     monkeypatch.setattr("app.skills.account_analyze.graph.transcribe", _transcribe)
     monkeypatch.setattr("app.skills.account_analyze.graph.chat", _fake_chat_summary)
-    monkeypatch.setattr("app.skills.account_analyze.graph.check", _safe)
     monkeypatch.setattr("app.skills.account_analyze.graph.update_task", _update_task)
     monkeypatch.setattr("app.skills.account_analyze.graph.insert_benchmark_video", _insert_bench)
     pool = _FakePool()
@@ -275,7 +263,7 @@ async def test_analyze_account_passes_channels_decode_key_to_transcribe(monkeypa
     async def _update_task(task_id, *, status=None, progress=None, result=None, error=None):
         return None
 
-    async def _insert_bench(task_id, title, play_count, fav_count, transcript, structure):
+    async def _insert_bench(task_id, title, play_count, fav_count, transcript, structure, **kwargs):
         return None
 
     async def _chat(skill, messages, json_schema=None):
@@ -287,7 +275,6 @@ async def test_analyze_account_passes_channels_decode_key_to_transcribe(monkeypa
 
     monkeypatch.setattr("app.skills.account_analyze.graph.account_top_videos", _top)
     monkeypatch.setattr("app.skills.account_analyze.graph.transcribe", _transcribe)
-    monkeypatch.setattr("app.skills.account_analyze.graph.check", _safe)
     monkeypatch.setattr("app.skills.account_analyze.graph.chat", _chat)
     monkeypatch.setattr("app.skills.account_analyze.graph.update_task", _update_task)
     monkeypatch.setattr("app.skills.account_analyze.graph.insert_benchmark_video", _insert_bench)
@@ -316,7 +303,6 @@ async def test_account_heartbeat_during_long_transcribe(monkeypatch):
 
     monkeypatch.setattr(ag, "account_top_videos", _top)
     monkeypatch.setattr(ag, "transcribe", _slow_transcribe)
-    monkeypatch.setattr(ag, "check", _safe)
     monkeypatch.setattr(ag, "chat", _fake_chat_summary)
     # update_task 用真实实现 → 走假 pool
     pool = _FakePool()
@@ -328,6 +314,64 @@ async def test_account_heartbeat_during_long_transcribe(monkeypatch):
     hb = [q for q, _ in pool.execs
           if q.startswith("UPDATE analyze_task SET updated_at = now() WHERE")]
     assert len(hb) >= 2, f"心跳应多次 touch，实际 {len(hb)} 次"
+
+
+# ---- 进度递增时机（回归锁）---------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_progress_increments_during_transcribe_not_after(monkeypatch):
+    """回归：进度必须随每条转写完成递增，不能等 gather 全完才动。
+
+    原先 insert+done+++progress 放在 ``asyncio.gather`` 之后的串行回填循环，导致
+    整段并发慢转写期间 progress 恒 0（线上 12min 0%、视频号同路径循环复现）。修复后
+    insert+进度迁入 ``_process_item``，该条转写+结构化+写行全成即递增。
+
+    用 gate 阻塞第 3 条 transcribe：前两条全成时 progress 应已到 66；原 bug 此刻为 0
+    （gather 未完 → 回填循环未跑）。
+    """
+    import app.skills.account_analyze.graph as ag
+    monkeypatch.setattr(ag, "HEARTBEAT_INTERVAL", 0.01)
+
+    calls: list[dict] = []
+    gate = asyncio.Event()
+
+    async def _top(url, n=20):
+        return _videos(3)
+
+    async def _transcribe(media):
+        idx = int(media.download_url.rsplit("/", 1)[-1].split(".")[0])
+        if idx == 2:
+            await gate.wait()  # 第 3 条阻塞，直到断言放行
+        await asyncio.sleep(0.01)
+        return f"转写-{media.download_url}"
+
+    async def _update_task(task_id, *, status=None, progress=None, result=None, error=None):
+        calls.append({"status": status, "progress": progress, "result": result, "error": error})
+
+    async def _insert_bench(*a, **kw):
+        return None
+
+    monkeypatch.setattr(ag, "account_top_videos", _top)
+    monkeypatch.setattr(ag, "transcribe", _transcribe)
+    monkeypatch.setattr(ag, "chat", _fake_chat_summary)
+    monkeypatch.setattr(ag, "update_task", _update_task)
+    monkeypatch.setattr(ag, "insert_benchmark_video", _insert_bench)
+    pool = _FakePool()
+    _patch_pool(monkeypatch, pool)
+
+    task = asyncio.create_task(ag.analyze_account(task_id=1, url="https://u"))
+    try:
+        await asyncio.sleep(0.15)  # 足够 0、1 两条全成（transcribe 0.01s + insert + progress）
+        max_prog = max(
+            (c["progress"] for c in calls if c["progress"] is not None), default=0
+        )
+        assert max_prog >= 66, (
+            f"第 3 条阻塞期间 progress 应≥66（前 2 条已全成递增），实际 {max_prog}；"
+            "若为 0 说明进度仍在 gather 之后才更新（回归 bug）"
+        )
+    finally:
+        gate.set()  # 放第 3 条收尾
+    await task
 
 
 # ---- 端点鉴权 + 202（ASGITransport，避开 TestClient×asyncpg loop flaky） ------

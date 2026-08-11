@@ -200,7 +200,9 @@ def test_semaphores_lazy_singleton():
 
     # 初值（_value 是 asyncio.Semaphore 暴露的剩余配额，CPython 实现细节；
     # 此处断言以锁定期望值，若未来 CPython 改名则改为 identity-only 检查）。
-    assert asr1._value == 3
-    assert dl1._value == 5
+    # asr=5：官方 qwen3-asr-flash 限流 RPM=100（无并发列），ASR 非瓶颈。
+    # download=2：实测 CDN 聚合限速，并发越多越慢（见 docs/spikes/cdn-download-concurrency.md）。
+    assert asr1._value == 5
+    assert dl1._value == 2
     assert cv1._value == 4
     assert dc1._value == 2
