@@ -47,9 +47,13 @@ class Settings(BaseSettings):
     # ASR 媒体下载临时文件目录（空 → 系统 tempfile 目录）。download.py 落盘 + gc_stale_tmp 清扫。
     ASR_TMP_DIR: str = ""
 
-    # 单条转写墙钟硬上限（秒，20min）——transcribe.py 的 wait_for 超时据此翻译为
-    # DataSourceError。可选调（极慢网络/超长视频才需放宽）；测试可 patch 此字段缩短。
-    TRANSCRIBE_TIMEOUT: int = 1200
+    # 单条转写墙钟硬上限（秒）。transcribe.py 的 wait_for 据此翻译为 DataSourceError，
+    # 超时 item 被 account_analyze._process_item 捕获后跳过（弃此条不拖垮整任务）。
+    # 1200→300 fail-fast：正常 item ~60-100s（下载 13-58s + ASR ~30s），300≈3× 最差
+    # 观测；卡死的 CDN 慢-but-进展流（read=30 只杀真 0 字节 stall，不杀慢流）300s 即
+    # 弃条，10 条弃 1 不影响任务。真 stall 由 httpx read=30 早死，此值兜底慢流。
+    # 详见 docs/spikes/cdn-download-concurrency.md。
+    TRANSCRIBE_TIMEOUT: int = 300
 
 
 settings = Settings()

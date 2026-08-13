@@ -5,3 +5,6 @@ __pycache__/
 .pytest_cache/
 .idea/
 *.iml
+
+# 落盘日志（app/main.py _configure_file_logging）
+logs/

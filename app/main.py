@@ -9,7 +9,9 @@
 """
 
 import logging
+import os
 from contextlib import asynccontextmanager
+from logging.handlers import RotatingFileHandler
 
 from fastapi import FastAPI
 
@@ -25,6 +27,37 @@ from app.config import settings
 from app.db import close_pool, init_pool
 
 log = logging.getLogger(__name__)
+
+
+def _configure_file_logging() -> None:
+    """落盘日志到 ``logs/sks-ai.log``（RotatingFileHandler 10MB×5）。
+
+    uvicorn 默认只输出 stdout（本地跑时即 PyCharm 控制台），进程退出即丢——
+    transcribe 的 per-step elapsed 与超时根因事后无从查起。加 FileHandler 后
+    ``transcribe step X done: elapsed=...`` 全落盘，下次 ``tail -f logs/sks-ai.log``
+    即可定位 1200→300 超时卡在哪段。只增 file handler，不影响控制台输出。
+    """
+    log_dir = "logs"
+    os.makedirs(log_dir, exist_ok=True)
+    handler = RotatingFileHandler(
+        os.path.join(log_dir, "sks-ai.log"),
+        maxBytes=10 * 1024 * 1024,
+        backupCount=5,
+        encoding="utf-8",
+    )
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s [%(name)s] %(levelname)s %(message)s")
+    )
+    handler.setLevel(logging.INFO)
+    root = logging.getLogger()
+    # 显式兜底根级 INFO：否则根默认 WARNING 会把 app.* 的 transcribe step INFO 记录
+    # 挡在 handler 之前（logger 级别先于 handler 级别判定），文件收不到分段计时。
+    root.setLevel(logging.INFO)
+    root.addHandler(handler)
+    # httpx/httpcore INFO 每请求一行，噪声盖过 transcribe step 日志，文件里降级。
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    log.info("file logging enabled: %s", os.path.abspath(os.path.join(log_dir, "sks-ai.log")))
 
 
 async def _init_checkpointer() -> None:
@@ -67,6 +100,8 @@ async def _init_checkpointer() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # 落盘日志先行：transcribe per-step elapsed 必须在 init_pool/请求前就绪。
+    _configure_file_logging()
     # startup：建 asyncpg 池 + 注册 pgvector（懒初始化兜底，真实环境由本处显式起池）
     try:
         await init_pool()

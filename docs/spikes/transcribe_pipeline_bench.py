@@ -28,7 +28,7 @@ CASES = [
     ("视频号", "https://weixin.qq.com/sph/A9zLUynrGY"),
 ]
 N = 2
-PER_VIDEO_TIMEOUT = 120  # 秒：防 1200s 外层挂死堵 bench
+PER_VIDEO_TIMEOUT = 120  # 秒：防 300s 外层挂死堵 bench
 
 
 async def bench_one(platform: str, url: str) -> None:
