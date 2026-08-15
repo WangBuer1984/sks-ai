@@ -130,6 +130,23 @@ def _build_summary_messages(items: list[dict[str, Any]]) -> list[dict[str, str]]
     ]
 
 
+# ---- 内部：原视频链接 ------------------------------------------------------
+
+def _video_url(v: VideoMeta) -> str | None:
+    """构造该条的作品链接，无法构造返 None（不编造）。
+
+    抖音：``aweme_id`` 拼标准作品页。视频号：一律 None——列表项只给到
+    ``media.full_url``（带鉴权 token 的加密 CDN 直链，需 decode_key 且短时失效），
+    拼网页形态（``channels.weixin.qq.com/web/pages/feed?eid=…|?oid=…`` /
+    ``weixin.qq.com/sph/<短码>``）需要 ``export_id`` / ``oid`` / sph 短码或
+    ``object_id``+``object_nonce_id`` 配对，``fetch_user_videos`` 是否带这些字段
+    未验证（spec §3.1 backlog）。前端据此让详情态输入框留空，结果区照常。
+    """
+    if v.platform == "douyin" and v.aweme_id:
+        return f"https://www.douyin.com/video/{v.aweme_id}"
+    return None
+
+
 # ---- 内部：单条结构化 ------------------------------------------------------
 
 async def _structure_item(transcript: str) -> dict[str, Any]:
@@ -227,6 +244,8 @@ async def analyze_account(task_id: int, url: str) -> None:
                         share_count=v.share_count,
                         collect_count=v.collect_count or v.fav_count,
                         duration_sec=v.duration_sec,
+                        author=v.author or "",
+                        video_url=_video_url(v),
                     )
                 except Exception:  # noqa: BLE001 — benchmark 写失败不抹掉已做的结构化
                     log.exception("insert_benchmark_video failed, continuing")

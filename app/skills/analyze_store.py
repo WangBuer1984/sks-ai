@@ -108,11 +108,17 @@ async def insert_benchmark_video(
     share_count: int = 0,
     collect_count: int | None = None,
     duration_sec: int | None = None,
+    author: str = "",
+    video_url: str | None = None,
 ) -> None:
     """写 benchmark_video 行（TOP20 明细）。
 
     ``fav_count`` / ``collect_count`` 均为收藏；``collect_count`` 缺省时用 ``fav_count``。
     ``like_count`` = 点赞（抖音 digg）。``duration_sec`` = 时长秒。
+
+    ``author`` / ``video_url``（V9 列）供拆视频页详情态：前者显示在信息卡副行，
+    后者用来预填拆视频输入框。``video_url`` 只有抖音能构造
+    （见 account_analyze.graph._video_url），视频号传 None。
     """
     collect = collect_count if collect_count is not None else fav_count
     tags_json = json.dumps(list(tags or []), ensure_ascii=False)
@@ -122,8 +128,8 @@ async def insert_benchmark_video(
         "INSERT INTO benchmark_video "
         "(analyze_task_id, title, play_count, fav_count, transcript, structure, "
         " description, tags, published_at, like_count, comment_count, share_count, collect_count, "
-        " duration_sec) "
-        "VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, $10, $11, $12, $13, $14)",
+        " duration_sec, author, video_url) "
+        "VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)",
         task_id,
         title,
         play_count,
@@ -138,4 +144,6 @@ async def insert_benchmark_video(
         share_count,
         collect,
         dur,
+        author or "",
+        video_url,
     )

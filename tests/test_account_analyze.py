@@ -453,6 +453,107 @@ async def test_account_endpoint_returns_202_and_sets_running_before_background(m
     assert order.index("update:running") < order.index("bg:analyze")
 
 
+# ---- author / video_url 落列 -------------------------------------------------
+
+def test_video_url_built_for_douyin():
+    """抖音：aweme_id → 作品链接（详情态用它预填拆视频输入框）。"""
+    from app.skills.account_analyze.graph import _video_url
+
+    v = VideoMeta(title="t", play_count=1, fav_count=1, download_url="https://dl/0.mp4",
+                  platform="douyin", aweme_id="7412345678901234567")
+    assert _video_url(v) == "https://www.douyin.com/video/7412345678901234567"
+
+
+def test_video_url_none_without_aweme_id():
+    """aweme_id 缺失 → None，不编造链接。"""
+    from app.skills.account_analyze.graph import _video_url
+
+    v = VideoMeta(title="t", play_count=1, fav_count=1, download_url="https://dl/0.mp4",
+                  platform="douyin", aweme_id=None)
+    assert _video_url(v) is None
+
+
+def test_video_url_none_for_channels():
+    """视频号无公开可构造链接 → None（即便 aweme_id 有值）。"""
+    from app.skills.account_analyze.graph import _video_url
+
+    v = VideoMeta(title="t", play_count=1, fav_count=1, download_url="https://dl/0.mp4",
+                  platform="wechat_channels", aweme_id="export_id_xyz")
+    assert _video_url(v) is None
+
+
+@pytest.mark.asyncio
+async def test_account_insert_passes_author_and_video_url(monkeypatch):
+    """拆账号写行时带上 author 与 video_url（详情页展示作者 + 原视频外链）。"""
+    captured: list[dict] = []
+
+    async def _top(url, n=20):
+        return [
+            VideoMeta(title="抖音条", play_count=100, fav_count=1,
+                      download_url="https://dl/0.mp4", author="装修避坑老张",
+                      platform="douyin", aweme_id="7412345678901234567"),
+            VideoMeta(title="视频号条", play_count=90, fav_count=1,
+                      download_url="https://dl/1.mp4", author="老李说装修",
+                      platform="wechat_channels", decode_key="k"),
+        ]
+
+    async def _transcribe(media):
+        return "转写文案"
+
+    async def _update_task(task_id, *, status=None, progress=None, result=None, error=None):
+        pass
+
+    async def _insert_bench(task_id, title, play_count, fav_count, transcript, structure,
+                            **kwargs):
+        captured.append({"title": title, "author": kwargs.get("author"),
+                         "video_url": kwargs.get("video_url")})
+
+    async def _chat(skill, messages, json_schema=None):
+        if skill == "account_analyze_item":
+            return await _fake_chat_item()
+        return await _fake_chat_summary()
+
+    monkeypatch.setattr("app.skills.account_analyze.graph.account_top_videos", _top)
+    monkeypatch.setattr("app.skills.account_analyze.graph.transcribe", _transcribe)
+    monkeypatch.setattr("app.skills.account_analyze.graph.chat", _chat)
+    monkeypatch.setattr("app.skills.account_analyze.graph.update_task", _update_task)
+    monkeypatch.setattr("app.skills.account_analyze.graph.insert_benchmark_video", _insert_bench)
+    _patch_pool(monkeypatch, _FakePool())
+
+    from app.skills.account_analyze.graph import analyze_account
+    await analyze_account(task_id=1, url="https://u")
+
+    by_title = {c["title"]: c for c in captured}
+    assert by_title["抖音条"]["author"] == "装修避坑老张"
+    assert by_title["抖音条"]["video_url"] == "https://www.douyin.com/video/7412345678901234567"
+    assert by_title["视频号条"]["author"] == "老李说装修"
+    assert by_title["视频号条"]["video_url"] is None
+
+
+@pytest.mark.asyncio
+async def test_insert_benchmark_video_sql_has_author_and_video_url(monkeypatch):
+    """真实 insert + 假 pool：新列进 INSERT 列表，值按位传（缺省 author='' / video_url=None）。"""
+    pool = _FakePool()
+    _patch_pool(monkeypatch, pool)
+
+    from app.skills.analyze_store import insert_benchmark_video
+    await insert_benchmark_video(
+        1, "标题", 100, 20, "转写", {"structure": "s"},
+        author="装修避坑老张", video_url="https://www.douyin.com/video/741",
+    )
+    await insert_benchmark_video(1, "无作者", 100, 20, "转写", {"structure": "s"})
+
+    sql, args = pool.execs[0]
+    assert "author" in sql and "video_url" in sql
+    assert "$16" in sql, "两个新列要进 VALUES 占位（原 14 列 → 16 列）"
+    # 按位断言（新列排在末尾，顺序即 INSERT 列顺序：… duration_sec, author, video_url）
+    assert args[-2] == "装修避坑老张"
+    assert args[-1] == "https://www.douyin.com/video/741"
+    _, args2 = pool.execs[1]
+    assert args2[-2] == ""      # author 缺省不写 None（列是 varchar，空串语义即「未知作者」）
+    assert args2[-1] is None    # video_url 缺省 NULL → 前端不渲染外链
+
+
 # ---- helper -----------------------------------------------------------------
 
 async def _ret(v):
