@@ -4,7 +4,8 @@
 - ``structure_video(task_id, transcript)`` **同步**：LLM 结构化 → 写
   ``analyze_task(status='done', progress=100, result)`` → 返回结构。
 - ``analyze_video_link(task_id, url)`` **后台**（FastAPI BackgroundTasks）：set running+updated_at
-  → transcribe(url)（带心跳）→ 结构化 → done+result。转写 DataSourceError → failed+error。
+  → transcribe(url)（带心跳）→ 结构化 → done+result（result 含四字段 + ``transcript`` 全文）。
+  转写 DataSourceError → failed+error。
 
 **不做阿里云内容安全**：解析视频的转写/LLM 产出是业务分析对象（含竞品引流话术等），
 过审会误杀正常拆解；内容安全留给文案生成等用户可见创作链路。
@@ -179,6 +180,9 @@ async def analyze_video_link(task_id: int, url: str) -> None:
         )
         await _set_progress(90)
         result = await _structure_transcript(transcript)
+        # transcript 随 result 落库：前端结果页要展示文案全文，而链接流的转写以前用完即丢。
+        # 注意是在结构化**之后**注入，不进 VIDEO_STRUCTURE_SCHEMA——否则等于让 LLM 复述全文。
+        result["transcript"] = transcript
     except DataSourceError as e:
         # 数据源失败（下载/转写/ASR）也打日志——以前只写 DB error 列，sks-ai 日志看不到，
         # 加上 Java poller 用固定文案覆盖 error，排查时 DB 和 log 双盲。

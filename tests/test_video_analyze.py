@@ -353,3 +353,73 @@ def _patch_pool(monkeypatch, pool):
     async def _get_pool():
         return pool
     monkeypatch.setattr("app.skills.analyze_store.get_pool", _get_pool)
+
+
+# ---- 链接流 transcript 落 result --------------------------------------------
+
+@pytest.mark.asyncio
+async def test_video_link_result_includes_transcript(monkeypatch):
+    """link 终态 result 含 transcript 全文（详情展示用），且与转写产物逐字一致。"""
+    import app.skills.video_analyze.graph as vg
+
+    calls: list[dict] = []
+    full_text = "开场就问你家师傅怕不怕检查，第一处看阴阳角……评论区扣「验收」领清单。"
+
+    async def _resolve(url):
+        from app.datasource.media import MediaRef
+        return MediaRef(platform="douyin", download_url="https://cdn.example/a.mp4")
+
+    async def _transcribe(media, *, on_progress=None):
+        return full_text
+
+    async def _chat(skill, messages, json_schema=None):
+        return {"structure": "钩子→正文→CTA", "why_hot": "切中焦虑",
+                "framework": "问题-方案", "diff_hint": "可复用"}
+
+    async def _update_task(task_id, *, status=None, progress=None, result=None, error=None):
+        calls.append({"status": status, "progress": progress, "result": result, "error": error})
+
+    monkeypatch.setattr(vg, "resolve_media", _resolve)
+    monkeypatch.setattr(vg, "transcribe", _transcribe)
+    monkeypatch.setattr(vg, "chat", _chat)
+    monkeypatch.setattr(vg, "update_task", _update_task)
+    # 心跳走假 pool：run_with_heartbeat 用的是自己模块里的 _heartbeat，patch vg.heartbeat 无效
+    # （同 test_video_link_done_transcribe_then_structure_then_done 的做法）。
+    _patch_pool(monkeypatch, _FakePool())
+
+    await vg.analyze_video_link(task_id=1, url="https://v.douyin.com/abc")
+
+    done = [c for c in calls if c["status"] == "done"][0]
+    assert done["result"]["transcript"] == full_text
+    assert done["result"]["structure"] == "钩子→正文→CTA"
+
+
+def test_transcript_not_requested_from_llm():
+    """transcript 不进 LLM schema——否则等于要求模型复述全文（成本与截断风险）。"""
+    import app.skills.video_analyze.graph as vg
+
+    assert "transcript" not in vg.VIDEO_STRUCTURE_SCHEMA["properties"]
+    assert "transcript" not in vg.VIDEO_STRUCTURE_SCHEMA["required"]
+    assert "transcript" not in vg._STRUCT_FIELDS
+
+
+@pytest.mark.asyncio
+async def test_video_text_result_stays_four_fields(monkeypatch):
+    """同步流（粘文案）result 形状不变：不塞 transcript（原文本就在用户手里/input 里）。"""
+    import app.skills.video_analyze.graph as vg
+
+    calls: list[dict] = []
+
+    async def _chat(skill, messages, json_schema=None):
+        return {"structure": "s", "why_hot": "w", "framework": "f", "diff_hint": "d"}
+
+    async def _update_task(task_id, *, status=None, progress=None, result=None, error=None):
+        calls.append({"status": status, "result": result})
+
+    monkeypatch.setattr(vg, "chat", _chat)
+    monkeypatch.setattr(vg, "update_task", _update_task)
+
+    await vg.structure_video(task_id=1, transcript="用户粘贴的原文")
+
+    result = [c for c in calls if c["status"] == "done"][0]["result"]
+    assert set(result.keys()) == {"structure", "why_hot", "framework", "diff_hint"}

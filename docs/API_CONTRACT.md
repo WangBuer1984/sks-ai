@@ -266,6 +266,8 @@ Query `url`（视频分享链）。
 
 `BackgroundTasks` 是进程内执行，**Python 重启不续跑**——靠 Java 轮询的超时/停滞判定兜底退款。
 
+`video/link` 终态 `analyze_task.result` 为**五字段**：`{structure, why_hot, framework, diff_hint, transcript}`——`transcript` 是 ASR 转写全文，结构化之后注入（**不在** LLM schema 里）。前端拆视频结果页据此展示文案全文。`video/text`（粘文案）result 仍是四字段：原文是用户输入，已在 `analyze_task.input` 与前端本地状态里。
+
 ### POST /ai/analyze/account（异步 202）
 
 入参出参同 video/link（`AccountRequest {task_id, url}` → `{task_id}`，HTTP 202）。后台跑 TOP20 → 逐条 → 三层，进度按 `floor(done*100/total)` 直写 `analyze_task`，终态 `done`/`partial`/`failed`。
