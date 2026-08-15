@@ -175,9 +175,13 @@ async def analyze_account(task_id: int, url: str) -> None:
             task_id, account_top_videos(url, n=_TOP_N), interval=HEARTBEAT_INTERVAL
         )
     except DataSourceError as e:
+        # 数据源失败也打日志——以前只写 DB error 列，sks-ai 日志看不到，
+        # 加上 Java poller 用固定文案覆盖 error，排查时 DB 和 log 双盲。
+        log.warning("account_analyze failed (DataSourceError): %s", e)
         await update_task(task_id, status="failed", error=str(e))
         return
     if not videos:
+        log.warning("account_analyze failed: no videos found for account")
         await update_task(task_id, status="failed", error="no videos found for account")
         return
 

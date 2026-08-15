@@ -180,6 +180,9 @@ async def analyze_video_link(task_id: int, url: str) -> None:
         await _set_progress(90)
         result = await _structure_transcript(transcript)
     except DataSourceError as e:
+        # 数据源失败（下载/转写/ASR）也打日志——以前只写 DB error 列，sks-ai 日志看不到，
+        # 加上 Java poller 用固定文案覆盖 error，排查时 DB 和 log 双盲。
+        log.warning("video_link failed (DataSourceError): %s", e)
         await update_task(task_id, status="failed", error=str(e))
         return
     except Exception as e:  # noqa: BLE001 — LLM/未预期错误统一 failed，不让任务卡 running
