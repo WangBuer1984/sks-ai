@@ -182,7 +182,7 @@ async def test_video_meta_returns_single(monkeypatch):
         if path.endswith("fetch_video_statistics"):
             return httpx.Response(200, json={"code": 200, "data": []})
         assert path.endswith("fetch_one_video_by_share_url")
-        assert request.url.params.get("url") == "https://v.douyin.com/abc"
+        assert request.url.params.get("share_url") == "https://v.douyin.com/abc"
         return httpx.Response(
             200,
             json={

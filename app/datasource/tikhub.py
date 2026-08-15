@@ -9,7 +9,7 @@
 接口路径（抖音）：
   - get_sec_user_id:           GET /api/v1/douyin/web/get_sec_user_id?url=
   - fetch_user_post_videos:    GET /api/v1/douyin/app/v3/fetch_user_post_videos?sec_user_id=&count=&max_cursor=
-  - fetch_one_video_by_share:  GET /api/v1/douyin/web/fetch_one_video_by_share_url?url=
+  - fetch_one_video_by_share:  GET /api/v1/douyin/web/fetch_one_video_by_share_url?share_url=
   - fetch_hot_total_list:      GET /api/v1/douyin/billboard/fetch_hot_total_list?page=&page_size=
                                （page/page_size 必填，缺则 422）
   - fetch_video_statistics:    GET /api/v1/douyin/app/v3/fetch_video_statistics?aweme_ids=
@@ -723,7 +723,8 @@ async def video_meta(url: str, *, client: httpx.AsyncClient | None = None) -> Vi
     if own:
         client = httpx.AsyncClient()
     try:
-        body = await _get_json(client, _PATH_ONE_VIDEO_BY_SHARE, {"url": url})
+        # TikHub 该端点 query 参数名为 share_url（非 url）——发错名 → 422 missing share_url。
+        body = await _get_json(client, _PATH_ONE_VIDEO_BY_SHARE, {"share_url": url})
         data = body.get("data") or {}
         item = data.get("aweme_detail") or data.get("item") or data
         if not isinstance(item, dict) or not item:
