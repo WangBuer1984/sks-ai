@@ -207,6 +207,8 @@ Query 参数 `thread_id`（必填）。Java 侧须自行拼 `"userId:sessionId"`
 
 `video_count` 是 TikHub 首页**估算**（≤20），非精确总数——拆账号扣费公式 `max(1, min(10, floor(N/2)))` 依赖此估算，是设计 §4.3 接受的契约。
 
+入参 url 由 sks-server 归一化后传入，通常已是有效 URL；_platform_of 是平台判定的最终权威。
+
 上游 `DataSourceError` → **502** `{"detail":{"error":"PRECHECK_FAILED","message":"..."}}`（message 截断 200 字符）。
 
 ### GET /ai/hot_board
@@ -224,6 +226,8 @@ Java `HotItem` 把 `hot_index`/`video_count` 声明为可空 `Integer`，Python 
 ### GET /ai/analyze/video/metrics
 
 Query `url`（视频分享链）。
+
+入参 url 由 sks-server 归一化后传入，通常已是有效 URL；_platform_of 是平台判定的最终权威。
 
 ```jsonc
 { "found": true, "play_count": 1234, "like_count": 56, "comment_count": 7, "share_count": 8, "collect_count": 9 }
@@ -264,6 +268,8 @@ Query `url`（视频分享链）。
 ### POST /ai/analyze/account（异步 202）
 
 入参出参同 video/link（`AccountRequest {task_id, url}` → `{task_id}`，HTTP 202）。后台跑 TOP20 → 逐条 → 三层，进度按 `floor(done*100/total)` 直写 `analyze_task`，终态 `done`/`partial`/`failed`。
+
+入参 url 由 sks-server 归一化后传入，通常已是有效 URL；_platform_of 是平台判定的最终权威。
 
 ### POST /ai/attribution/single
 
