@@ -32,3 +32,41 @@ def test_default_factory_sets_timeout_120():
     llm = _default_factory(MODEL_FOR["script_gen"])
     # ChatOpenAI 把 timeout= 暴露为 request_timeout 字段。
     assert float(llm.request_timeout) == 120.0
+
+
+def test_chat_forces_thinking_off_when_structured(monkeypatch):
+    """不变量：json_schema 结构化输出时，即便 spec.thinking=True 也必须降级 thinking=False。
+
+    GLM-4.7 thinking 开 + function_calling → 400 code 1210。GLMClient.chat 的 guard 在
+    运行时兜底配置漂移（MODEL_FOR 误改回 thinking=True），保证结构化路径不走 thinking。
+    """
+    import asyncio
+
+    from app.llm.client import GLMClient
+    from app.llm.models import ModelSpec
+
+    seen: dict[str, ModelSpec] = {}
+
+    def fake_factory(spec: ModelSpec):
+        seen["spec"] = spec
+        # 返回一个假 llm，其 ainvoke 返回空 dict（with_structured_output 在本测试不实际调用）
+        class _Fake:
+            def with_structured_output(self, schema, method="function_calling"):
+                return self
+            async def ainvoke(self, messages):
+                return {}
+        return _Fake()
+
+    # 故意构造 thinking=True 的漂移 spec，模拟配置被误改回
+    monkeypatch.setitem(
+        __import__("app.llm.models", fromlist=["MODEL_FOR"]).MODEL_FOR,
+        "_drift_test",
+        ModelSpec("glm-4.7", thinking=True),
+    )
+
+    client = GLMClient(llm_factory=fake_factory)
+    asyncio.run(client.chat("_drift_test", [{"role": "user", "content": "x"}], json_schema={"type": "object"}))
+
+    assert seen["spec"].thinking is False, (
+        "结构化输出路径必须降级 thinking=False，否则 GLM-4.7 function_calling 触发 1210"
+    )

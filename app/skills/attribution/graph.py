@@ -1,20 +1,17 @@
 """归因 skill：单条归因 + 周卡。
 
-设计文档 §5 + §4.4（复盘状态机：归因是「看归因」动作，FREE 不扣费）+
-§5.1（LLM 用户可见产出先审后展示——硬不变量）。
+设计文档 §5 + §4.4（复盘状态机：归因是「看归因」动作，FREE 不扣费）。
 
-- skill=`attribution` 走 glm-4.7 thinking **on**（MODEL_FOR["attribution"]，
-  档位规则：深度归纳/归因 GLM-4.7 thinking on）。业务代码不感知型号。
-- 无流式（硬不变量）：生成完整 → 内容安全过审 → 一次性返回 JSON。
+- skill=`attribution` 走 glm-4.7 thinking **off**（MODEL_FOR["attribution"]）。原 thinking on
+  与结构化输出冲突（FC→1210、json_schema→散文、json_mode→形状不可控），已关；不变量见
+  GLMClient.chat 的 thinking 降级 guard + test_llm_models.test_structured_skills_must_not_think。
+- 无流式：生成完整 → 一次性返回 JSON。
+- **不调阿里云内容安全**：创作/归纳产出交给大模型自身合规；阿里云只审用户输入/录音。
 - 归因是 review aid，FREE（PRD：flop「看归因」不扣费；周归因是定时聚合，非用户扣费）。
 - **无 DB**：skill 不查库。单条归因读取请求体传入的 script/play_count/baseline；
-  周归因读取 Java 组装好的 scripts 数组（含 play_count/review_state 等）。
-  Java 拥有近 30 天均值计算与 scripts 组装；本 skill 仅做 LLM 归纳。
+  周归因读取 Java 组装好的 scripts 数组。本 skill 仅做 LLM 归纳。
 
-线性流程（生成 → 过审 → 返回/blocked），无 script_gen 的「命中→重写」分支，
-故不引入 LangGraph——一个 async 函数即可（与 card_gen 同口径）。
-模块级别名 chat / check 是测试 monkeypatch 目标
-（app.skills.attribution.graph.chat / .check），与 script_gen / card_gen 同模式。
+模块级别名 chat 是测试 monkeypatch 目标。
 """
 
 from __future__ import annotations
@@ -24,13 +21,11 @@ import logging
 from typing import Any
 
 from app.llm.client import glm_client
-from app.safety.content_safety import check as _check
 
 log = logging.getLogger(__name__)
 
-# 模块级别名——测试 monkeypatch 目标（app.skills.attribution.graph.chat / .check）
+# 模块级别名——测试 monkeypatch 目标
 chat = glm_client.chat
-check = _check
 
 
 # ---- 结构化输出 schema ------------------------------------------------------
@@ -133,55 +128,17 @@ def _build_weekly_messages(user_id: int, scripts: list[dict[str, Any]]) -> list[
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
 
-# ---- 文本扁平化（用于内容安全检查）-----------------------------------------
-
-def _single_to_text(result: dict[str, Any]) -> str:
-    """单条归因产出 → 纯文本（diagnosis + 所有 suggestions）。"""
-    parts: list[str] = []
-    diag = result.get("diagnosis", "")
-    if diag:
-        parts.append(str(diag))
-    for s in result.get("suggestions", []) or []:
-        if s:
-            parts.append(str(s))
-    return " ".join(parts)
-
-
-def _weekly_to_text(result: dict[str, Any]) -> str:
-    """周卡产出 → 纯文本（summary + wins + gaps + next_focus 全部拼接）。"""
-    parts: list[str] = []
-    for key in ("summary", "next_focus"):
-        v = result.get(key, "")
-        if v:
-            parts.append(str(v))
-    for key in ("wins", "gaps"):
-        for item in result.get(key, []) or []:
-            if item:
-                parts.append(str(item))
-    return " ".join(parts)
-
-
 # ---- entrypoint ------------------------------------------------------------
 
 async def attribution_single(script: str, play_count: int, baseline: float) -> dict[str, Any]:
-    """单条归因：生成 → 过审 → 返回 / blocked。
+    """单条归因：生成 → 返回。不做阿里云内容安全。
 
-    参数:
-      script: 文案文本（caller 传它持有的形式——全文本或 hook+body+cta 拼接，本处一律当文本）
-      play_count: 实际播放量
-      baseline: 该用户近 30 天均值（Java 计算 owns）
-
-    返回:
-      - 成功: {diagnosis: str, suggestions: list[str]}
-      - blocked: {blocked: true}  （LLM 产出命中安全，不返回 unsafe 文本）
+    返回: {diagnosis: str, suggestions: list[str]}
     """
     messages = _build_single_messages(script, play_count, baseline)
     result = await chat("attribution", messages, json_schema=ATTRIBUTION_SINGLE_SCHEMA)
     if not isinstance(result, dict):
         result = {}
-    # 硬不变量：LLM 用户可见产出过审后展示
-    if not await check(_single_to_text(result)):
-        return {"blocked": True}
     return {
         "diagnosis": result.get("diagnosis", ""),
         "suggestions": list(result.get("suggestions", []) or []),
@@ -189,22 +146,14 @@ async def attribution_single(script: str, play_count: int, baseline: float) -> d
 
 
 async def attribution_weekly(user_id: int, scripts: list[dict[str, Any]]) -> dict[str, Any]:
-    """周归因卡：生成 → 过审 → 返回 / blocked。
+    """周归因卡：生成 → 返回。不做阿里云内容安全。
 
-    参数:
-      user_id: 创作者 ID（Java 传入真实 uid；skill 不鉴权——X-Service-Token + 内网是信任边界）
-      scripts: 本周 scripts（Java 组装，含 play_count/review_state/baseline/script 等）
-
-    返回:
-      - 成功: {summary, wins:[...], gaps:[...], next_focus}
-      - blocked: {blocked: true}
+    返回: {summary, wins:[...], gaps:[...], next_focus}
     """
     messages = _build_weekly_messages(user_id, scripts)
     result = await chat("attribution", messages, json_schema=WEEKLY_SCHEMA)
     if not isinstance(result, dict):
         result = {}
-    if not await check(_weekly_to_text(result)):
-        return {"blocked": True}
     return {
         "summary": result.get("summary", ""),
         "wins": list(result.get("wins", []) or []),

@@ -1,9 +1,7 @@
-"""拆视频 skill 测试：mock transcribe/llm/safety/db seam，绝不发真实网络/DB 请求。
+"""拆视频 skill 测试：mock transcribe/llm/db seam，绝不发真实网络/DB 请求。
 
 覆盖：
-- /ai/analyze/video/text 同步：UGC 安全 → LLM 结构化 → 输出过审 → analyze_task(done+result) → 返回结构
-- /ai/analyze/video/text UGC 命中安全 → {blocked:true}，不调 chat、不写 result
-- /ai/analyze/video/text LLM 输出命中安全 → {blocked:true}，不写 result
+- /ai/analyze/video/text 同步：LLM 结构化 → analyze_task(done+result) → 返回结构（无内容安全）
 - /ai/analyze/video/link 202：endpoint 先写 status=running+updated_at，再 BackgroundTasks 跑 transcribe→结构化→done
 - /ai/analyze/video/link 转写 DataSourceError → status=failed+error
 - 202 路径在 background task 启动前已写 running（调用顺序断言）
@@ -24,14 +22,6 @@ from app.datasource import DataSourceError
 
 
 # ---- fakes -----------------------------------------------------------------
-
-async def _safe(_t):
-    return True
-
-
-async def _unsafe(_t):
-    return False
-
 
 async def _fake_chat_structure(*args, **kwargs):
     """模拟 GLM 结构化输出（4 字段文本）。"""
@@ -60,14 +50,13 @@ class _FakePool:
 
 @pytest.mark.asyncio
 async def test_video_text_done_writes_result_and_returns_structure(monkeypatch):
-    """UGC 安全 + LLM 输出安全 → 写 analyze_task(done, progress=100, result) → 返回结构。"""
+    """LLM 结构化 → 写 analyze_task(done, progress=100, result) → 返回结构（无内容安全）。"""
     calls: list[dict] = []
 
     async def _update_task(task_id, *, status=None, progress=None, result=None, error=None):
         calls.append({"task_id": task_id, "status": status, "progress": progress,
                        "result": result, "error": error})
 
-    monkeypatch.setattr("app.skills.video_analyze.graph.check", _safe)
     monkeypatch.setattr("app.skills.video_analyze.graph.chat", _fake_chat_structure)
     monkeypatch.setattr("app.skills.video_analyze.graph.update_task", _update_task)
 
@@ -82,57 +71,6 @@ async def test_video_text_done_writes_result_and_returns_structure(monkeypatch):
     assert dones[0]["progress"] == 100
     assert dones[0]["result"]["structure"] == res["structure"]
     assert dones[0]["task_id"] == 42
-
-
-@pytest.mark.asyncio
-async def test_video_text_blocked_ugc_returns_blocked_and_skips_llm(monkeypatch):
-    """transcript 命中安全 → {blocked:true}，不调 chat、不写 result。"""
-    chat_calls = {"n": 0}
-    update_calls: list[dict] = []
-
-    async def _chat(*a, **kw):
-        chat_calls["n"] += 1
-        return {"structure": "x"}
-
-    async def _update_task(task_id, *, status=None, progress=None, result=None, error=None):
-        update_calls.append({"status": status, "result": result})
-
-    monkeypatch.setattr("app.skills.video_analyze.graph.check", _unsafe)
-    monkeypatch.setattr("app.skills.video_analyze.graph.chat", _chat)
-    monkeypatch.setattr("app.skills.video_analyze.graph.update_task", _update_task)
-
-    from app.skills.video_analyze.graph import structure_video
-    res = await structure_video(task_id=1, transcript="违规")
-
-    assert res == {"blocked": True}
-    assert chat_calls["n"] == 0
-    # 不写 done/result
-    assert all(c["status"] != "done" for c in update_calls)
-
-
-@pytest.mark.asyncio
-async def test_video_text_blocked_llm_output_returns_blocked(monkeypatch):
-    """LLM 输出命中安全 → {blocked:true}，不写 result。"""
-    update_calls: list[dict] = []
-
-    async def _update_task(task_id, *, status=None, progress=None, result=None, error=None):
-        update_calls.append({"status": status, "result": result})
-
-    # check 第一次（UGC）安全，第二次（LLM 输出）不安全
-    seq = iter([True, False])
-
-    async def _check(_t):
-        return next(seq)
-
-    monkeypatch.setattr("app.skills.video_analyze.graph.check", _check)
-    monkeypatch.setattr("app.skills.video_analyze.graph.chat", _fake_chat_structure)
-    monkeypatch.setattr("app.skills.video_analyze.graph.update_task", _update_task)
-
-    from app.skills.video_analyze.graph import structure_video
-    res = await structure_video(task_id=1, transcript="一段文案")
-
-    assert res == {"blocked": True}
-    assert all(c["status"] != "done" for c in update_calls)
 
 
 # ---- video/link 202 异步路径 -----------------------------------------------
@@ -156,11 +94,14 @@ async def test_video_link_done_transcribe_then_structure_then_done(monkeypatch):
             author="a",
         )
 
-    async def _transcribe(media):
+    async def _transcribe(media, *, on_progress=None):
         # 原始分享链不得传入 transcribe——必须收到 resolve_media 产出的 MediaRef。
         captured["transcribe_arg"] = media
         assert isinstance(media, MediaRef)
         assert media.download_url.startswith("https://cdn")
+        if on_progress is not None:
+            await on_progress(0.5)
+            await on_progress(1.0)
         return "转写文本"
 
     async def _update_task(task_id, *, status=None, progress=None, result=None, error=None):
@@ -168,7 +109,6 @@ async def test_video_link_done_transcribe_then_structure_then_done(monkeypatch):
 
     monkeypatch.setattr(vg, "resolve_media", _resolve)
     monkeypatch.setattr(vg, "transcribe", _transcribe)
-    monkeypatch.setattr(vg, "check", _safe)
     monkeypatch.setattr(vg, "chat", _fake_chat_structure)
     monkeypatch.setattr(vg, "update_task", _update_task)
     # 心跳打到假 pool（不报错即可）
@@ -186,6 +126,14 @@ async def test_video_link_done_transcribe_then_structure_then_done(monkeypatch):
     # running（bg 启动）→ done
     assert "running" in statuses
     assert statuses[-1] == "done"
+    # 阶段进度：启动 5 → resolve≥20 → 转写推进 → 结构化前≥90 → done 100
+    progress_seq = [c["progress"] for c in calls if c["progress"] is not None]
+    assert progress_seq[0] == 5
+    assert any(p >= 20 for p in progress_seq)
+    assert any(p >= 90 for p in progress_seq)
+    assert progress_seq[-1] == 100
+    # 单调不减（允许同值重复写）
+    assert progress_seq == sorted(progress_seq)
     done = [c for c in calls if c["status"] == "done"][0]
     assert done["progress"] == 100
     assert done["result"]["structure"]
@@ -206,7 +154,7 @@ async def test_video_link_failed_on_transcribe_datasource_error(monkeypatch):
             headers={"Referer": "https://www.douyin.com/"},
         )
 
-    async def _transcribe(media):
+    async def _transcribe(media, *, on_progress=None):
         raise DataSourceError("asr boom")
 
     async def _update_task(task_id, *, status=None, progress=None, result=None, error=None):
@@ -245,7 +193,7 @@ async def test_video_link_sets_running_before_background(monkeypatch):
             headers={"Referer": "https://www.douyin.com/"},
         )
 
-    async def _transcribe(url):
+    async def _transcribe(url, *, on_progress=None):
         order.append("transcribe")
         return "t"
 
@@ -256,7 +204,6 @@ async def test_video_link_sets_running_before_background(monkeypatch):
     monkeypatch.setattr(vg, "resolve_media", _resolve)
     monkeypatch.setattr(vg, "transcribe", _transcribe)
     monkeypatch.setattr(vg, "chat", _chat)
-    monkeypatch.setattr(vg, "check", _safe)
     monkeypatch.setattr(vg, "update_task", _update_task)
     monkeypatch.setattr(settings, "SERVICE_TOKEN", "test-secret")
 
@@ -307,13 +254,12 @@ async def test_heartbeat_touches_updated_at_during_long_transcribe(monkeypatch):
             headers={"Referer": "https://www.douyin.com/"},
         )
 
-    async def _slow_transcribe(url):
+    async def _slow_transcribe(url, *, on_progress=None):
         await asyncio.sleep(0.05)
         return "慢转写结果"
 
     monkeypatch.setattr(vg, "resolve_media", _resolve)
     monkeypatch.setattr(vg, "transcribe", _slow_transcribe)
-    monkeypatch.setattr(vg, "check", _safe)
     monkeypatch.setattr(vg, "chat", _fake_chat_structure)
 
     pool = _FakePool()

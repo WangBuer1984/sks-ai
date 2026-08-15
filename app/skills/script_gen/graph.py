@@ -1,13 +1,13 @@
-"""文案生成 LangGraph：retrieve → generate → safety → (rewrite once) → done/blocked。
+"""文案生成 LangGraph：retrieve → generate → done。
 
 设计文档 §5 + §4.1：
 - script_gen 用 glm-4.7 thinking off（MODEL_FOR["script_gen"]）。
 - 输出三段 {hook, body, cta}，每段为 {sentences: [{idx, text}]}——逐句编辑（V1.1）的数据基础。
-- 无流式（§5.1 硬不变量）：生成完整 → 内容安全 → 一次性返回 JSON。
-- 安全命中则重写一次再查，仍命中返回 {blocked: true}——**仅一次重写**，不循环。
+- 无流式（§5.1 硬不变量）：生成完整 → 一次性返回 JSON。
+- **不调阿里云内容安全**：创作产出交给大模型自身合规；阿里云只审用户输入/录音。
 
-模块级别名 chat / check / retrieve_b_cards 是测试 monkeypatch 目标
-（app.skills.script_gen.graph.chat / .check / .retrieve_b_cards）。
+模块级别名 chat / retrieve_b_cards 是测试 monkeypatch 目标
+（app.skills.script_gen.graph.chat / .retrieve_b_cards）。
 """
 
 from __future__ import annotations
@@ -22,11 +22,9 @@ log = logging.getLogger(__name__)
 
 from app.llm.client import glm_client
 from app.rag.retrieve import retrieve_b_cards as _retrieve_b_cards
-from app.safety.content_safety import check as _check
 
-# 模块级别名——测试 monkeypatch 目标（app.skills.script_gen.graph.chat / .check / .retrieve_b_cards）
+# 模块级别名——测试 monkeypatch 目标
 chat = glm_client.chat
-check = _check
 retrieve_b_cards = _retrieve_b_cards
 
 
@@ -72,9 +70,6 @@ class ScriptGenState(TypedDict, total=False):
     cards: list[Any]
     cited_card_ids: list[int]
     script: dict[str, Any]
-    safety_passed: bool
-    rewrite_attempted: bool
-    blocked: bool
 
 
 # ---- prompt 构建 -----------------------------------------------------------
@@ -103,7 +98,7 @@ def _build_messages(state: ScriptGenState) -> list[dict[str, str]]:
         "你是一名专业口播视频文案创作者。根据选题、定位档案和知识库卡片，"
         "生成一段口播文案。文案分为三段：hook（开场钩子）、body（正文内容）、cta（结尾引导）。"
         "每段由若干句子组成，每句需有 idx（从 0 开始）和 text（单句文本）。"
-        "内容须符合平台调性，口吻与定位档案一致，不得包含违禁内容。"
+        "内容须符合平台调性，口吻与定位档案一致。"
     )
     user = (
         f"平台: {platform}\n"
@@ -117,39 +112,6 @@ def _build_messages(state: ScriptGenState) -> list[dict[str, str]]:
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
 
-def _build_rewrite_messages(state: ScriptGenState) -> list[dict[str, str]]:
-    """构造重写 prompt：原稿 + 安全未通过指令（重写一次，非循环）。"""
-    script = state.get("script", {})
-    script_text = _script_to_text(script)
-
-    system = (
-        "你是一名专业口播视频文案创作者。之前生成的文案未通过内容安全审核，"
-        "请重新生成一段合规的口播文案，保持原意但移除任何违禁内容。"
-        "文案分为三段：hook（开场钩子）、body（正文内容）、cta（结尾引导）。"
-        "每段由若干句子组成，每句需有 idx（从 0 开始）和 text（单句文本）。"
-    )
-    user = (
-        f"平台: {state['platform']}\n"
-        f"选题: {state['topic'].get('title', '')}\n"
-        f"定位档案:\n{json.dumps(state.get('profile', {}), ensure_ascii=False, indent=2)}\n"
-        f"原稿（未通过安全审核）:\n{script_text}\n\n"
-        "请重新生成合规的三段文案（hook/body/cta）。"
-    )
-    return [{"role": "system", "content": system}, {"role": "user", "content": user}]
-
-
-def _script_to_text(script: dict[str, Any]) -> str:
-    """把三段结构化文案拼接为纯文本（用于内容安全检查）。"""
-    parts: list[str] = []
-    for section in ("hook", "body", "cta"):
-        section_data = script.get(section, {}) or {}
-        for s in section_data.get("sentences", []):
-            text = s.get("text", "") if isinstance(s, dict) else str(s)
-            if text:
-                parts.append(text)
-    return " ".join(parts)
-
-
 # ---- LangGraph nodes -------------------------------------------------------
 
 async def _retrieve_node(state: ScriptGenState) -> dict[str, Any]:
@@ -157,8 +119,6 @@ async def _retrieve_node(state: ScriptGenState) -> dict[str, Any]:
 
     RAG 检索是 best-effort：若 embed/DB 不可达（如 GLM API 未配置、DB 未起），
     返回空列表——稿仍能生成（只是无 cited_card_ids），不阻断生成流程。
-    生产环境 embed/DB 应可用；此降级保证测试（未 mock retrieve 时）与
-    瞬时故障不致整体 500。
     """
     try:
         cards = await retrieve_b_cards(
@@ -178,51 +138,15 @@ async def _generate_node(state: ScriptGenState) -> dict[str, Any]:
     return {"script": script}
 
 
-async def _safety_node(state: ScriptGenState) -> dict[str, Any]:
-    """内容安全检查。命中且未重写 → 走重写；命中且已重写 → blocked。"""
-    text = _script_to_text(state.get("script", {}))
-    safe = await check(text)
-    if safe:
-        return {"safety_passed": True}
-    # 不安全
-    if state.get("rewrite_attempted"):
-        return {"blocked": True, "safety_passed": False}
-    return {"safety_passed": False}  # 触发重写
-
-
-async def _rewrite_node(state: ScriptGenState) -> dict[str, Any]:
-    """重写一次（安全命中后），非循环——仅一次。"""
-    messages = _build_rewrite_messages(state)
-    script = await chat("script_gen", messages, json_schema=SCRIPT_SCHEMA)
-    return {"script": script, "rewrite_attempted": True}
-
-
-def _safety_router(state: ScriptGenState) -> str:
-    """safety → done / blocked / rewrite。"""
-    if state.get("blocked"):
-        return "blocked"
-    if state.get("safety_passed"):
-        return "done"
-    return "rewrite"
-
-
 # ---- graph build -----------------------------------------------------------
 
 def _build_graph():
     g: StateGraph = StateGraph(ScriptGenState)
     g.add_node("retrieve", _retrieve_node)
     g.add_node("generate", _generate_node)
-    g.add_node("safety", _safety_node)
-    g.add_node("rewrite", _rewrite_node)
     g.set_entry_point("retrieve")
     g.add_edge("retrieve", "generate")
-    g.add_edge("generate", "safety")
-    g.add_conditional_edges(
-        "safety",
-        _safety_router,
-        {"rewrite": "rewrite", "done": END, "blocked": END},
-    )
-    g.add_edge("rewrite", "safety")
+    g.add_edge("generate", END)
     return g.compile()
 
 
@@ -238,11 +162,10 @@ async def generate_script(
     platform: str,
     duration: str = "45",
 ) -> dict[str, Any]:
-    """文案生成入口：retrieve → generate → safety → (rewrite once) → done/blocked。
+    """文案生成入口：retrieve → generate → 返回三段。
 
-    返回:
-      - 成功: {hook, body, cta, cited_card_ids: [...]}
-      - blocked: {blocked: true}
+    返回: {hook, body, cta, cited_card_ids: [...]}
+    不做阿里云内容安全（创作链路交给大模型自身合规）。
     """
     initial: ScriptGenState = {
         "user_id": user_id,
@@ -250,13 +173,8 @@ async def generate_script(
         "profile": profile,
         "platform": platform,
         "duration": duration,
-        "rewrite_attempted": False,
-        "safety_passed": False,
-        "blocked": False,
     }
     result = await _graph.ainvoke(initial)
-    if result.get("blocked"):
-        return {"blocked": True}
     script = result.get("script", {})
     return {
         "hook": script.get("hook", {}),

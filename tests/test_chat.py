@@ -54,6 +54,23 @@ async def test_chat_with_json_schema_uses_structured_output():
     assert result["model_used"] == "glm-4.7"
 
 
+async def test_chat_injects_schema_title_when_missing():
+    """langchain function_calling 要求顶层 title；缺省用 skill 名兜底。"""
+    held: dict = {}
+
+    class _CaptureLLM(_FakeLLM):
+        def with_structured_output(self, schema, method=None):
+            held["schema"] = schema
+            held["method"] = method
+            return super().with_structured_output(schema, method=method)
+
+    client = GLMClient(llm_factory=lambda spec: _CaptureLLM(spec))
+    schema = {"type": "object", "properties": {"x": {"type": "string"}}}
+    await client.chat("script_gen", [{"role": "user", "content": "x"}], json_schema=schema)
+    assert held["schema"]["title"] == "script_gen"
+    assert held["method"] == "function_calling"
+
+
 async def test_chat_unknown_skill_raises():
     client = GLMClient(llm_factory=_fake_factory)
     with pytest.raises(KeyError):

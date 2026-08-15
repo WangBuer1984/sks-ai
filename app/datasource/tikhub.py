@@ -10,16 +10,19 @@
   - get_sec_user_id:           GET /api/v1/douyin/web/get_sec_user_id?url=
   - fetch_user_post_videos:    GET /api/v1/douyin/app/v3/fetch_user_post_videos?sec_user_id=&count=&max_cursor=
   - fetch_one_video_by_share:  GET /api/v1/douyin/web/fetch_one_video_by_share_url?url=
-  - fetch_hot_total_list:      GET /api/v1/douyin/billboard/fetch_hot_total_list
+  - fetch_hot_total_list:      GET /api/v1/douyin/billboard/fetch_hot_total_list?page=&page_size=
+                               （page/page_size 必填，缺则 422）
+  - fetch_video_statistics:    GET /api/v1/douyin/app/v3/fetch_video_statistics?aweme_ids=
+                               （每次最多 2 个；补播放/点赞/评论/分享/收藏）
 
 接口路径（视频号，单视频）：
   - fetch_video_detail:        POST /api/v1/wechat_channels/v2/fetch_video_detail
                                body ``{share_url, raw:false}`` → media.full_url + decode_key
 
-响应形状：TikHub 统一包络 ``{code, request_id, message, data: {...}}``；抖音 aweme 字段
-``desc``（标题）/``statistics.play_count``/``statistics.digg_count``（收藏）/``video.play_addr.url_list``
-（下载直链）。**aweme_list / aweme_detail / hot_list 的精确嵌套层级需联调期用真实 key
-核对**——此处解析按 TikHub 官方文档的常见形状，结构正确但未用真实 key 验证。
+响应形状：TikHub 统一包络 ``{code, request_id, message, data: {...}}``。抖音：
+``desc``/``create_time``/``text_extra``/``statistics.{play,digg,comment,share,collect}_count``；
+列表常缺播放 → 补调 statistics。视频号：``title``/``create_time``/
+``read/like/fav/forward/comment_count``。
 
 失败语义：HTTP 非 2xx、网络异常、业务 code != 200 → 统一抛 ``DataSourceError``，
 Task 3.2/3.3 捕获后翻译（拆账号全量失败 → 全额退款 + 引导视频粘贴，PRD §11.3）。
@@ -36,7 +39,8 @@ import logging
 import re
 import time
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Literal
 from urllib.parse import urlparse
 
@@ -71,6 +75,14 @@ _PATH_GET_SEC_USER_ID = "/api/v1/douyin/web/get_sec_user_id"
 _PATH_USER_POST_VIDEOS = "/api/v1/douyin/app/v3/fetch_user_post_videos"
 _PATH_ONE_VIDEO_BY_SHARE = "/api/v1/douyin/web/fetch_one_video_by_share_url"
 _PATH_HOT_TOTAL_LIST = "/api/v1/douyin/billboard/fetch_hot_total_list"
+_PATH_VIDEO_STATISTICS = "/api/v1/douyin/app/v3/fetch_video_statistics"
+
+# 抖音热点总榜分页：TikHub 把 page/page_size/type 列为必填 query（缺则 422）。
+# type=snapshot=按时刻取当前热榜（range=按时间范围，今日热点不需要）。
+# page_size 取 50 覆盖整张总榜；过大可能被上游拒，联调期如需再调。
+_HOT_BOARD_PAGE = 1
+_HOT_BOARD_PAGE_SIZE = 50
+_HOT_BOARD_TYPE = "snapshot"
 _PATH_CHANNELS_VIDEO_DETAIL = "/api/v1/wechat_channels/v2/fetch_video_detail"
 _PATH_CHANNELS_USER_VIDEOS = "/api/v1/wechat_channels/v2/fetch_user_videos"
 
@@ -111,14 +123,32 @@ async def _sleep(seconds: float) -> None:
 
 @dataclass
 class VideoMeta:
-    """单个视频元数据。供 Task 3.2 拆视频/拆账号消费。"""
+    """单个视频元数据。供 Task 3.2 拆视频/拆账号消费。
+
+    互动字段语义（对齐 TikHub）：
+    - ``like_count`` = digg（点赞）/ 视频号 like_count
+    - ``collect_count`` / ``fav_count`` = 收藏（抖音 collect；视频号 fav）。``fav_count``
+      保留给历史 DB 列名，值恒等于 ``collect_count``。
+    - ``comment_count`` / ``share_count`` / ``play_count`` 各自独立。
+    - ``duration_sec`` = 时长（秒）；无则 None。抖音 ``video.duration`` 为毫秒，视频号
+      ``media.duration`` 多为秒，解析时归一。
+    """
     title: str
     play_count: int | None
-    fav_count: int
+    fav_count: int  # = collect_count（收藏），非 digg
     download_url: str
     author: str = ""  # aweme author.nickname / author.nick_name
     decode_key: str | None = None  # 视频号 CDN 解码键；抖音无需解码，留 None
     platform: str = "douyin"  # "douyin" / "wechat_channels"；驱动 media_ref 装配分支
+    description: str = ""
+    tags: list[str] = field(default_factory=list)
+    published_at: int | None = None  # unix 秒；无则 None
+    like_count: int = 0
+    comment_count: int = 0
+    share_count: int = 0
+    collect_count: int = 0
+    duration_sec: int | None = None  # 时长秒；上游无则 None
+    aweme_id: str | None = None  # 抖音作品 id，供 statistics 补播放
 
 
 @dataclass
@@ -142,6 +172,21 @@ def _headers() -> dict[str, str]:
     return {"Authorization": f"Bearer {settings.TIKHUB_API_KEY}"}
 
 
+def _body_says_retry(resp: httpx.Response) -> bool:
+    """TikHub 瞬时故障 400 的判定：body（message/detail 等）大小写不敏感含 'retry'。
+
+    TikHub 把上游瞬时故障误标成 HTTP 400 + body 含 "Please retry."（如
+    ``{"detail":{"message":"Request failed. Please retry. ..."}}``）。属上游不规范行为：
+    按字面「4xx 不重试」会把可恢复错误打成 precheck/拆账号失败。
+
+    判定直接对 ``resp.text`` 做 lowercase 子串匹配——覆盖 detail 为对象
+    （{message: "Please retry."}）或列表（422 验证错误，不含 retry）等各种嵌套形状，
+    无需脆弱的 JSON 路径假设。非通用 4xx 重试：仅此窄口触发，401/403/404、无 retry
+    字样的 400 仍一次抛。
+    """
+    return "retry" in (resp.text or "").lower()
+
+
 async def _request_json(
     client: httpx.AsyncClient,
     method: str,
@@ -155,7 +200,9 @@ async def _request_json(
 
     ``retry=True``（默认，供 GET）：瞬时传输错误与 HTTP 5xx 最多
     ``_RETRY_ATTEMPTS`` 次。``retry=False``（POST 计费）：单次尝试，失败立即
-    ``DataSourceError``。4xx / 业务 code!=200 从不重试。
+    ``DataSourceError``。4xx / 业务 code!=200 从不重试——**例外**：TikHub 把瞬时
+    上游故障误标成 400 + body 含 "retry"（上游不规范，非通用 4xx 重试），此窄口
+    与 5xx 同一套 backoff 重试；401/403/404、无 retry 字样的 400 仍一次抛。
     """
     url = f"{_base_url()}{path}"
     attempts = _RETRY_ATTEMPTS if retry else 1
@@ -198,8 +245,20 @@ async def _request_json(
                 await _sleep(_RETRY_BACKOFFS[attempt])
                 continue
             raise DataSourceError(f"tikhub http {resp.status_code} ({path}): {resp.text[:200]}")
+        # TikHub 瞬时故障误标 400 + body 含 "retry"（上游不规范；非通用 4xx 重试）——
+        # 窄口重试，次数/backoff 与 5xx 同一套。仅 status==400 且 _body_says_retry 触发。
+        if resp.status_code == 400 and _body_says_retry(resp):
+            if attempt < attempts - 1:
+                log.warning(
+                    "tikhub http 400 retryable (%s) attempt %d/%d, retrying: %s",
+                    path, attempt + 1, attempts, resp.text[:200],
+                )
+                last_exc = DataSourceError(f"tikhub http 400 ({path}): {resp.text[:200]}")
+                await _sleep(_RETRY_BACKOFFS[attempt])
+                continue
+            raise DataSourceError(f"tikhub http 400 ({path}): {resp.text[:200]}")
         if resp.status_code < 200 or resp.status_code >= 300:
-            # 4xx —— 不重试
+            # 其余 4xx —— 不重试
             raise DataSourceError(f"tikhub http {resp.status_code} ({path}): {resp.text[:200]}")
         try:
             body = resp.json()
@@ -258,21 +317,186 @@ def _safe_int(value: object, default: int = 0) -> int:
         return default
 
 
+def _title_from_desc(desc: str) -> str:
+    """描述首句作标题（≤80 字）；空则空串。"""
+    text = (desc or "").strip()
+    if not text:
+        return ""
+    first = re.split(r"[\n。！？]", text, maxsplit=1)[0].strip() or text
+    return first[:80]
+
+
+def _extract_hashtags(*texts: object) -> list[str]:
+    """从 text_extra / cha_list / 正文 #话题 抽标签，去重保序。"""
+    seen: list[str] = []
+    for blob in texts:
+        if isinstance(blob, list):
+            for it in blob:
+                if not isinstance(it, dict):
+                    continue
+                name = (
+                    it.get("hashtag_name")
+                    or it.get("cha_name")
+                    or it.get("tag_name")
+                    or it.get("name")
+                )
+                if isinstance(name, str) and name.strip():
+                    t = name.strip().lstrip("#")
+                    if t and t not in seen:
+                        seen.append(t)
+        elif isinstance(blob, str):
+            for m in re.finditer(r"#([^\s#]+)", blob):
+                t = m.group(1).strip()
+                if t and t not in seen:
+                    seen.append(t)
+    return seen
+
+
+def _unix_published(value: object) -> int | None:
+    """create_time → unix 秒；非法 / 0 → None。"""
+    if value is None or value is False:
+        return None
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return None
+    # 毫秒兜底
+    if n > 10_000_000_000:
+        n = n // 1000
+    return n if n > 0 else None
+
+
+def _duration_sec(value: object, *, unit: str = "auto") -> int | None:
+    """时长 → 秒。``unit``: ``ms`` / ``s`` / ``auto``（≥1000 当毫秒）。0/非法 → None。"""
+    if value is None or value is False:
+        return None
+    try:
+        n = float(value)
+    except (TypeError, ValueError):
+        return None
+    if n <= 0:
+        return None
+    if unit == "ms" or (unit == "auto" and n >= 1000):
+        n = n / 1000.0
+    sec = int(round(n))
+    return sec if sec > 0 else None
+
+
 def _parse_video(item: dict) -> VideoMeta:
     stats = item.get("statistics") or {}
-    play_addr = (item.get("video") or {}).get("play_addr") or {}
+    if not isinstance(stats, dict):
+        stats = {}
+    video = item.get("video") or {}
+    if not isinstance(video, dict):
+        video = {}
+    play_addr = video.get("play_addr") or {}
     url_list = play_addr.get("url_list") or []
     author_obj = item.get("author") or {}
     author = str(author_obj.get("nickname") or author_obj.get("nick_name") or "")
     first = url_list[0] if url_list else None
     download_url = str(first).strip() if first not in (None, "") else ""
+    desc = str(item.get("desc") or "")
+    like = _safe_int(stats.get("digg_count"))
+    collect = _safe_int(stats.get("collect_count"))
+    aweme_id = item.get("aweme_id") or item.get("awemeId") or item.get("id")
+    aweme_id_s = str(aweme_id).strip() if aweme_id not in (None, "") else None
+    tags = _extract_hashtags(
+        item.get("text_extra"),
+        item.get("cha_list"),
+        desc,
+    )
+    # 抖音文档：video.duration 毫秒；偶发顶层 duration
+    duration = _duration_sec(video.get("duration"), unit="ms")
+    if duration is None:
+        duration = _duration_sec(item.get("duration"), unit="auto")
     return VideoMeta(
-        title=str(item.get("desc") or ""),
+        title=_title_from_desc(desc) or desc[:80],
         play_count=_safe_int(stats.get("play_count")),
-        fav_count=_safe_int(stats.get("digg_count")),
+        fav_count=collect,  # DB 列 fav = 收藏
         download_url=download_url,
         author=author,
+        description=desc,
+        tags=tags,
+        published_at=_unix_published(item.get("create_time")),
+        like_count=like,
+        comment_count=_safe_int(stats.get("comment_count")),
+        share_count=_safe_int(stats.get("share_count")),
+        collect_count=collect,
+        duration_sec=duration,
+        aweme_id=aweme_id_s,
+        platform="douyin",
     )
+
+
+def _apply_statistics_blob(meta: VideoMeta, stats: dict) -> None:
+    """用 statistics 接口字段覆盖 meta（有值才盖）。"""
+    if not isinstance(stats, dict):
+        return
+    play = stats.get("play_count")
+    if play is not None:
+        meta.play_count = _safe_int(play, meta.play_count)
+    digg = stats.get("digg_count")
+    if digg is not None:
+        meta.like_count = _safe_int(digg, meta.like_count)
+    comment = stats.get("comment_count")
+    if comment is not None:
+        meta.comment_count = _safe_int(comment, meta.comment_count)
+    share = stats.get("share_count")
+    if share is not None:
+        meta.share_count = _safe_int(share, meta.share_count)
+    collect = stats.get("collect_count")
+    if collect is not None:
+        c = _safe_int(collect, meta.collect_count)
+        meta.collect_count = c
+        meta.fav_count = c
+
+
+async def _enrich_douyin_statistics(
+    client: httpx.AsyncClient, metas: list[VideoMeta]
+) -> list[VideoMeta]:
+    """按 aweme_id 批量补调 fetch_video_statistics（每次最多 2 个）。失败单批跳过不抛。"""
+    id_to_meta: dict[str, VideoMeta] = {
+        m.aweme_id: m for m in metas if m.aweme_id and m.platform == "douyin"
+    }
+    ids = list(id_to_meta.keys())
+    for i in range(0, len(ids), 2):
+        batch = ids[i : i + 2]
+        try:
+            body = await _get_json(
+                client, _PATH_VIDEO_STATISTICS, {"aweme_ids": ",".join(batch)}
+            )
+        except DataSourceError as e:
+            log.warning("fetch_video_statistics failed for %s: %s", batch, e)
+            continue
+        data = body.get("data")
+        # 响应可能是 list / dict(aweme_id→stats) / {statistics_list:[]}
+        blobs: list[tuple[str | None, dict]] = []
+        if isinstance(data, list):
+            for it in data:
+                if isinstance(it, dict):
+                    aid = str(it.get("aweme_id") or it.get("id") or "") or None
+                    stats = it.get("statistics") if isinstance(it.get("statistics"), dict) else it
+                    blobs.append((aid, stats if isinstance(stats, dict) else {}))
+        elif isinstance(data, dict):
+            if any(k in data for k in ("play_count", "digg_count", "statistics")):
+                # 单条扁平
+                aid = str(data.get("aweme_id") or data.get("id") or "") or None
+                stats = data.get("statistics") if isinstance(data.get("statistics"), dict) else data
+                blobs.append((aid, stats if isinstance(stats, dict) else {}))
+            else:
+                for k, v in data.items():
+                    if isinstance(v, dict):
+                        stats = v.get("statistics") if isinstance(v.get("statistics"), dict) else v
+                        blobs.append((str(k), stats if isinstance(stats, dict) else {}))
+        # 按 id 对齐；对不上则按 batch 顺序回填
+        unmatched = list(batch)
+        for aid, stats in blobs:
+            target_id = aid if aid in id_to_meta else (unmatched.pop(0) if unmatched else None)
+            if target_id and target_id in id_to_meta:
+                _apply_statistics_blob(id_to_meta[target_id], stats)
+                if target_id in unmatched:
+                    unmatched.remove(target_id)
+    return metas
 
 
 def video_meta_to_media_ref(v: VideoMeta) -> MediaRef:
@@ -303,11 +527,21 @@ def video_meta_to_media_ref(v: VideoMeta) -> MediaRef:
 
 
 async def _resolve_sec_user_id(client: httpx.AsyncClient, url: str) -> str | None:
-    """主页 URL → sec_user_id。解析失败返回 None（precheck 据此判不可达）。"""
+    """主页 URL → sec_user_id。解析失败返回 None（precheck 据此判不可达）。
+
+    TikHub ``get_sec_user_id`` 的 ``data`` 直接是 sec_user_id 字符串（如
+    ``MS4wLjABAAAA...``），不是 ``{sec_user_id: ...}`` 字典——早期实现误当 dict 解析，
+    对真响应 ``str.get`` 抛 AttributeError。此处两种形状都兼容（dict 形状留给旧测试 mock
+    与上游可能的形状回退）。
+    """
     body = await _get_json(client, _PATH_GET_SEC_USER_ID, {"url": url})
-    data = body.get("data") or {}
-    val = data.get("sec_user_id")
-    return val if isinstance(val, str) and val else None
+    data = body.get("data")
+    if isinstance(data, str):
+        return data if data.strip() else None
+    if isinstance(data, dict):
+        val = data.get("sec_user_id")
+        return val if isinstance(val, str) and val else None
+    return None
 
 
 async def account_top_videos(url: str, n: int = 20, *, client: httpx.AsyncClient | None = None) -> list[VideoMeta]:
@@ -340,8 +574,8 @@ async def account_top_videos(url: str, n: int = 20, *, client: httpx.AsyncClient
             )
             data = body.get("data") or {}
             items = data.get("aweme_list") or data.get("list") or []
-            videos = [_parse_video(it) for it in items[:n]]
-            return videos
+            videos = [_parse_video(it) for it in items[:n] if isinstance(it, dict)]
+            return await _enrich_douyin_statistics(client, videos)
         # channels_share → 视频号账号视频列表
         username = await _resolve_channels_username(client, kind, url)
         if not username:
@@ -438,9 +672,8 @@ async def _resolve_channels_username(client: httpx.AsyncClient, kind: str, raw: 
 def _parse_channels_video(item: dict, *, fallback_author: str = "") -> VideoMeta | None:
     """视频号 ``fetch_user_videos`` 单条 → ``VideoMeta``。
 
-    与 ``channels_video_meta`` 单视频装配口径一致：``full_url`` 优先，否则
-    ``url + url_token``；``decode_key`` 有则配对透传（缺省 None，允许未加密片）；
-    ``platform="wechat_channels"``。无 media / 无 full_url → None（跳过该条）。
+    互动：read=播放 / like=点赞 / fav=收藏 / forward=分享 / comment=评论。
+    无 media / 无 full_url → None（跳过该条）。
     """
     media = item.get("media") or {}
     if not isinstance(media, dict):
@@ -452,19 +685,33 @@ def _parse_channels_video(item: dict, *, fallback_author: str = "") -> VideoMeta
         return None
     dk = media.get("decode_key") or media.get("decodeKey")
     decode_key = str(dk).strip() if dk not in (None, "") else None
-    fav = item.get("fav_count")
-    if fav is None:
-        fav = item.get("like_count")
+    title = _channels_title(item.get("title"))
+    desc = str(item.get("desc") or item.get("description") or title or "")
+    collect = _safe_int(item.get("fav_count"))
+    like = _safe_int(item.get("like_count"))
+    tags = _extract_hashtags(title, desc)
+    # 视频号：media.duration 多为秒（spike 样例 570s）；≥1000 按毫秒兜底
+    duration = _duration_sec(media.get("duration"), unit="auto")
+    if duration is None:
+        duration = _duration_sec(item.get("duration"), unit="auto")
     _read = _safe_int(item.get("read_count"))
     play_count = _read if _read > 0 else None
     return VideoMeta(
-        title=_channels_title(item.get("title")),
+        title=title or _title_from_desc(desc),
         play_count=play_count,
-        fav_count=_safe_int(fav),
+        fav_count=collect,
         download_url=full,
         author=str(item.get("nickname") or fallback_author or ""),
         decode_key=decode_key,
         platform="wechat_channels",
+        description=desc,
+        tags=tags,
+        published_at=_unix_published(item.get("create_time")),
+        like_count=like,
+        comment_count=_safe_int(item.get("comment_count")),
+        share_count=_safe_int(item.get("forward_count")),
+        collect_count=collect,
+        duration_sec=duration,
     )
 
 
@@ -481,7 +728,8 @@ async def video_meta(url: str, *, client: httpx.AsyncClient | None = None) -> Vi
         item = data.get("aweme_detail") or data.get("item") or data
         if not isinstance(item, dict) or not item:
             raise DataSourceError(f"video_meta: empty item for url {url}")
-        return _parse_video(item)
+        metas = await _enrich_douyin_statistics(client, [_parse_video(item)])
+        return metas[0]
     finally:
         if own:
             await client.aclose()
@@ -593,17 +841,32 @@ async def hot_board(*, client: httpx.AsyncClient | None = None) -> list[HotItem]
     if own:
         client = httpx.AsyncClient()
     try:
-        body = await _get_json(client, _PATH_HOT_TOTAL_LIST)
+        body = await _get_json(
+            client,
+            _PATH_HOT_TOTAL_LIST,
+            {"page": _HOT_BOARD_PAGE, "page_size": _HOT_BOARD_PAGE_SIZE, "type": _HOT_BOARD_TYPE},
+        )
+        # TikHub 热榜响应嵌套两层 data：body.data.data.objs 才是热榜数组。
+        # 外层 data 是 TikHub 统一包络 {code,data,extra,message}，内层 data 才含 {page,objs,last_update_time}。
         data = body.get("data") or {}
-        raw = data.get("hot_list") or data.get("list") or data.get("billboard_list") or []
+        inner = data.get("data") or {}
+        raw = (
+            inner.get("objs")
+            or data.get("hot_list")
+            or data.get("list")
+            or data.get("billboard_list")
+            or []
+        )
         items: list[HotItem] = []
         for r in raw:
             if not isinstance(r, dict):
                 continue
             items.append(
                 HotItem(
-                    title=str(r.get("title") or r.get("word") or ""),
-                    hot_index=int(r.get("hot_index") or r.get("rank") or 0),
+                    # 真实字段是 sentence（热点词条）；title/word 留作其它端点形状的回退。
+                    title=str(r.get("sentence") or r.get("title") or r.get("word") or ""),
+                    # hot_score=热度值（如 11914614）；rank=位次（1..N），作 fallback。
+                    hot_index=int(r.get("hot_score") or r.get("hot_index") or r.get("rank") or 0),
                     video_count=int(r.get("video_count") or 0),
                 )
             )

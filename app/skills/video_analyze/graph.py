@@ -1,30 +1,37 @@
 """拆视频 skill：单条文案 → 结构化拆解（structure / why_hot / framework / diff_hint）。
 
 两条入口（被 app/api/analyze.py 调用）：
-- ``structure_video(task_id, transcript)`` **同步**：UGC 安全 → LLM 结构化 → 输出过审 →
-  写 ``analyze_task(status='done', progress=100, result)`` → 返回结构。UGC 或输出命中安全
-  返回 ``{blocked: True}``，**不写 result**（Java 决策退/不退，与 P2 interview blocked 同口径）。
+- ``structure_video(task_id, transcript)`` **同步**：LLM 结构化 → 写
+  ``analyze_task(status='done', progress=100, result)`` → 返回结构。
 - ``analyze_video_link(task_id, url)`` **后台**（FastAPI BackgroundTasks）：set running+updated_at
   → transcribe(url)（带心跳）→ 结构化 → done+result。转写 DataSourceError → failed+error。
+
+**不做阿里云内容安全**：解析视频的转写/LLM 产出是业务分析对象（含竞品引流话术等），
+过审会误杀正常拆解；内容安全留给文案生成等用户可见创作链路。
 
 模型档位：``video_analyze`` 走 glm-4.7 thinking off（MODEL_FOR，轻量抽取/归纳——本 skill
 是单条结构化，非深度归纳，按 §5 选 thinking off）。
 
-进度语义（LOAD-BEARING，Task 3.3 按比例退款依赖）：单条 progress 0→100，``100`` 仅在结构化
-完成并写 result 后赋。无中间值（单条无中间条目概念）。
+进度语义：
+- ``video/link``（异步）：启动 5 → resolve 20 → 转写管内 20–85（里程碑 + 每 3s 缓增，
+  避免长时间停在 20）→ 结构化前 90 → done 100。失败仍全额退，中间值不参与按比例退款。
+- ``video/text``（同步）：一次写 done+100（无轮询条）。
+- 拆账号仍用「已完成条数/总数」口径（LOAD-BEARING，按比例退款）。
 
 心跳：``transcribe``（Qwen 管线，最长约 20min）期间 ``run_with_heartbeat``
 每 ``HEARTBEAT_INTERVAL``（60s）touch 一次 ``updated_at = now()``，防止 Java
 5min running-timeout 把正在转写的任务判为停滞。实现见
 ``app.datasource.media.heartbeat``（与 account_analyze 共享）。
 
-模块级别名 ``chat`` / ``check`` / ``transcribe`` / ``update_task`` / ``heartbeat`` 是测试
+模块级别名 ``chat`` / ``transcribe`` / ``update_task`` / ``heartbeat`` 是测试
 monkeypatch 目标（app.skills.video_analyze.graph.*），与 script_gen / card_gen 同模式。
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
+from contextlib import suppress
 from typing import Any
 
 from app.datasource import DataSourceError
@@ -33,7 +40,6 @@ from app.datasource.media.heartbeat import run_with_heartbeat
 from app.datasource.tikhub import resolve_media as _resolve_media
 from app.datasource.transcribe import transcribe as _transcribe
 from app.llm.client import glm_client
-from app.safety.content_safety import check as _check
 from app.skills.analyze_store import heartbeat as _heartbeat
 from app.skills.analyze_store import update_task as _update_task
 
@@ -41,7 +47,6 @@ log = logging.getLogger(__name__)
 
 # 模块级别名——测试 monkeypatch 目标
 chat = glm_client.chat
-check = _check
 transcribe = _transcribe
 update_task = _update_task
 heartbeat = _heartbeat
@@ -51,10 +56,17 @@ resolve_media = _resolve_media
 # 自 ``app.datasource.media.constants`` import（共享常量）；调用 ``run_with_heartbeat``
 # 时传 ``interval=HEARTBEAT_INTERVAL``，故测试 monkeypatch ``vg.HEARTBEAT_INTERVAL`` 仍生效。
 
+# 转写阶段进度：对齐前端 3s 轮询缓增；真实里程碑可超越缓增上限。
+_PROGRESS_CREEP_INTERVAL = 3.0
+_PROGRESS_CREEP_CAP = 72
+_TRANSCRIBE_PROGRESS_LO = 20
+_TRANSCRIBE_PROGRESS_HI = 85
+
 
 # ---- 结构化输出 schema ----------------------------------------------------
 
 VIDEO_STRUCTURE_SCHEMA: dict[str, Any] = {
+    "title": "video_analyze",
     "type": "object",
     "properties": {
         "structure": {"type": "string", "description": "视频文案结构拆解（开场/正文/结尾分段与作用）"},
@@ -77,28 +89,22 @@ def _build_messages(transcript: str) -> list[dict[str, str]]:
         "why_hot（爆火原因：受众、情绪、节奏、时机）、"
         "framework（可复用的叙事框架，抽象成套路）、"
         "diff_hint（迁移到其他账号时的差异化建议）。"
-        "基于转写文本，不要臆造，不得包含违禁内容。"
+        "基于文本，不臆造。"
     )
-    user = f"视频转写文案：\n{transcript}\n\n请输出结构化拆解（四个字段均为文本）。"
-    return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": f"转写文案：\n{transcript}\n\n请输出四字段结构化拆解。"},
+    ]
 
 
-# ---- 内部：结构化 + 双向安全 -----------------------------------------------
+# ---- 内部：结构化 ----------------------------------------------------------
 
-async def _structure_transcript(transcript: str) -> dict[str, Any] | None:
-    """UGC 已过审前提下，调 LLM 结构化 → 输出过审 → 返回结构 dict；命中返回 None。
-
-    调用方负责先对 transcript 做 UGC 安全检查（本函数不重复 UGC 检查，避免双查）。
-    返回 None 表示 LLM 输出命中安全——上游按 blocked 处理（不写 result）。
-    """
+async def _structure_transcript(transcript: str) -> dict[str, Any]:
+    """调 LLM 结构化，返回四字段 dict。不做内容安全。"""
     messages = _build_messages(transcript)
     result = await chat("video_analyze", messages, json_schema=VIDEO_STRUCTURE_SCHEMA)
     if not isinstance(result, dict):
         result = {}
-    # LLM 输出过审（文本部分会展示给用户，§5.1 硬不变量）
-    text = " ".join(str(result.get(k, "")) for k in _STRUCT_FIELDS)
-    if not await check(text):
-        return None
     return {k: result.get(k, "") for k in _STRUCT_FIELDS}
 
 
@@ -112,22 +118,11 @@ async def _structure_transcript(transcript: str) -> dict[str, Any] | None:
 # ---- 入口 1：同步结构化（/ai/analyze/video/text） ---------------------------
 
 async def structure_video(task_id: int, transcript: str) -> dict[str, Any]:
-    """UGC 安全 → LLM 结构化 → 输出过审 → 写 done+result → 返回结构。
+    """LLM 结构化 → 写 done+result → 返回结构。
 
-    返回:
-      - 成功: {structure, why_hot, framework, diff_hint}
-      - blocked: {blocked: True}  （UGC 或 LLM 输出命中安全，不写 result）
+    不做阿里云内容安全；不再返回 ``{blocked: True}``。
     """
-    # 1. UGC 安全（transcript 是用户输入/转写文本，§5.1 先审后用）
-    if not await check(transcript):
-        return {"blocked": True}
-
-    # 2. LLM 结构化 + 输出过审
     result = await _structure_transcript(transcript)
-    if result is None:
-        return {"blocked": True}
-
-    # 3. 写 done+result+progress=100+updated_at（update_task 内部保证 updated_at=now()）
     await update_task(task_id, status="done", progress=100, result=result)
     return result
 
@@ -135,17 +130,54 @@ async def structure_video(task_id: int, transcript: str) -> dict[str, Any]:
 # ---- 入口 2：后台异步（/ai/analyze/video/link） ----------------------------
 
 async def analyze_video_link(task_id: int, url: str) -> None:
-    """后台：set running → transcribe(带心跳) → 结构化 → done+result；失败 → failed+error。
+    """后台：running → resolve → transcribe(心跳+进度) → 结构化 → done；失败 → failed。
 
-    endpoint 在返回 202 前已写一次 running，本函数开头再写一次 running+updated_at，
-    保证 background 启动瞬间 updated_at 是最新的（Java 看到的是 running 而非 stale-queued）。
+    转写期间：管线里程碑映射 20–85，并每 3s 缓增（单调不回退），避免进度条长期卡死。
     """
-    await update_task(task_id, status="running", progress=0)
+    await update_task(task_id, status="running", progress=5)
+    progress_state = {"p": 5}
+    progress_lock = asyncio.Lock()
+
+    async def _set_progress(p: int) -> None:
+        """单调推进任务 progress（永不回退）。"""
+        p = max(0, min(99, int(p)))  # 100 仅在最终 done 写入
+        async with progress_lock:
+            if p <= progress_state["p"]:
+                return
+            progress_state["p"] = p
+            await update_task(task_id, progress=p)
+
+    async def _on_transcribe_frac(frac: float) -> None:
+        lo, hi = _TRANSCRIBE_PROGRESS_LO, _TRANSCRIBE_PROGRESS_HI
+        await _set_progress(lo + int(max(0.0, min(1.0, frac)) * (hi - lo)))
+
+    async def _creep_during_transcribe() -> None:
+        """下载/转码等长等待无里程碑时，每 3s +2，封顶 72，防止用户以为卡死。"""
+        try:
+            while True:
+                await asyncio.sleep(_PROGRESS_CREEP_INTERVAL)
+                async with progress_lock:
+                    cur = progress_state["p"]
+                    if cur >= _PROGRESS_CREEP_CAP:
+                        continue
+                    nxt = min(cur + 2, _PROGRESS_CREEP_CAP)
+                    if nxt > cur:
+                        progress_state["p"] = nxt
+                        await update_task(task_id, progress=nxt)
+        except asyncio.CancelledError:
+            raise
+
+    creep_task: asyncio.Task[None] | None = None
     try:
         ref = await resolve_media(url)
+        await _set_progress(20)
+        creep_task = asyncio.create_task(_creep_during_transcribe())
         transcript = await run_with_heartbeat(
-            task_id, transcribe(ref), interval=HEARTBEAT_INTERVAL
+            task_id,
+            transcribe(ref, on_progress=_on_transcribe_frac),
+            interval=HEARTBEAT_INTERVAL,
         )
+        await _set_progress(90)
         result = await _structure_transcript(transcript)
     except DataSourceError as e:
         await update_task(task_id, status="failed", error=str(e))
@@ -154,13 +186,10 @@ async def analyze_video_link(task_id: int, url: str) -> None:
         log.exception("video_link unexpected error, marking failed")
         await update_task(task_id, status="failed", error=f"{type(e).__name__}: {e}")
         return
-
-    if result is None:
-        # LLM 输出命中安全——按 failed 退款（粘文案版无重写路径，blocked 即终止）
-        await update_task(
-            task_id, status="failed",
-            error="transcript or structured output blocked by content safety",
-        )
-        return
+    finally:
+        if creep_task is not None:
+            creep_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await creep_task
 
     await update_task(task_id, status="done", progress=100, result=result)

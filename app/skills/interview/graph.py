@@ -1,23 +1,21 @@
 """定位访谈 LangGraph 状态机：guess_persona → ask(多轮) → summarize → END。
 
 设计文档 §5 + PRD §5.2（校准第一步贴素材 → AI 先猜一版人设）+ §11.4（断点续答）。
-- skill=`interview` 走 glm-4.7 thinking off（创作档，MODEL_FOR["interview"]）。
+- skill=`interview` 走 glm-4.5-air thinking off（MODEL_FOR["interview"]；4.7 单轮易超时，见 models.py）。
 - 多轮一问一答，每 `/step` 一次请求返回一次 JSON（无流式——硬不变量）。
 - AsyncPostgresSaver（生产）/ MemorySaver（测试）持久化检查点，
   thread_id=f"{user_id}:{session_id}"，同 thread_id + 新请求从 checkpoint 恢复。
   生产 main.py 启动调 set_checkpointer 注入 AsyncPostgresSaver 并 setup() 自建检查点表
   （LangGraph 私有，迁移例外）。
 - UGC（materials/user_reply）过 safety.check 后才推进；命中返回 {blocked:true} 不推进。
-- LLM 产出（问题/档案文本）返回前过 safety.check；命中返回 {blocked:true}。
+- LLM 产出（问题/档案）**不调**阿里云内容安全——创作链路交给大模型自身合规。
 
-**节点拆分（保证 interrupt 确定性）：** 每轮拆成「生成节点」（chat+check，写 state，
+**节点拆分（保证 interrupt 确定性）：** 每轮拆成「生成节点」（chat，写 state，
 无 interrupt）+「应答节点」（读 state、interrupt 等用户输入）。生成节点完成后 state
-已落 checkpoint，应答节点 re-exec 时读到的 current_question/current_safe 稳定，
-interrupt 路径确定性可重放。若把 chat+interrupt 放同一节点，re-exec 会重新调 chat
-产生不同问题、破坏 interrupt 索引重放（LangGraph interrupt 按调用序号匹配 resume 值）。
+已落 checkpoint，应答节点 re-exec 时读到的 current_question 稳定，
+interrupt 路径确定性可重放。
 
-模块级别名 chat / check 是测试 monkeypatch 目标
-（app.skills.interview.graph.chat / .check），与 script_gen 同模式。
+模块级别名 chat / check 是测试 monkeypatch 目标（check 仅审 UGC）。
 """
 
 from __future__ import annotations
@@ -151,89 +149,60 @@ def _build_summarize_messages(
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
 
-def _profile_text(profile_payload: dict[str, Any]) -> str:
-    """把 summarize 产出拼成纯文本用于内容安全检查。"""
-    p = profile_payload.get("profile", {}) or {}
-    parts = [str(v) for v in p.values()]
-    for c in profile_payload.get("a_cards", []) or []:
-        parts.append(str(c.get("title", "")))
-        parts.append(json.dumps(c.get("content", {}), ensure_ascii=False))
-    return " ".join(parts)
-
-
 # ---- LangGraph nodes（生成/应答拆分保证 interrupt 确定性）-------------------
 
 async def _guess_generate(state: InterviewState) -> dict[str, Any]:
-    """生成人设草稿 + 反馈问题，过审后写 state（无 interrupt）。"""
+    """生成人设草稿 + 反馈问题，写 state（无 interrupt）。不做阿里云过审。"""
     messages = _build_guess_messages(state.get("materials", ""))
     result = await chat("interview", messages, json_schema=_GUESS_SCHEMA)
     persona = result.get("persona", {}) if isinstance(result, dict) else {}
     question = result.get("question", "") if isinstance(result, dict) else ""
-    safe = await check(question)
-    return {"persona": persona, "current_question": question, "current_safe": safe}
+    # current_safe 恒 True：创作产出不再走阿里云；保留字段以兼容既有 interrupt 重放路径。
+    return {"persona": persona, "current_question": question, "current_safe": True}
 
 
 async def _guess_feedback(state: InterviewState) -> dict[str, Any]:
-    """interrupt 等用户确认/调整人设。current_safe 来自 state（确定性重放）。"""
+    """interrupt 等用户确认/调整人设。"""
     question = state.get("current_question", "")
-    if state.get("current_safe"):
-        feedback = interrupt({
-            "stage": "await_feedback",
-            "question": question,
-            "persona": state.get("persona", {}),
-        })
-        return {"feedback": feedback or ""}
-    # LLM 产出命中安全 → blocked，resume 后返回空 feedback 触发重猜
-    interrupt({"blocked": True, "stage": "await_feedback"})
-    return {}
+    feedback = interrupt({
+        "stage": "await_feedback",
+        "question": question,
+        "persona": state.get("persona", {}),
+    })
+    return {"feedback": feedback or ""}
 
 
 async def _ask_generate(state: InterviewState) -> dict[str, Any]:
-    """生成本轮问题，过审后写 state（无 interrupt）。"""
+    """生成本轮问题，写 state（无 interrupt）。不做阿里云过审。"""
     messages = _build_ask_messages(
         state.get("persona", {}), state.get("feedback", ""), state.get("answers", [])
     )
     result = await chat("interview", messages, json_schema=_QUESTION_SCHEMA)
     question = result.get("question", "") if isinstance(result, dict) else ""
-    safe = await check(question)
-    return {"current_question": question, "current_safe": safe}
+    return {"current_question": question, "current_safe": True}
 
 
 async def _ask_answer(state: InterviewState) -> dict[str, Any]:
-    """interrupt 等本轮回答。current_safe 来自 state（确定性重放）。"""
+    """interrupt 等本轮回答。"""
     answers = list(state.get("answers", []))
     question = state.get("current_question", "")
-    if state.get("current_safe"):
-        answer = interrupt({"stage": "ask", "question": question})
-        answers.append(answer or "")
-        return {"answers": answers}
-    # LLM 产出命中安全 → blocked，resume 后不 append，触发重生成本轮问题
-    interrupt({"blocked": True, "stage": "ask"})
+    answer = interrupt({"stage": "ask", "question": question})
+    answers.append(answer or "")
     return {"answers": answers}
 
 
 async def _summarize(state: InterviewState) -> dict[str, Any]:
-    """归纳最终档案 + A 层卡草稿。LLM 产出过审；命中返回 blocked。"""
+    """归纳最终档案 + A 层卡草稿。不做阿里云过审。"""
     messages = _build_summarize_messages(
         state.get("persona", {}), state.get("feedback", ""), state.get("answers", [])
     )
     result = await chat("interview", messages, json_schema=SUMMARIZE_SCHEMA)
     if not isinstance(result, dict):
         result = {}
-    # LLM 产出过审（硬不变量）
-    if not await check(_profile_text(result)):
-        return {"blocked": True}
     return {"profile": result}
 
 
 # ---- 路由 ------------------------------------------------------------------
-
-def _guess_router(state: InterviewState) -> str:
-    """guess_feedback 后：有 feedback → 进入提问；无（blocked 重猜）→ 重猜人设。"""
-    if state.get("feedback"):
-        return "ask_generate"
-    return "guess_generate"
-
 
 def _ask_router(state: InterviewState) -> str:
     """ask_answer 后：answers 未满 MAX_ROUNDS → 下一轮；满 → summarize。"""
@@ -247,9 +216,8 @@ def _ask_router(state: InterviewState) -> str:
 def build_graph(saver: Any) -> Any:
     """编译状态机。saver 为 checkpointer。
 
-    guess_generate → guess_feedback → [ask_generate | guess_generate（重猜）]
-    ask_generate → ask_answer → [ask_generate（下一轮/重试）| summarize]
-    summarize → END
+    guess_generate → guess_feedback → ask_generate → ask_answer
+    → [ask_generate（下一轮）| summarize] → END
     """
     g: StateGraph = StateGraph(InterviewState)
     g.add_node("guess_generate", _guess_generate)
@@ -259,11 +227,7 @@ def build_graph(saver: Any) -> Any:
     g.add_node("summarize", _summarize)
     g.set_entry_point("guess_generate")
     g.add_edge("guess_generate", "guess_feedback")
-    g.add_conditional_edges(
-        "guess_feedback",
-        _guess_router,
-        {"ask_generate": "ask_generate", "guess_generate": "guess_generate"},
-    )
+    g.add_edge("guess_feedback", "ask_generate")
     g.add_edge("ask_generate", "ask_answer")
     g.add_conditional_edges(
         "ask_answer",
@@ -340,12 +304,10 @@ async def interview_step(
     首次调用（无 checkpoint）传 materials → guess_generate 猜人设。
     后续调用传 user_reply → 从 checkpoint 恢复并推进一轮。
     UGC（materials/user_reply）命中安全 → {blocked:true}，不推进。
+    LLM 产出不做阿里云内容安全。
 
     幂等终态约定：图跑完（END）后再次 /step 必须幂等返回同一终态响应，
-    绝不在同 thread_id 上重启访谈——无论是 summarize 成功（profile 已产出）
-    还是 summarize LLM 产出命中安全（state.blocked=True，profile=None）。
-    后者曾导致 bug：done 分支只匹配 profile-is-not-None 的成功路径，
-    blocked-done 落到 `ainvoke` 重启分支，丢失全部 Q&A 与人设状态。
+    绝不在同 thread_id 上重启访谈。
     """
     thread_id = f"{user_id}:{session_id}"
     config = {"configurable": {"thread_id": thread_id}}

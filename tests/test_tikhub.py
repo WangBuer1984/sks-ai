@@ -70,7 +70,7 @@ async def test_authorization_bearer_header_sent(monkeypatch):
         captured["auth"] = _auth_header(request)
         captured["url"] = str(request.url)
         if request.url.path.endswith("get_sec_user_id"):
-            return httpx.Response(200, json={"code": 200, "data": {"sec_user_id": "SEC1"}})
+            return httpx.Response(200, json={"code": 200, "data": "SEC1"})
         return httpx.Response(
             200,
             json={
@@ -103,7 +103,7 @@ async def test_account_top_videos_parses_n_video_meta(monkeypatch):
     async def handler(request: httpx.Request):
         path = request.url.path
         if path.endswith("get_sec_user_id"):
-            return httpx.Response(200, json={"code": 200, "data": {"sec_user_id": "SEC123"}})
+            return httpx.Response(200, json={"code": 200, "data": "SEC123"})
         if path.endswith("fetch_user_post_videos"):
             assert "sec_user_id=SEC123" in str(request.url)
             count = int(request.url.params.get("count", "0"))
@@ -112,12 +112,21 @@ async def test_account_top_videos_parses_n_video_meta(monkeypatch):
                 {
                     "aweme_id": str(i),
                     "desc": f"title-{i}",
-                    "statistics": {"play_count": 100 * i, "digg_count": i},
+                    "statistics": {
+                        "play_count": 100 * i,
+                        "digg_count": i,
+                        "collect_count": 10 * i,
+                        "comment_count": 2 * i,
+                        "share_count": i,
+                    },
                     "video": {"play_addr": {"url_list": [f"https://dl/{i}.mp4"]}},
                 }
                 for i in range(3)
             ]
             return httpx.Response(200, json={"code": 200, "data": {"aweme_list": items}})
+        if path.endswith("fetch_video_statistics"):
+            # 无补丁时保持列表字段；返回空 data 跳过覆盖
+            return httpx.Response(200, json={"code": 200, "data": []})
         return httpx.Response(404)
 
     client = _mock_client(handler)
@@ -130,9 +139,15 @@ async def test_account_top_videos_parses_n_video_meta(monkeypatch):
     assert all(isinstance(v, VideoMeta) for v in videos)
     assert videos[0].title == "title-0"
     assert videos[0].play_count == 0
-    assert videos[0].fav_count == 0
+    assert videos[0].like_count == 0
+    assert videos[0].fav_count == 0  # collect
     assert videos[0].download_url == "https://dl/0.mp4"
     assert videos[2].play_count == 200
+    assert videos[2].like_count == 2
+    assert videos[2].collect_count == 20
+    assert videos[2].comment_count == 4
+    assert videos[2].share_count == 2
+    assert videos[2].fav_count == 20
 
 
 async def test_account_top_videos_caps_at_n(monkeypatch):
@@ -141,7 +156,9 @@ async def test_account_top_videos_caps_at_n(monkeypatch):
     async def handler(request: httpx.Request):
         path = request.url.path
         if path.endswith("get_sec_user_id"):
-            return httpx.Response(200, json={"code": 200, "data": {"sec_user_id": "S"}})
+            return httpx.Response(200, json={"code": 200, "data": "S"})
+        if path.endswith("fetch_video_statistics"):
+            return httpx.Response(200, json={"code": 200, "data": []})
         items = [
             {"aweme_id": str(i), "desc": f"t{i}", "statistics": {}, "video": {"play_addr": {"url_list": [f"u{i}"]}}}
             for i in range(10)
@@ -161,7 +178,10 @@ async def test_video_meta_returns_single(monkeypatch):
     monkeypatch.setattr(settings, "TIKHUB_API_KEY", "tk-test-key")
 
     async def handler(request: httpx.Request):
-        assert request.url.path.endswith("fetch_one_video_by_share_url")
+        path = request.url.path
+        if path.endswith("fetch_video_statistics"):
+            return httpx.Response(200, json={"code": 200, "data": []})
+        assert path.endswith("fetch_one_video_by_share_url")
         assert request.url.params.get("url") == "https://v.douyin.com/abc"
         return httpx.Response(
             200,
@@ -171,8 +191,19 @@ async def test_video_meta_returns_single(monkeypatch):
                     "aweme_detail": {
                         "aweme_id": "V1",
                         "desc": "a video",
-                        "statistics": {"play_count": 99, "digg_count": 5},
-                        "video": {"play_addr": {"url_list": ["https://dl/v1.mp4"]}},
+                        "statistics": {
+                            "play_count": 99,
+                            "digg_count": 5,
+                            "collect_count": 3,
+                            "comment_count": 1,
+                            "share_count": 2,
+                        },
+                        "video": {
+                            "duration": 45000,
+                            "play_addr": {"url_list": ["https://dl/v1.mp4"]},
+                        },
+                        "create_time": 1711305600,
+                        "text_extra": [{"hashtag_name": "验收"}],
                     }
                 },
             },
@@ -186,8 +217,93 @@ async def test_video_meta_returns_single(monkeypatch):
     assert isinstance(vm, VideoMeta)
     assert vm.title == "a video"
     assert vm.play_count == 99
-    assert vm.fav_count == 5
+    assert vm.like_count == 5
+    assert vm.collect_count == 3
+    assert vm.fav_count == 3
+    assert vm.comment_count == 1
+    assert vm.share_count == 2
+    assert vm.tags == ["验收"]
+    assert vm.published_at == 1711305600
+    assert vm.duration_sec == 45
     assert vm.download_url == "https://dl/v1.mp4"
+
+
+async def test_enrich_douyin_statistics_merges_five_metrics(monkeypatch):
+    """列表缺播放时，fetch_video_statistics 补齐；digg→like、collect→收藏。"""
+    monkeypatch.setattr(settings, "TIKHUB_API_KEY", "tk-test-key")
+    stats_calls: list[str] = []
+
+    async def handler(request: httpx.Request):
+        path = request.url.path
+        if path.endswith("get_sec_user_id"):
+            return httpx.Response(200, json={"code": 200, "data": "SEC"})
+        if path.endswith("fetch_user_post_videos"):
+            items = [
+                {
+                    "aweme_id": "A1",
+                    "desc": "口播 #话题A",
+                    "statistics": {"digg_count": 1, "collect_count": 2},
+                    "video": {"play_addr": {"url_list": ["https://dl/a1.mp4"]}},
+                    "create_time": 1710000000,
+                },
+                {
+                    "aweme_id": "A2",
+                    "desc": "第二条",
+                    "statistics": {},
+                    "video": {"play_addr": {"url_list": ["https://dl/a2.mp4"]}},
+                },
+            ]
+            return httpx.Response(200, json={"code": 200, "data": {"aweme_list": items}})
+        if path.endswith("fetch_video_statistics"):
+            ids = request.url.params.get("aweme_ids", "")
+            stats_calls.append(ids)
+            assert ids == "A1,A2"
+            return httpx.Response(
+                200,
+                json={
+                    "code": 200,
+                    "data": [
+                        {
+                            "aweme_id": "A1",
+                            "play_count": 10000,
+                            "digg_count": 88,
+                            "comment_count": 7,
+                            "share_count": 3,
+                            "collect_count": 12,
+                        },
+                        {
+                            "aweme_id": "A2",
+                            "play_count": 500,
+                            "digg_count": 9,
+                            "comment_count": 1,
+                            "share_count": 0,
+                            "collect_count": 4,
+                        },
+                    ],
+                },
+            )
+        return httpx.Response(404)
+
+    client = _mock_client(handler)
+    try:
+        videos = await account_top_videos("https://www.douyin.com/user/x", n=2, client=client)
+    finally:
+        await client.aclose()
+
+    assert len(stats_calls) == 1
+    assert len(videos) == 2
+    v0, v1 = videos[0], videos[1]
+    assert v0.play_count == 10000
+    assert v0.like_count == 88  # digg，不是收藏
+    assert v0.comment_count == 7
+    assert v0.share_count == 3
+    assert v0.collect_count == 12
+    assert v0.fav_count == 12
+    assert "话题A" in v0.tags
+    assert v0.published_at == 1710000000
+    assert v1.play_count == 500
+    assert v1.like_count == 9
+    assert v1.collect_count == 4
 
 
 async def test_precheck_returns_reachable_and_count(monkeypatch):
@@ -200,7 +316,7 @@ async def test_precheck_returns_reachable_and_count(monkeypatch):
     async def handler(request: httpx.Request):
         path = request.url.path
         if path.endswith("get_sec_user_id"):
-            return httpx.Response(200, json={"code": 200, "data": {"sec_user_id": "SEC"}})
+            return httpx.Response(200, json={"code": 200, "data": "SEC"})
         if path.endswith("fetch_user_post_videos"):
             count = int(request.url.params.get("count", "0"))
             assert count > 1, "precheck must request a meaningful first-page count, not 1"
@@ -231,7 +347,7 @@ async def test_precheck_returns_meaningful_first_page_count(monkeypatch):
     async def handler(request: httpx.Request):
         path = request.url.path
         if path.endswith("get_sec_user_id"):
-            return httpx.Response(200, json={"code": 200, "data": {"sec_user_id": "SEC"}})
+            return httpx.Response(200, json={"code": 200, "data": "SEC"})
         if path.endswith("fetch_user_post_videos"):
             count = int(request.url.params.get("count", "0"))
             n = min(count, POOL)
@@ -256,8 +372,8 @@ async def test_precheck_unreachable_when_sec_user_id_missing(monkeypatch):
     monkeypatch.setattr(settings, "TIKHUB_API_KEY", "tk-test-key")
 
     async def handler(request: httpx.Request):
-        # 主页 URL 无法解析 sec_user_id → 不可达
-        return httpx.Response(200, json={"code": 200, "data": {}})
+        # 主页 URL 无法解析 sec_user_id → TikHub 返回空 data → 不可达
+        return httpx.Response(200, json={"code": 200, "data": ""})
 
     client = _mock_client(handler)
     try:
@@ -298,7 +414,7 @@ async def test_precheck_empty_home_page_unreachable(monkeypatch):
 
     def douyin_handler(request: httpx.Request) -> httpx.Response:
         if request.url.path.endswith("get_sec_user_id"):
-            return httpx.Response(200, json={"code": 200, "data": {"sec_user_id": "u1"}})
+            return httpx.Response(200, json={"code": 200, "data": "u1"})
         if request.url.path.endswith("fetch_user_post_videos"):
             return httpx.Response(200, json={"code": 200, "data": {"aweme_list": []}})
         return httpx.Response(500, text=request.url.path)
@@ -342,15 +458,27 @@ async def test_hot_board_returns_list(monkeypatch):
 
     async def handler(request: httpx.Request):
         assert request.url.path.endswith("fetch_hot_total_list")
+        # page / page_size / type 必填（缺则 TikHub 422）——回归防回退
+        assert request.url.params["page"] == "1"
+        assert request.url.params["page_size"] == "50"
+        assert request.url.params["type"] == "snapshot"
+        # 真实响应形状：body.data.data.objs，字段 sentence/hot_score/video_count/rank
         return httpx.Response(
             200,
             json={
                 "code": 200,
                 "data": {
-                    "hot_list": [
-                        {"hot_index": 1, "title": "trending", "video_count": 12},
-                        {"hot_index": 2, "title": "second", "video_count": 5},
-                    ]
+                    "code": 200,
+                    "data": {
+                        "page": 1,
+                        "objs": [
+                            {"rank": 1, "sentence": "trending", "hot_score": 11914614, "video_count": 12},
+                            {"rank": 2, "sentence": "second", "hot_score": 500, "video_count": 5},
+                        ],
+                        "last_update_time": 1736126146,
+                    },
+                    "extra": {},
+                    "message": "ok",
                 },
             },
         )
@@ -363,7 +491,10 @@ async def test_hot_board_returns_list(monkeypatch):
     assert len(items) == 2
     assert all(isinstance(i, HotItem) for i in items)
     assert items[0].title == "trending"
-    assert items[0].hot_index == 1
+    assert items[0].hot_index == 11914614  # hot_score，热度值
+    assert items[0].video_count == 12
+    assert items[1].title == "second"
+    assert items[1].hot_index == 500
 
 
 async def test_tikhub_http_error_raises_datasource_error(monkeypatch):
@@ -494,6 +625,62 @@ async def test_get_json_does_not_retry_on_4xx(monkeypatch):
     finally:
         await client.aclose()
     assert calls["n"] == 1, "4xx must not be retried"
+
+
+async def test_get_json_retries_400_with_retry_then_succeeds(monkeypatch):
+    # TikHub 瞬时故障误标 400 + body 含 "retry"（上游不规范）→ 窄口重试一次后成功。
+    monkeypatch.setattr(settings, "TIKHUB_API_KEY", "tk-test-key")
+    import app.datasource.tikhub as tikhub_mod
+
+    async def _no_sleep(_s):
+        return None
+
+    monkeypatch.setattr(tikhub_mod, "_sleep", _no_sleep)
+
+    calls = {"n": 0}
+
+    async def handler(request: httpx.Request):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx.Response(
+                400,
+                text='{"detail":{"code":400,"message":"Request failed. Please retry. Check the docs."}}',
+            )
+        return httpx.Response(200, json={"code": 200, "data": {"hot_list": []}})
+
+    client = _mock_client(handler)
+    try:
+        items = await hot_board(client=client)
+    finally:
+        await client.aclose()
+    assert items == []
+    assert calls["n"] == 2, "400+retry must be retried once (then succeed)"
+
+
+async def test_get_json_does_not_retry_on_400_without_retry(monkeypatch):
+    # 普通 400（body 不含 retry，如参数校验）→ 不重试，仅 1 次尝试（保留 4xx 不变量）。
+    monkeypatch.setattr(settings, "TIKHUB_API_KEY", "tk-test-key")
+    import app.datasource.tikhub as tikhub_mod
+
+    async def _no_sleep(_s):
+        return None
+
+    monkeypatch.setattr(tikhub_mod, "_sleep", _no_sleep)
+
+    calls = {"n": 0}
+
+    async def handler(request: httpx.Request):
+        calls["n"] += 1
+        # 422 风格的参数校验错误，body 不含 "retry"
+        return httpx.Response(400, text='{"detail":[{"msg":"Field required","loc":["query","x"]}]}')
+
+    client = _mock_client(handler)
+    try:
+        with pytest.raises(DataSourceError):
+            await hot_board(client=client)
+    finally:
+        await client.aclose()
+    assert calls["n"] == 1, "plain 400 (no retry hint) must not be retried"
 
 
 async def test_get_json_does_not_retry_on_business_code_failure(monkeypatch):
@@ -910,7 +1097,8 @@ async def test_account_top_videos_channels_share_paginates_until_n_or_max_pages(
     assert videos[0].decode_key == "k-1-0"
     assert videos[0].download_url.endswith("1-0.mp4")
     assert videos[0].play_count == 10  # read_count 代理
-    assert videos[0].fav_count == 1    # fav 优先于 like
+    assert videos[0].fav_count == 1    # 收藏
+    assert videos[0].like_count == 9   # 点赞独立
     await client.aclose()
 
 

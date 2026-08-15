@@ -4,8 +4,8 @@
 - ``POST /ai/analyze/precheck {url}`` 同步：封装 tikhub.precheck → {reachable, video_count}
   （Java 预扣额度门槛，Task 3.3）。
 - ``GET /ai/hot_board`` 同步：封装 tikhub.hot_board → 列表（Task 1.7 HotTopicJob 消费）。
-- ``POST /ai/analyze/video/text {task_id, transcript}`` 同步：structure_video → 结构或
-  {blocked:true}（UGC/LLM 输出命中安全，不写 result，Java 决策）。
+- ``POST /ai/analyze/video/text {task_id, transcript}`` 同步：structure_video → 结构
+  （解析视频不做阿里云内容安全）。
 - ``POST /ai/analyze/video/link {task_id, url}`` 202：endpoint 先写 running+updated_at，
   BackgroundTasks 跑 analyze_video_link（transcribe→结构化→done/failed）。
 - ``POST /ai/analyze/account {task_id, url}`` 202：endpoint 先写 running+updated_at，
@@ -140,10 +140,7 @@ class VideoTextRequest(BaseModel):
 
 @router.post("/analyze/video/text")
 async def post_video_text(req: VideoTextRequest) -> dict[str, Any]:
-    """同步结构化：transcript UGC 过审 → LLM 结构化 → 输出过审 → 写 done+result → 返回。
-
-    命中安全返回 {blocked: true}（不写 result，Java 决策退/不退）。
-    """
+    """同步结构化：LLM 结构化 → 写 done+result → 返回。不做阿里云内容安全。"""
     result = await structure_video(task_id=req.task_id, transcript=req.transcript)
     return result
 

@@ -4,6 +4,9 @@ Java（Task 2.2）调本端点把访谈/补卡的语音回答转文字。识别�
 （Java 提示用户改用文字输入）；ALIYUN_ASR_KEY 未配置返回 503（懒初始化失败，
 per-request，不在 import 期崩溃）。
 
+用户录音属 UGC：转写后须过阿里云内容安全；命中 → 422 CONTENT_BLOCKED
+（与「仅用户输入/录音必须过审」口径一致；解析账号/视频不过审）。
+
 router 整体 verify_service_token 守卫——与其他 /ai/* 路由同模式（内网端点）。
 无流式：同步返回 {text}。
 """
@@ -17,6 +20,7 @@ from pydantic import BaseModel
 
 from app.api.deps import verify_service_token
 from app.datasource.asr import ASRNotConfigured, ASRRecognitionError, transcribe_short
+from app.safety.content_safety import check as safety_check
 
 log = logging.getLogger(__name__)
 
@@ -57,6 +61,13 @@ async def post_asr(audio: UploadFile = File(...)) -> ASRResponse:
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail={"error": "ASR_FAILED"},
+        )
+    # 用户录音 → 文本：必须过审（产品口径）
+    if not await safety_check(text):
+        log.warning("asr transcript blocked by content safety: chars=%d", len(text))
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail={"error": "CONTENT_BLOCKED"},
         )
     # 明细已在 datasource 打过；端点只留 DEBUG，避免双份刷屏。
     log.debug("asr endpoint: fmt=%s bytes=%d chars=%d", fmt, len(audio_bytes), len(text))

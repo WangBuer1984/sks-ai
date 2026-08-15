@@ -195,8 +195,9 @@ Query 参数 `thread_id`（必填）。Java 侧须自行拼 `"userId:sessionId"`
 | > 60 MB | 413 | `{"detail":{"error":"AUDIO_TOO_LARGE"}}` |
 | `ALIYUN_ASR_KEY` 未配置 | 503 | `{"detail":{"error":"ASR_NOT_CONFIGURED"}}` |
 | 阿里云识别失败 | 502 | `{"detail":{"error":"ASR_FAILED"}}` |
+| 转写命中内容安全（用户录音必须过审） | 422 | `{"detail":{"error":"CONTENT_BLOCKED"}}` |
 
-全部被 Java 翻译为 `AI_FAILED`，前端提示改用文字输入，**不阻断访谈**。
+502/503/其他非 2xx 被 Java 翻译为 `AI_FAILED`（提示改用文字）；422 `CONTENT_BLOCKED` → `CONTENT_BLOCKED`。**不阻断访谈**。解析账号/解析视频**不过**内容安全。
 
 ### POST /ai/analyze/precheck
 

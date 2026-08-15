@@ -178,7 +178,7 @@ async def generate_cards(user_id: int, raw_text: str, target_layer: str) -> dict
       - 成功: {cards:[{card_type,title,content}], gaps:[...], conflicts:[{card_id,card_index,reason}]}
       - blocked: {blocked: true}  （raw_text 命中安全）
     """
-    # 1. UGC 安全先过审（§5.1）：raw_text 是用户直接输入，必须先检
+    # 1. 用户输入必须过审（产品口径）；创作产出本身不叠阿里云
     safe = await check(raw_text)
     if not safe:
         return {"blocked": True}

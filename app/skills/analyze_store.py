@@ -19,7 +19,8 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any
+from datetime import datetime, timezone
+from typing import Any, Sequence
 
 from app.db import get_pool  # noqa: F401  — 模块级别名，测试 monkeypatch 目标
 
@@ -82,6 +83,15 @@ async def heartbeat(task_id: int) -> None:
     )
 
 
+def _published_at_dt(published_at: int | None) -> datetime | None:
+    if published_at is None or published_at <= 0:
+        return None
+    try:
+        return datetime.fromtimestamp(int(published_at), tz=timezone.utc)
+    except (OSError, OverflowError, ValueError):
+        return None
+
+
 async def insert_benchmark_video(
     task_id: int,
     title: str,
@@ -89,17 +99,43 @@ async def insert_benchmark_video(
     fav_count: int,
     transcript: str,
     structure: dict[str, Any],
+    *,
+    description: str = "",
+    tags: Sequence[str] | None = None,
+    published_at: int | None = None,
+    like_count: int = 0,
+    comment_count: int = 0,
+    share_count: int = 0,
+    collect_count: int | None = None,
+    duration_sec: int | None = None,
 ) -> None:
-    """写 benchmark_video 行（TOP20 明细）。analyze_task_id FK→analyze_task(id)。"""
+    """写 benchmark_video 行（TOP20 明细）。
+
+    ``fav_count`` / ``collect_count`` 均为收藏；``collect_count`` 缺省时用 ``fav_count``。
+    ``like_count`` = 点赞（抖音 digg）。``duration_sec`` = 时长秒。
+    """
+    collect = collect_count if collect_count is not None else fav_count
+    tags_json = json.dumps(list(tags or []), ensure_ascii=False)
+    dur = int(duration_sec) if duration_sec is not None and duration_sec > 0 else None
     pool = await get_pool()
     await pool.execute(
         "INSERT INTO benchmark_video "
-        "(analyze_task_id, title, play_count, fav_count, transcript, structure) "
-        "VALUES ($1, $2, $3, $4, $5, $6::jsonb)",
+        "(analyze_task_id, title, play_count, fav_count, transcript, structure, "
+        " description, tags, published_at, like_count, comment_count, share_count, collect_count, "
+        " duration_sec) "
+        "VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, $10, $11, $12, $13, $14)",
         task_id,
         title,
         play_count,
-        fav_count,
+        collect,  # 历史列 fav_count = 收藏
         transcript,
         json.dumps(structure, ensure_ascii=False),
+        description or "",
+        tags_json,
+        _published_at_dt(published_at),
+        like_count,
+        comment_count,
+        share_count,
+        collect,
+        dur,
     )

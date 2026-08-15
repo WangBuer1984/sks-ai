@@ -7,12 +7,15 @@ thinking 经 extra_body 传递。支持结构化 JSON 输出（with_structured_o
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Callable
 
 from langchain_openai import ChatOpenAI
 
 from app.config import settings
 from app.llm.models import MODEL_FOR, ModelSpec
+
+log = logging.getLogger(__name__)
 
 
 def _default_factory(spec: ModelSpec) -> ChatOpenAI:
@@ -48,10 +51,28 @@ class GLMClient:
         硬不变量：不流式；所有业务产出落 JSONB 前经本方法返回完整结构。
         """
         spec = MODEL_FOR[skill]
+        # 不变量：结构化输出（json_schema）+ thinking 不可共存——GLM-4.7 thinking 开时
+        # function_calling 触发 400 code 1210、json_schema 返回散文、json_mode 不强制 schema。
+        # 若配置漂移（MODEL_FOR 误改回 thinking=True），此处强制降级 thinking=False 并告警，
+        # 保证结构化路径永远走 function_calling（强制字段类型），而非在运行时撞 1210。
+        if json_schema is not None and spec.thinking:
+            log.warning(
+                "skill=%s 配置 thinking=True 但走结构化输出；GLM-4.7 thinking+结构化冲突"
+                "（1210/散文/形状不可控），强制降级 thinking=False 走 function_calling",
+                skill,
+            )
+            spec = ModelSpec(spec.model, thinking=False)
         llm = self._llm_factory(spec)
 
         if json_schema is not None:
-            structured = llm.with_structured_output(json_schema, method="function_calling")
+            # langchain function_calling 要求 schema 顶层有 title（作 function name）；
+            # 缺省时用 skill 名兜底，避免各 skill 漏写 title 在运行时炸。
+            schema = (
+                json_schema
+                if json_schema.get("title")
+                else {**json_schema, "title": skill}
+            )
+            structured = llm.with_structured_output(schema, method="function_calling")
             result = await structured.ainvoke(messages)
         else:
             result = await llm.ainvoke(messages)
