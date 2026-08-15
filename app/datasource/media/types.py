@@ -33,6 +33,9 @@ class MediaRef:
 
     platform: str
     download_url: str
+    # 备选直链（抖音 play_addr.url_list 常含多个 CDN 节点）；首个即 download_url。
+    # 下载层逐个尝试，慢流/失败时换下一个。空 → 下游 fallback [download_url]。
+    download_urls: list[str] = field(default_factory=list)
     headers: dict[str, str] | None = None
     decode_key: str | None = None
     title: str | None = None

@@ -134,6 +134,93 @@ async def test_recognize_wav_retries_non_runtime_network_errors(monkeypatch):
     assert call_count["n"] == 3
 
 
+async def test_recognize_wav_permanent_400_not_retried(monkeypatch):
+    """欠费/鉴权类 400 是永久错误：只调 1 次，不烧 3 次重试。
+
+    线上实测（logs 15:16-16:49）：DashScope 欠费返回
+    ``400 Access denied ... good standing``，旧实现无差别重试 3 次，每条视频白烧
+    ~8-10s、10 条 ~100s，根因还被埋进第 3 条日志。
+    """
+    from app.datasource.media import qwen_asr
+
+    monkeypatch.setattr(settings, "ALIYUN_ASR_KEY", "fake-key")
+    monkeypatch.setattr(qwen_asr, "_RETRY_BACKOFFS", (0, 0))
+
+    call_count = {"n": 0}
+
+    def fake_call(**kwargs):
+        call_count["n"] += 1
+        return SimpleNamespace(
+            status_code=400,
+            output=None,
+            message=(
+                "Access denied, please make sure your account is in good standing."
+            ),
+        )
+
+    monkeypatch.setattr(qwen_asr.MultiModalConversation, "call", fake_call)
+
+    with pytest.raises(DataSourceError, match="permanent error"):
+        await qwen_asr.recognize_wav("/tmp/x.wav")
+
+    assert call_count["n"] == 1
+
+
+async def test_recognize_wav_oversize_400_not_retried(monkeypatch):
+    """体积超限 400 同样永久：同一个文件重投必然再失败。
+
+    spike 实测（docs/spikes/douyin-audio-only-download.md §4）：359s 整段 wav 不切片
+    直喂 → ``400 InternalError.Algo.InvalidParameter: Multimodal file size is too
+    large``，旧标记表没覆盖，白烧 3 次共 45s。
+    """
+    from app.datasource.media import qwen_asr
+
+    monkeypatch.setattr(settings, "ALIYUN_ASR_KEY", "fake-key")
+    monkeypatch.setattr(qwen_asr, "_RETRY_BACKOFFS", (0, 0))
+
+    call_count = {"n": 0}
+
+    def fake_call(**kwargs):
+        call_count["n"] += 1
+        return SimpleNamespace(
+            status_code=400,
+            output=None,
+            message=(
+                "InternalError.Algo.InvalidParameter: Multimodal file size is too large"
+            ),
+        )
+
+    monkeypatch.setattr(qwen_asr.MultiModalConversation, "call", fake_call)
+
+    with pytest.raises(DataSourceError, match="permanent error"):
+        await qwen_asr.recognize_wav("/tmp/x.wav")
+
+    assert call_count["n"] == 1
+
+
+async def test_recognize_wav_transient_400_still_retried(monkeypatch):
+    """无永久标记的 400 仍按瞬态重试——DashScope 也会把上游抖动标成 400。"""
+    from app.datasource.media import qwen_asr
+
+    monkeypatch.setattr(settings, "ALIYUN_ASR_KEY", "fake-key")
+    monkeypatch.setattr(qwen_asr, "_RETRY_BACKOFFS", (0, 0))
+
+    call_count = {"n": 0}
+
+    def fake_call(**kwargs):
+        call_count["n"] += 1
+        return SimpleNamespace(
+            status_code=400, output=None, message="Request failed. Please retry."
+        )
+
+    monkeypatch.setattr(qwen_asr.MultiModalConversation, "call", fake_call)
+
+    with pytest.raises(DataSourceError, match="after 3 retries"):
+        await qwen_asr.recognize_wav("/tmp/x.wav")
+
+    assert call_count["n"] == 3
+
+
 # ---------------------------------------------------------------------------
 # 3. 空文本：不重试，立即 DataSourceError("qwen asr empty text")
 # ---------------------------------------------------------------------------

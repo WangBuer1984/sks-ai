@@ -25,6 +25,7 @@ from app.datasource.tikhub import (
     _channels_title,
     _clear_channels_detail_cache,
     _parse_channels_video,
+    _parse_video,
     _platform_of,
     account_top_videos,
     channels_video_meta,
@@ -1134,3 +1135,105 @@ def test_account_entry_kind_classifies_inputs():
     assert _account_entry_kind("  sphABC_123  ") == "unknown"
     # 裸串不得崩
     assert _account_entry_kind("sph") == "unknown"
+
+
+# ---- ASR 下载源选择：纯音频轨 → 低画质档 → play_addr ----------------------
+# fixture 形状抄自实测抓取（docs/spikes/douyin_bitrate_probe.py 输出），不臆造：
+# bit_rate 是档位数组、每档自带 play_addr{url_list,data_size}；bit_rate_audio 的
+# url_list 是 {main_url,backup_url} 的 dict 而非 list，且该字段既可能是 dict 也可能是
+# list、缺失时为空 {}。
+
+def _aweme_with_sources(*, audio=None, gears=None) -> dict:
+    video: dict = {"play_addr": {"url_list": ["https://cdn/default.mp4"], "data_size": 39112345}}
+    if audio is not None:
+        video["bit_rate_audio"] = audio
+    if gears is not None:
+        video["bit_rate"] = gears
+    return {"aweme_id": "1", "desc": "t", "statistics": {}, "video": video}
+
+
+def _gear(name: str, size: int, url: str) -> dict:
+    return {"gear_name": name, "play_addr": {"url_list": [url], "data_size": size}}
+
+
+def _audio_dict(url: str) -> dict:
+    return {"audio_meta": {"quality": "normal", "size": 5872025, "url_list": {"main_url": url}}}
+
+
+def test_asr_source_prefers_audio_track_then_low_gear():
+    """三级源全在时：纯音频轨打头，低画质档次之，play_addr 垫底（下载层逐个降级）。"""
+    item = _aweme_with_sources(
+        audio=_audio_dict("https://cdn/audio.mp4"),
+        gears=[
+            _gear("additional_1080_1_1", 51000000, "https://cdn/1080.mp4"),
+            _gear("720_1_1", 25000000, "https://cdn/720.mp4"),
+            _gear("540_2_1", 18000000, "https://cdn/540.mp4"),
+        ],
+    )
+    v = _parse_video(item)
+    assert v.download_urls == [
+        "https://cdn/audio.mp4",
+        "https://cdn/540.mp4",
+        "https://cdn/default.mp4",
+    ]
+    assert v.download_url == "https://cdn/audio.mp4"
+
+
+def test_asr_source_falls_back_to_low_gear_when_no_audio_track():
+    """实测覆盖率只有 ~40%：无音频轨时必须还能吃到低画质档，而不是直接回 play_addr。"""
+    v = _parse_video(
+        _aweme_with_sources(
+            audio={},  # 实测缺失形态就是空 dict
+            gears=[
+                _gear("720_1_1", 25000000, "https://cdn/720.mp4"),
+                _gear("540_1_1", 18500000, "https://cdn/540.mp4"),
+            ],
+        )
+    )
+    assert v.download_urls == ["https://cdn/540.mp4", "https://cdn/default.mp4"]
+
+
+def test_asr_source_accepts_list_shaped_audio_node():
+    """bit_rate_audio 实测既有 dict 也有 list 形状——两种都要吃，别再重演 str/dict 分歧。"""
+    v = _parse_video(_aweme_with_sources(audio=[_audio_dict("https://cdn/audio.mp4")]))
+    assert v.download_urls[0] == "https://cdn/audio.mp4"
+
+
+def test_asr_source_skips_gears_below_540p():
+    """不取到底：360p 档虽更小也跳过，避免极低码率压坏音轨拖累 ASR。"""
+    v = _parse_video(
+        _aweme_with_sources(
+            gears=[
+                _gear("360_1_1", 9000000, "https://cdn/360.mp4"),
+                _gear("540_1_1", 18500000, "https://cdn/540.mp4"),
+            ]
+        )
+    )
+    assert v.download_urls == ["https://cdn/540.mp4", "https://cdn/default.mp4"]
+
+
+def test_asr_source_gear_missing_data_size_not_treated_as_smallest():
+    """data_size 缺失 = 大小未知，不能当 0 字节赢过真最小档。"""
+    v = _parse_video(
+        _aweme_with_sources(
+            gears=[
+                {"gear_name": "720_1_1", "play_addr": {"url_list": ["https://cdn/720.mp4"]}},
+                _gear("540_1_1", 18500000, "https://cdn/540.mp4"),
+            ]
+        )
+    )
+    assert v.download_urls[0] == "https://cdn/540.mp4"
+
+
+def test_asr_source_degrades_to_play_addr_when_fields_absent():
+    """两个新字段都没有 → 与改造前完全一致（play_addr 多 CDN 节点，去重保序）。"""
+    item = _aweme_with_sources()
+    item["video"]["play_addr"]["url_list"] = ["https://cdn/a.mp4", "https://cdn/a.mp4", " "]
+    v = _parse_video(item)
+    assert v.download_urls == ["https://cdn/a.mp4"]
+
+
+def test_asr_source_tolerates_garbage_shapes():
+    """上游字段类型漂移不得抛异常，静默降级到 play_addr。"""
+    item = _aweme_with_sources(audio="nope", gears="nope")
+    assert _parse_video(item).download_urls == ["https://cdn/default.mp4"]

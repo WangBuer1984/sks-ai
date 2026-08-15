@@ -44,8 +44,8 @@ def _common_seams(monkeypatch, tmp_path: Path) -> dict:
     wav_path = tmp_path / "audio_16k_mono.wav"
     wav_path.write_bytes(b"wav-bytes")
 
-    async def _download(url, *, headers=None, client=None):
-        cap["download_url"] = url
+    async def _download(urls, *, headers=None, total_timeout=None, client=None):
+        cap["download_url"] = urls[0] if urls else None
         cap["download_headers"] = headers
         return dl_path
 
@@ -71,7 +71,7 @@ def _common_seams(monkeypatch, tmp_path: Path) -> dict:
         cap["merge_parts"] = list(parts)
         return "".join(parts)
 
-    monkeypatch.setattr(tr, "download_url", _download)
+    monkeypatch.setattr(tr, "download_urls", _download)
     monkeypatch.setattr(tr, "convert_to_wav", _convert)
     monkeypatch.setattr(tr, "get_audio_duration", _duration)
     monkeypatch.setattr(tr, "slice_audio", _slice)
@@ -249,13 +249,13 @@ async def test_transcribe_timeout_raises_datasource_error(monkeypatch, tmp_path)
     wav_path = tmp_path / "wav_to.wav"
     wav_path.write_bytes(b"y")
 
-    async def _download(url, *, headers=None, client=None):
+    async def _download(urls, *, headers=None, total_timeout=None, client=None):
         return dl_path
 
     async def _convert(src):
         return wav_path
 
-    monkeypatch.setattr(tr, "download_url", _download)
+    monkeypatch.setattr(tr, "download_urls", _download)
     monkeypatch.setattr(tr, "convert_to_wav", _convert)
 
     with pytest.raises(DataSourceError, match="timed out"):
@@ -264,6 +264,37 @@ async def test_transcribe_timeout_raises_datasource_error(monkeypatch, tmp_path)
     # P0：超时路径 temps 仍被清理（finally 在 cancel 时执行）。
     assert not dl_path.exists()
     assert not wav_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_transcribe_queue_wait_excluded_from_wall_clock(monkeypatch, tmp_path):
+    """排队等下载槽位不计入 TRANSCRIBE_TIMEOUT，且下载后立即让出槽位。
+
+    回归（线上实测拆账号 10 条）：item 并发 10 > download_sem 2，尾部条目在队列里
+    干等；旧实现把排队算进 wait_for，第 8 条含排队的 step elapsed 已达 252s，
+    第 9/10 条不做任何实际工作就撞满 300s。
+    """
+    cap = _common_seams(monkeypatch, tmp_path)
+    monkeypatch.setattr(tr.settings, "TRANSCRIBE_TIMEOUT", 0.2)
+
+    sem = asyncio.Semaphore(1)
+    monkeypatch.setattr(tr, "get_download_semaphore", lambda: sem)
+
+    async def _recognize(wav_path, *, title=None, author=None):
+        # 下载结束即 release：ASR 阶段不得仍占着下载并发。
+        cap["sem_locked_during_asr"] = sem.locked()
+        return "你好"
+
+    monkeypatch.setattr(tr, "recognize_wav", _recognize)
+
+    await sem.acquire()  # 占满槽位，模拟前序条目正在下载
+    task = asyncio.create_task(tr.transcribe("https://x/a.mp4"))
+    await asyncio.sleep(0.4)  # 排队 0.4s，远超 0.2s 墙钟
+    assert not task.done(), "排队期间不得启动墙钟"
+    sem.release()
+
+    assert await task == "你好"
+    assert cap["sem_locked_during_asr"] is False
 
 
 @pytest.mark.asyncio
@@ -303,7 +334,7 @@ async def test_transcribe_cleans_temps_on_recognize_error(monkeypatch, tmp_path)
     wav_path = tmp_path / "wav_err.wav"
     wav_path.write_bytes(b"y")
 
-    async def _download(url, *, headers=None, client=None):
+    async def _download(urls, *, headers=None, total_timeout=None, client=None):
         return dl_path
 
     async def _convert(src):
@@ -312,7 +343,7 @@ async def test_transcribe_cleans_temps_on_recognize_error(monkeypatch, tmp_path)
     async def _boom(wav_path, *, title=None, author=None):
         raise DataSourceError("asr boom")
 
-    monkeypatch.setattr(tr, "download_url", _download)
+    monkeypatch.setattr(tr, "download_urls", _download)
     monkeypatch.setattr(tr, "convert_to_wav", _convert)
     monkeypatch.setattr(tr, "recognize_wav", _boom)
 
@@ -322,3 +353,126 @@ async def test_transcribe_cleans_temps_on_recognize_error(monkeypatch, tmp_path)
     # 下载产物 + 转码产物均被 unlink（temps 清空）。
     assert not dl_path.exists()
     assert not wav_path.exists()
+
+
+# ---- 转写缓存：按 raw_id 复用，避免同一条视频反复整下 ----------------------
+
+
+def _reusable_seams(monkeypatch, tmp_path: Path) -> dict:
+    """``_common_seams`` + 每次调用重建临时文件。
+
+    管线的 finally 会 unlink 下载/转码产物，所以在同一个测试里真跑第二遍时，
+    共用一份 fixture 文件的桩会撞 FileNotFoundError。缓存类测试必须跑两遍，故单列。
+    """
+    cap = _common_seams(monkeypatch, tmp_path)
+    dl_path = tmp_path / "dl_source.mp4"
+    wav_path = tmp_path / "audio_16k_mono.wav"
+
+    async def _download(urls, *, headers=None, total_timeout=None, client=None):
+        cap.setdefault("download_calls", []).append(urls[0] if urls else None)
+        dl_path.write_bytes(b"src-bytes")
+        return dl_path
+
+    async def _convert(src):
+        wav_path.write_bytes(b"wav-bytes")
+        return wav_path
+
+    monkeypatch.setattr(tr, "download_urls", _download)
+    monkeypatch.setattr(tr, "convert_to_wav", _convert)
+    return cap
+
+
+@pytest.fixture(autouse=True)
+def _clear_transcript_cache():
+    """缓存是模块级状态，测试间必须隔离，否则用例互相污染。"""
+    tr.clear_transcript_cache()
+    yield
+    tr.clear_transcript_cache()
+
+
+@pytest.mark.asyncio
+async def test_transcribe_caches_by_raw_id(monkeypatch, tmp_path):
+    """第二次转同一条视频直接命中缓存：不下载、不识别。
+
+    线上实测（logs 15:48–16:49）同一条 10.3MB 视频被整下 4 次——用户重试拆视频，
+    每次重跑全链路。
+    """
+    cap = _common_seams(monkeypatch, tmp_path)
+    ref = MediaRef(
+        platform="douyin",
+        download_url="https://x/a.mp4",
+        headers={},
+        raw_id="7412345678901234567",
+    )
+
+    first = await tr.transcribe(ref)
+    assert first == "你好"
+    assert len(cap["recognize_calls"]) == 1
+
+    # 换一套直链（CDN 签名会变）但同一个 raw_id → 仍应命中。
+    again = MediaRef(
+        platform="douyin",
+        download_url="https://y/other-signed-url.mp4",
+        headers={},
+        raw_id="7412345678901234567",
+    )
+    second = await tr.transcribe(again)
+    assert second == "你好"
+    assert len(cap["recognize_calls"]) == 1, "命中缓存不应再走 ASR"
+
+
+@pytest.mark.asyncio
+async def test_transcribe_cache_key_isolates_platform_and_id(monkeypatch, tmp_path):
+    """不同 raw_id / 不同平台各自独立，不得串味。"""
+    cap = _reusable_seams(monkeypatch, tmp_path)
+    await tr.transcribe(MediaRef(platform="douyin", download_url="u", headers={}, raw_id="a"))
+    await tr.transcribe(MediaRef(platform="douyin", download_url="u", headers={}, raw_id="b"))
+    await tr.transcribe(
+        MediaRef(platform="wechat_channels", download_url="u", headers={}, raw_id="a")
+    )
+    assert len(cap["recognize_calls"]) == 3
+
+
+@pytest.mark.asyncio
+async def test_transcribe_without_raw_id_not_cached(monkeypatch, tmp_path):
+    """无 raw_id（含裸 str URL）不缓存——URL 带时效签名，不能当身份。"""
+    cap = _reusable_seams(monkeypatch, tmp_path)
+    await tr.transcribe("https://x/a.mp4")
+    await tr.transcribe("https://x/a.mp4")
+    assert len(cap["recognize_calls"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_transcribe_failure_not_cached(monkeypatch, tmp_path):
+    """失败不进缓存：多为瞬态（CDN 慢流 / ASR 抖动），下次该真重试。"""
+    cap = _reusable_seams(monkeypatch, tmp_path)
+    calls = {"n": 0}
+
+    async def _flaky(wav_path, *, title=None, author=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise DataSourceError("cdn stalled")
+        cap.setdefault("recognize_calls", []).append({"wav": str(wav_path)})
+        return "你好"
+
+    monkeypatch.setattr(tr, "recognize_wav", _flaky)
+    ref = MediaRef(platform="douyin", download_url="u", headers={}, raw_id="z")
+
+    with pytest.raises(DataSourceError):
+        await tr.transcribe(ref)
+    assert await tr.transcribe(ref) == "你好"
+    assert calls["n"] == 2
+
+
+@pytest.mark.asyncio
+async def test_transcribe_cache_hit_skips_download_slot(monkeypatch, tmp_path):
+    """命中缓存必须绕开下载信号量——排在满队列后面就白缓存了。"""
+    _common_seams(monkeypatch, tmp_path)
+    ref = MediaRef(platform="douyin", download_url="u", headers={}, raw_id="q")
+    await tr.transcribe(ref)
+
+    sem = asyncio.Semaphore(1)
+    await sem.acquire()  # 占满，未命中缓存者必被挂起
+    monkeypatch.setattr(tr, "get_download_semaphore", lambda: sem)
+
+    assert await asyncio.wait_for(tr.transcribe(ref), timeout=1.0) == "你好"

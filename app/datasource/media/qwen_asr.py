@@ -2,7 +2,8 @@
 
 **与 clever-hans 的关键分歧（无静默空串降级）**：clever-hans 在失败 / 空文本时
 返回 ``""``，让上游静默吞掉。本仓库改为统一抛 ``DataSourceError``：
-  - 瞬态（非 200 / 网络 / ``RuntimeError``）：最多 3 次尝试，耗尽 → ``DataSourceError``。
+  - 永久（欠费 / 鉴权 / 模型不存在，见 ``PermanentAsrError``）：**不重试**，立即抛。
+  - 瞬态（其余非 200 / 网络 / ``RuntimeError``）：最多 3 次尝试，耗尽 → ``DataSourceError``。
   - 200 但解析后空文本：**不重试**，立即 ``DataSourceError("qwen asr empty text")``。
 空文本被视为数据源故障而非可降级空串，避免后续 pipeline 在无声文本上误判成功。
 
@@ -36,6 +37,45 @@ MODEL_NAME = "qwen3-asr-flash"
 _MAX_ATTEMPTS = 3
 # 重试间隔（秒）：attempt 失败后、下一次前 sleep，避免限流连打。
 _RETRY_BACKOFFS = (0.5, 1.5)
+
+# 永久错误标记（小写子串匹配）：账号欠费/鉴权失败/模型不存在——重试只是等量放大耗时，
+# 且把根因埋进第 3 条日志。线上实测：欠费时每条视频白烧 ~8-10s×3 次，10 条 ~100s。
+# 与 tikhub ``_get_json`` 同口径：4xx 默认不可重试，只在确认是瞬态时才重试；此处反过来
+# ——默认重试（保住 DashScope 偶发瞬态 400），只在命中确定性标记时才放弃。
+_PERMANENT_MARKERS = (
+    "access denied",
+    "overdue",
+    "arrear",
+    "invalid api",
+    "incorrect api",
+    "unauthorized",
+    "permission denied",
+    "model not exist",
+    "model not found",
+    # 请求本身超限——同一个文件重投必然再失败。实测 spike：359s 整段 wav 不切片直喂
+    # → 400 ``Multimodal file size is too large``，被当瞬态重试 3 次白烧 45s。
+    # 生产链路有 slice_audio 兜着，但切片阈值调错/上游改限额时会直接撞上。
+    "file size is too large",
+    "file is too large",
+)
+# 天然永久的状态码：鉴权/授权失败重试无意义。400 需配合上面的标记判断（DashScope
+# 把瞬态上游故障也标 400）。
+_PERMANENT_STATUS = (401, 403)
+
+
+class PermanentAsrError(RuntimeError):
+    """不可重试的 DashScope 错误（欠费/鉴权/模型不存在）。
+
+    ``recognize_wav`` 见此异常立即翻译为 ``DataSourceError``，不走重试循环。
+    """
+
+
+def _is_permanent(status_code: object, message: str) -> bool:
+    """状态码 + 错误文案 → 是否永久错误（不可重试）。"""
+    if status_code in _PERMANENT_STATUS:
+        return True
+    low = (message or "").lower()
+    return any(m in low for m in _PERMANENT_MARKERS)
 
 
 def _build_messages(wav_path_abs: str, title: str | None, author: str | None) -> list[dict]:
@@ -108,7 +148,10 @@ def _call_dashscope_sync(
         return ""
     else:
         error_msg = response.message if hasattr(response, "message") else "unknown"
-        raise RuntimeError(f"DashScope ASR error: {response.status_code} {error_msg}")
+        detail = f"DashScope ASR error: {response.status_code} {error_msg}"
+        if _is_permanent(response.status_code, str(error_msg)):
+            raise PermanentAsrError(detail)
+        raise RuntimeError(detail)
 
 
 async def recognize_wav(
@@ -121,7 +164,9 @@ async def recognize_wav(
 
     失败语义（与 clever-hans 分歧——无空串降级）：
       - ``ALIYUN_ASR_KEY`` 未配置 → 立即 ``DataSourceError``（防御性二次校验）。
-      - 瞬态（非 200 / 网络等）：最多 3 次尝试，耗尽 → ``DataSourceError``。
+      - 永久（``PermanentAsrError``：欠费/鉴权/模型不存在）：**不重试**，立即
+        ``DataSourceError("qwen asr permanent error: …")``。
+      - 瞬态（其余非 200 / 网络等）：最多 3 次尝试，耗尽 → ``DataSourceError``。
         捕获宽 ``Exception``（含 dashscope/httpx 非 RuntimeError）；``BaseException`` 不重试。
       - 200 但空文本：**不重试**，立即 ``DataSourceError("qwen asr empty text")``。
 
@@ -145,6 +190,10 @@ async def recognize_wav(
             )
             # 成功（含空串）即跳出重试循环；空判定在循环之外执行。
             break
+        except PermanentAsrError as exc:
+            # 欠费/鉴权/模型不存在：重试不会变好，立即失败并把根因放在首条日志。
+            log.warning("Qwen ASR permanent error, not retrying: %s", exc)
+            raise DataSourceError(f"qwen asr permanent error: {exc}") from exc
         except Exception as exc:
             last_exc = exc
             log.warning("Qwen ASR attempt %d/%d failed: %s", attempt + 1, _MAX_ATTEMPTS, exc)

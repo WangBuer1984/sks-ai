@@ -13,6 +13,8 @@ submit→poll→fetch POP API，不再持有域名/版本/区域/轮询常量，
 
 P0 不变量（5min 超时 → DataSourceError）：
   ``transcribe`` 外层包 ``asyncio.wait_for(_transcribe_inner(media), timeout=300)``。
+  **墙钟从拿到下载槽位开始计时**——``download_sem`` 在 ``wait_for`` 之外 acquire，
+  排队等待不消耗预算（否则 item 并发 > download_sem 时尾部条目全部空转超时）。
   ``wait_for`` 超时抛裸 ``asyncio.TimeoutError``，skill 层只 catch ``DataSourceError`` +
   宽 ``except Exception``，故此处必须捕获并翻译为 ``DataSourceError("transcribe timed out …")``。
   超时时内层 task 被 cancel，CPython 仍执行内层 ``finally`` → temp 文件被 unlink。
@@ -20,8 +22,11 @@ P0 不变量（5min 超时 → DataSourceError）：
 配置校验在 ``transcribe()`` 中、``wait_for`` **之前**执行，缺 key / 缺 ffmpeg 立即 fail-fast
 （不在 20min 超时后才报错）。
 
+转写结果按 ``MediaRef.raw_id`` 进程内缓存（见 ``_transcript_cache``），查缓存在下载槽位
+之前——命中即跳过整条管线。测试用 ``clear_transcript_cache()`` 隔离。
+
 seam 全部模块级绑定（与 ``tikhub.py`` 同模式），测试 monkeypatch 目标：
-``app.datasource.transcribe.download_url`` / ``.convert_to_wav`` /
+``app.datasource.transcribe.download_urls`` / ``.convert_to_wav`` /
 ``.get_audio_duration`` / ``.slice_audio`` / ``.recognize_wav`` /
 ``.merge_transcript_parts`` / ``.gc_stale_tmp`` / ``._ffmpeg_available``。
 转写墙钟超时从 ``settings.TRANSCRIBE_TIMEOUT`` 读取（默认 300s，fail-fast）。
@@ -33,6 +38,7 @@ import asyncio
 import logging
 import shutil
 import time
+from collections import OrderedDict
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 
@@ -42,7 +48,7 @@ from app.datasource.media import MediaRef
 from app.datasource.media.audio import convert_to_wav, get_audio_duration, slice_audio
 from app.datasource.media.channels_decode import decode_channels_media
 from app.datasource.media.constants import WAV_SIZE_LIMIT
-from app.datasource.media.download import download_url, gc_stale_tmp
+from app.datasource.media.download import download_urls, gc_stale_tmp
 from app.datasource.media.merge import merge_transcript_parts
 from app.datasource.media.qwen_asr import recognize_wav
 from app.datasource.media.semaphores import (
@@ -55,6 +61,74 @@ from app.datasource.media.semaphores import (
 log = logging.getLogger(__name__)
 
 _SHORT_DURATION_LIMIT = 300.0
+
+# 转写结果进程内缓存：同一条视频的文案不会变，但下载它要几十秒且按 CDN 限速计费墙钟。
+# 线上实测（logs 15:48–16:49）同一条 10.3MB 视频被整下了 4 次——用户反复重试拆视频，
+# 每次都重跑全链路。键用平台原生 id 而非 URL：CDN 直链带时效签名，同一视频每次取数
+# 都是新 URL，按 URL 缓存必然全 miss。
+#
+# 边界（有意为之）：
+#   - 仅缓存成功结果。失败不缓存——多为瞬态（CDN 慢流/ASR 抖动），下次该重试。
+#   - 不做 in-flight 去重：两个任务同时首转同一条仍会各下一次。加共享 future 会把
+#     「首个调用者超时/被取消」传染给后续调用者，不值当。
+#   - 视频号不参与：``_parse_channels_video`` 未解出稳定 id，``raw_id`` 为空自然跳过。
+_TRANSCRIPT_CACHE_TTL_SEC = 6 * 3600.0
+_TRANSCRIPT_CACHE_MAX = 256
+_transcript_cache: OrderedDict[str, tuple[float, str]] = OrderedDict()
+
+
+def _transcript_cache_key(media: MediaRef | str) -> str | None:
+    """``平台:原生id``；裸 str URL 或无 ``raw_id`` 的 ref 返回 None（不缓存）。"""
+    if not isinstance(media, MediaRef):
+        return None
+    raw_id = (media.raw_id or "").strip()
+    return f"{media.platform}:{raw_id}" if raw_id else None
+
+
+def _transcript_cache_get(key: str) -> str | None:
+    item = _transcript_cache.get(key)
+    if item is None:
+        return None
+    expires, text = item
+    if expires <= time.monotonic():
+        _transcript_cache.pop(key, None)
+        return None
+    _transcript_cache.move_to_end(key)
+    return text
+
+
+def _transcript_cache_put(key: str, text: str) -> None:
+    if not text:
+        return
+    _transcript_cache[key] = (time.monotonic() + _TRANSCRIPT_CACHE_TTL_SEC, text)
+    _transcript_cache.move_to_end(key)
+    while len(_transcript_cache) > _TRANSCRIPT_CACHE_MAX:
+        _transcript_cache.popitem(last=False)
+
+
+def clear_transcript_cache() -> None:
+    """测试 seam：清空转写缓存。"""
+    _transcript_cache.clear()
+
+
+class _DownloadSlot:
+    """下载信号量票据：``transcribe`` 在墙钟外 acquire，下载一结束立即 release。
+
+    ``release`` 幂等——正常路径由 ``_transcribe_inner`` 在下载后释放，取消/异常路径
+    由 ``transcribe`` 的 finally 兜底，两条路径可能都跑到。
+    """
+
+    __slots__ = ("_sem", "_released")
+
+    def __init__(self, sem: asyncio.Semaphore) -> None:
+        self._sem = sem
+        self._released = False
+
+    def release(self) -> None:
+        if not self._released:
+            self._released = True
+            self._sem.release()
+
 
 # 0.0–1.0：转写管线内相对进度（供 video/link 映射到任务 progress，账号拆解可不传）。
 ProgressCallback = Callable[[float], Awaitable[None]]
@@ -106,16 +180,38 @@ async def transcribe(
         raise DataSourceError("ALIYUN_ASR_KEY not configured")
     if not _ffmpeg_available():
         raise DataSourceError("ffmpeg/ffprobe not found on PATH")
+
+    # 缓存查在下载槽位**之前**——命中还去排队就白搭了。
+    cache_key = _transcript_cache_key(media)
+    if cache_key is not None:
+        hit = _transcript_cache_get(cache_key)
+        if hit is not None:
+            log.info("transcribe cache hit: %s (%d chars)", cache_key, len(hit))
+            await _emit_progress(on_progress, 1.0)
+            return hit
+
     timeout = settings.TRANSCRIBE_TIMEOUT
+    # 下载槽位在墙钟**之外** acquire（LOAD-BEARING）：item 层并发（拆账号 10）远大于
+    # download_sem（2），尾部条目要在队列里干等数分钟。排队若计入 wait_for，这些条目
+    # 一点实际工作没做就被判超时——实测拆账号 10 条：真实下载 18-52s，但含排队的
+    # step elapsed 递增到 252s（第 8 条），第 9/10 条必然撞满 300s。
+    sem = get_download_semaphore()
+    await sem.acquire()
+    slot = _DownloadSlot(sem)
     try:
-        return await asyncio.wait_for(
-            _transcribe_inner(media, on_progress=on_progress), timeout=timeout
+        text = await asyncio.wait_for(
+            _transcribe_inner(media, on_progress=on_progress, slot=slot), timeout=timeout
         )
+        if cache_key is not None:
+            _transcript_cache_put(cache_key, text)
+        return text
     except asyncio.TimeoutError as e:
         # P0：裸 TimeoutError 不可泄漏到 skill 层（只 catch DataSourceError）。
         raise DataSourceError(
             f"transcribe timed out after {timeout}s"
         ) from e
+    finally:
+        slot.release()  # 幂等兜底：正常路径 _transcribe_inner 下载后已释放
 
 
 _TEMP_DIR_PREFIXES = ("sks_asr_wav_", "sks_asr_slice_")
@@ -125,6 +221,7 @@ async def _transcribe_inner(
     media: MediaRef | str,
     *,
     on_progress: ProgressCallback | None = None,
+    slot: _DownloadSlot,
 ) -> str:
     """管线编排本体：own temps 列表 + try/finally 清理。
 
@@ -149,8 +246,14 @@ async def _transcribe_inner(
         await _emit_progress(on_progress, 0.05)
         # 下载：裸 str 时 headers 为 {} → ``ref.headers or None`` 传 None 给 download_url。
         t0 = time.monotonic()
-        async with get_download_semaphore():
-            src = await download_url(ref.download_url, headers=ref.headers or None)
+        try:
+            src = await download_urls(
+                ref.download_urls or [ref.download_url],
+                headers=ref.headers or None,
+            )
+        finally:
+            # 下载一结束（成功或失败）立即让出槽位——绝不占到 convert/ASR 阶段。
+            slot.release()
         temps.append(src)
         log.info("transcribe step download done: elapsed=%.2fs", time.monotonic() - t0)
         await _emit_progress(on_progress, 0.30)

@@ -137,6 +137,8 @@ class VideoMeta:
     play_count: int | None
     fav_count: int  # = collect_count（收藏），非 digg
     download_url: str
+    # 备选直链（抖音 play_addr.url_list 多 CDN 节点）；首个即 download_url。
+    download_urls: list[str] = field(default_factory=list)
     author: str = ""  # aweme author.nickname / author.nick_name
     decode_key: str | None = None  # 视频号 CDN 解码键；抖音无需解码，留 None
     platform: str = "douyin"  # "douyin" / "wechat_channels"；驱动 media_ref 装配分支
@@ -382,6 +384,108 @@ def _duration_sec(value: object, *, unit: str = "auto") -> int | None:
     return sec if sec > 0 else None
 
 
+# 转写只要 16k 单声道语音，但 ``play_addr`` 给的是平台默认画质档（实测 929s 视频 37.3MB）。
+# 同一个 aweme 里还躺着两个更省的源，按字节数从小到大优先，拼成一个有序列表交给
+# ``download_urls`` 逐个试——任一级缺失或下载失败都自然降级，无需额外分支：
+#   1. ``video.bit_rate_audio``：纯音频轨，约 play_addr 的 14%。实测确认是视频原声而非
+#      BGM（转写与整片逐字一致），但覆盖率只有 ~40%。
+#   2. ``video.bit_rate`` 的最低画质档：约 48%，覆盖 ~100%。
+#   3. ``play_addr``：兜底，即改造前的行为。
+# 依据与实测数据：docs/spikes/douyin-audio-only-download.md
+#
+# 档位不取到底（360p 等）而是设下限，避免极低码率连带压坏音轨、拖累 ASR 准确率。
+_ASR_MIN_GEAR_HEIGHT = 540
+# data_size 缺失时的排序兜底：当「未知大小」而非「0 字节」，不让它假装最小档胜出。
+_UNKNOWN_SIZE = 1 << 62
+
+
+def _clean_urls(raw: object) -> list[str]:
+    """``url_list`` → 去空去重的直链列表；非 list 输入返回空。"""
+    out: list[str] = []
+    for u in raw if isinstance(raw, list) else []:
+        if isinstance(u, str):
+            s = u.strip()
+            if s and s not in out:
+                out.append(s)
+    return out
+
+
+def _gear_height(gear_name: object) -> int | None:
+    """``gear_name`` → 纵向分辨率：``540_2_1``→540、``additional_1080_1_1``→1080。
+
+    取首个 >=100 的数字段，跳过 ``_1_1`` 这类档内序号。解析不出返回 None（该档跳过）。
+    """
+    for part in str(gear_name or "").split("_"):
+        if part.isdigit() and int(part) >= 100:
+            return int(part)
+    return None
+
+
+def _audio_track_urls(video: dict) -> list[str]:
+    """``video.bit_rate_audio`` 的纯音频直链；没有则空列表。
+
+    形状不稳：实测该字段既出现过 dict 也出现过 list，缺失时是空 ``{}``（与
+    ``_resolve_sec_user_id`` 的 str/dict 分歧同类），两种都吃。且内层 ``url_list``
+    是 ``{main_url, backup_url}`` 的 dict——与 ``play_addr.url_list`` 的 list 形状不同。
+    """
+    node = video.get("bit_rate_audio")
+    if isinstance(node, list):
+        node = node[0] if node else None
+    if not isinstance(node, dict):
+        return []
+    meta = node.get("audio_meta")
+    if not isinstance(meta, dict):
+        return []
+    urls = meta.get("url_list")
+    if not isinstance(urls, dict):
+        return []
+    out: list[str] = []
+    for key in ("main_url", "backup_url"):
+        u = urls.get(key)
+        if isinstance(u, str) and u.strip() and u.strip() not in out:
+            out.append(u.strip())
+    return out
+
+
+def _low_gear_urls(video: dict) -> list[str]:
+    """``video.bit_rate`` 中不低于 ``_ASR_MIN_GEAR_HEIGHT`` 的最小档直链。"""
+    gears = video.get("bit_rate")
+    if not isinstance(gears, list):
+        return []
+    best_size = _UNKNOWN_SIZE
+    best_urls: list[str] = []
+    for g in gears:
+        if not isinstance(g, dict):
+            continue
+        height = _gear_height(g.get("gear_name"))
+        if height is None or height < _ASR_MIN_GEAR_HEIGHT:
+            continue
+        addr = g.get("play_addr")
+        if not isinstance(addr, dict):
+            continue
+        urls = _clean_urls(addr.get("url_list"))
+        if not urls:
+            continue
+        size = _safe_int(addr.get("data_size")) or _UNKNOWN_SIZE
+        if not best_urls or size < best_size:
+            best_size, best_urls = size, urls
+    return best_urls
+
+
+def _asr_source_urls(video: dict) -> list[str]:
+    """按「字节数从小到大」拼出该视频的候选下载源（纯音频轨 → 低画质档 → play_addr）。"""
+    play_addr = video.get("play_addr")
+    default_urls = _clean_urls(
+        (play_addr or {}).get("url_list") if isinstance(play_addr, dict) else None
+    )
+    ordered: list[str] = []
+    for group in (_audio_track_urls(video), _low_gear_urls(video), default_urls):
+        for u in group:
+            if u not in ordered:
+                ordered.append(u)
+    return ordered
+
+
 def _parse_video(item: dict) -> VideoMeta:
     stats = item.get("statistics") or {}
     if not isinstance(stats, dict):
@@ -389,12 +493,12 @@ def _parse_video(item: dict) -> VideoMeta:
     video = item.get("video") or {}
     if not isinstance(video, dict):
         video = {}
-    play_addr = video.get("play_addr") or {}
-    url_list = play_addr.get("url_list") or []
     author_obj = item.get("author") or {}
     author = str(author_obj.get("nickname") or author_obj.get("nick_name") or "")
-    first = url_list[0] if url_list else None
-    download_url = str(first).strip() if first not in (None, "") else ""
+    # 候选源有序列表：纯音频轨 → 低画质档 → play_addr 多 CDN 节点（见 _asr_source_urls）。
+    # 下载层逐个尝试，慢流/失败时换下一个，避免单点卡死耗满转写墙钟。
+    download_urls = _asr_source_urls(video)
+    download_url = download_urls[0] if download_urls else ""
     desc = str(item.get("desc") or "")
     like = _safe_int(stats.get("digg_count"))
     collect = _safe_int(stats.get("collect_count"))
@@ -414,6 +518,7 @@ def _parse_video(item: dict) -> VideoMeta:
         play_count=_safe_int(stats.get("play_count")),
         fav_count=collect,  # DB 列 fav = 收藏
         download_url=download_url,
+        download_urls=download_urls,
         author=author,
         description=desc,
         tags=tags,
@@ -507,22 +612,28 @@ def video_meta_to_media_ref(v: VideoMeta) -> MediaRef:
     TikHub 缺字段时跳过 decode，由 ffmpeg 实际成败判定）；否则抖音分支。
     ``headers=dict(...)`` 均复制新鲜字典，避免多个 ref 共享模块级可变 dict。
     ``title``/``author`` 空串归一为 ``None``（下游空值更稳）。
+    ``raw_id`` 透传 ``aweme_id``——``transcribe`` 的转写缓存以它为键（CDN 直链带时效
+    签名，按 URL 缓存必然全 miss）。视频号侧未解出稳定 id，为 None → 不参与缓存。
     """
     if v.platform == "wechat_channels" or v.decode_key:
         return MediaRef(
             platform="wechat_channels",
             download_url=v.download_url,
+            download_urls=v.download_urls,
             headers=dict(CHANNELS_DOWNLOAD_HEADERS),
             decode_key=v.decode_key,
             title=v.title or None,
             author=v.author or None,
+            raw_id=v.aweme_id or None,
         )
     return MediaRef(
         platform="douyin",
         download_url=v.download_url,
+        download_urls=v.download_urls,
         headers=dict(DOUYIN_DOWNLOAD_HEADERS),
         title=v.title or None,
         author=v.author or None,
+        raw_id=v.aweme_id or None,
     )
 
 
@@ -701,6 +812,7 @@ def _parse_channels_video(item: dict, *, fallback_author: str = "") -> VideoMeta
         play_count=play_count,
         fav_count=collect,
         download_url=full,
+        download_urls=[full],
         author=str(item.get("nickname") or fallback_author or ""),
         decode_key=decode_key,
         platform="wechat_channels",
@@ -981,6 +1093,7 @@ async def channels_video_meta(url: str, *, client: httpx.AsyncClient | None = No
         return MediaRef(
             platform="wechat_channels",
             download_url=full_url,
+            download_urls=[full_url],
             headers=dict(CHANNELS_DOWNLOAD_HEADERS),
             decode_key=decode_key,
             title=_channels_title(data.get("title")) or None,

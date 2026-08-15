@@ -87,14 +87,21 @@ async def download_url(
     *,
     headers: dict[str, str] | None = None,
     client: httpx.AsyncClient | None = None,
+    total_timeout: float | None = 120.0,
 ) -> Path:
     """下载直链到 temp 文件，返回 ``Path``。
 
     - ``headers``：下载所需请求头（Referer/UA 等），默认 None。
     - ``client``：测试注入 ``MockTransport`` 客户端；生产传 None → 用进程内
       共享 client（keepalive，拆账号多视频复用）。
+    - ``total_timeout``：整段下载墙钟上限（默认 120s）。httpx 的 read timeout
+      只杀「块间 30s 无数据」的真 stall，护不住「持续吐字节但极慢」的慢流；
+      本层用 ``asyncio.wait_for`` 兜总时长，慢流到点必杀 → DataSourceError，
+      交给上层（``download_urls``）换节点重试。``None`` 表示不限。
     - 流式写盘（``aiter_bytes``），不把整包 body 留在内存。
     - 非 2xx / 传输异常 / 超时 → ``DataSourceError``（绝不冒泡裸 httpx/网络异常）。
+    - 下载中每 10s 或 5MB 打一条进度日志（written/elapsed/rate），便于区分
+      慢流与 stall——read timeout 只能杀 stall，慢流只能靠 total_timeout。
     """
     if client is None:
         client = await _get_shared_client()
@@ -102,31 +109,55 @@ async def download_url(
     log.info("download start: url=%s", url[:100])
     t0 = time.monotonic()
     tmp_path: str | None = None
+
+    async def _do_download() -> int:
+        nonlocal tmp_path
+        async with client.stream("GET", url, headers=headers) as resp:
+            if resp.status_code // 100 != 2:
+                raise DataSourceError(
+                    f"download failed for {url}: HTTP {resp.status_code}"
+                )
+            fd, tmp_path = tempfile.mkstemp(
+                prefix=_TMP_PREFIX,
+                dir=settings.ASR_TMP_DIR or None,
+            )
+            written = 0
+            last_log = t0
+            last_written = 0
+            f = None
+            try:
+                f = os.fdopen(fd, "wb")
+                fd = -1  # ownership transferred
+                async for chunk in resp.aiter_bytes(chunk_size=_CHUNK_SIZE):
+                    f.write(chunk)
+                    written += len(chunk)
+                    now = time.monotonic()
+                    if now - last_log >= 10.0 or written - last_written >= 5 * 1024 * 1024:
+                        elapsed = now - t0
+                        rate = (written / elapsed / (1024 * 1024)) if elapsed > 0 else 0.0
+                        log.info(
+                            "download progress: url=%s written=%.1fMB elapsed=%.1fs rate=%.2fMB/s",
+                            url[:60], written / (1024 * 1024), elapsed, rate,
+                        )
+                        last_log = now
+                        last_written = written
+            finally:
+                if f is not None:
+                    f.close()
+                elif fd >= 0:
+                    os.close(fd)
+            return written
+
     try:
         try:
-            async with client.stream("GET", url, headers=headers) as resp:
-                if resp.status_code // 100 != 2:
-                    raise DataSourceError(
-                        f"download failed for {url}: HTTP {resp.status_code}"
-                    )
-
-                fd, tmp_path = tempfile.mkstemp(
-                    prefix=_TMP_PREFIX,
-                    dir=settings.ASR_TMP_DIR or None,
-                )
-                written = 0
-                f = None
-                try:
-                    f = os.fdopen(fd, "wb")
-                    fd = -1  # ownership transferred
-                    async for chunk in resp.aiter_bytes(chunk_size=_CHUNK_SIZE):
-                        f.write(chunk)
-                        written += len(chunk)
-                finally:
-                    if f is not None:
-                        f.close()
-                    elif fd >= 0:
-                        os.close(fd)
+            if total_timeout is not None:
+                written = await asyncio.wait_for(_do_download(), timeout=total_timeout)
+            else:
+                written = await _do_download()
+        except asyncio.TimeoutError as e:
+            raise DataSourceError(
+                f"download timed out after {total_timeout}s: {url[:80]}"
+            ) from e
         except httpx.HTTPError as exc:
             raise DataSourceError(f"download transport error for {url}: {exc}") from exc
         except OSError as exc:
@@ -144,6 +175,45 @@ async def download_url(
         # 含 DataSourceError / 传输中断：清掉半截文件，避免 ASR_TMP 堆残骸。
         _unlink_quiet(tmp_path)
         raise
+
+
+async def download_urls(
+    urls: list[str] | tuple[str, ...] | None,
+    *,
+    headers: dict[str, str] | None = None,
+    total_timeout: float | None = 120.0,
+    client: httpx.AsyncClient | None = None,
+) -> Path:
+    """逐个尝试备选直链，成功即返回；全失败抛 ``DataSourceError``。
+
+    抖音 ``play_addr.url_list`` 常含多个 CDN 节点，首个慢流/失败时换下一个，
+    避免单节点卡死耗满 transcribe 墙钟。每个 URL 各享 ``total_timeout``——
+    慢流到点必杀后换节点，而非干等。
+    """
+    seen: list[str] = []
+    for u in urls or []:
+        if isinstance(u, str):
+            s = u.strip()
+            if s and s not in seen:
+                seen.append(s)
+    if not seen:
+        raise DataSourceError("download_urls: empty url list")
+    last_err: Exception | None = None
+    for i, u in enumerate(seen):
+        try:
+            return await download_url(
+                u, headers=headers, client=client, total_timeout=total_timeout
+            )
+        except DataSourceError as e:
+            last_err = e
+            if i < len(seen) - 1:
+                log.warning(
+                    "download_urls: url %d/%d failed (%s), trying next",
+                    i + 1, len(seen), e,
+                )
+    raise DataSourceError(
+        f"download_urls: all {len(seen)} urls failed, last: {last_err}"
+    )
 
 
 def gc_stale_tmp(*, max_age_hours: float = 2.0) -> int:
