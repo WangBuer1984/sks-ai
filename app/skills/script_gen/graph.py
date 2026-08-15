@@ -59,6 +59,39 @@ SCRIPT_SCHEMA: dict[str, Any] = {
 }
 
 
+def _normalize_section(v: Any) -> dict[str, Any]:
+    """hook/body/cta 归一为 ``{sentences: [...]}`` dict。
+
+    GLM function_calling 结构化输出偶尔把某段双重编码成 JSON 字符串（线上实测
+    cta 中招，返回 ``'{"sentences":[…]}'``），原样透传会让
+    ``ScriptGenResponse(cta: dict)`` 校验炸 500。str → ``json.loads``；
+    解析失败/非对象 → 空 dict——空段不阻断生成，比整条 500 友好（用户能看出该段
+    空、可手改/重生）。
+    """
+    if isinstance(v, dict):
+        return v
+    if isinstance(v, str):
+        s = v.strip()
+        if not s:
+            return {}
+        try:
+            parsed = json.loads(s)
+        except (ValueError, TypeError):
+            log.warning("script section not JSON-decodable, returning empty: %.80s", s)
+            return {}
+        if isinstance(parsed, dict):
+            return parsed
+        log.warning(
+            "script section JSON decoded to %s, not dict; returning empty",
+            type(parsed).__name__,
+        )
+        return {}
+    if v is None:
+        return {}
+    log.warning("script section unexpected type %s, returning empty", type(v).__name__)
+    return {}
+
+
 # ---- LangGraph state -------------------------------------------------------
 
 class ScriptGenState(TypedDict, total=False):
@@ -176,9 +209,12 @@ async def generate_script(
     }
     result = await _graph.ainvoke(initial)
     script = result.get("script", {})
+    if not isinstance(script, dict):
+        log.warning("script not a dict (%s), treating as empty", type(script).__name__)
+        script = {}
     return {
-        "hook": script.get("hook", {}),
-        "body": script.get("body", {}),
-        "cta": script.get("cta", {}),
+        "hook": _normalize_section(script.get("hook", {})),
+        "body": _normalize_section(script.get("body", {})),
+        "cta": _normalize_section(script.get("cta", {})),
         "cited_card_ids": result.get("cited_card_ids", []),
     }

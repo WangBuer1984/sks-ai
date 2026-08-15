@@ -63,6 +63,49 @@ async def test_no_cards_retrieved_still_generates(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_double_encoded_section_is_normalized(monkeypatch):
+    """GLM 偶尔把某段双重编码成 JSON 字符串——归一为 dict，不炸 ScriptGenResponse。
+
+    回归线上 500：cta 返回 ``'{"sentences":[…]}'``（str）→ ScriptGenResponse(cta: dict) 校验失败。
+    """
+    async def _fake_chat_double(*args, **kwargs):
+        return {
+            "hook": {"sentences": [{"idx": 0, "text": "钩子句"}]},
+            "body": '{"sentences": [{"idx": 0, "text": "正文句"}]}',  # 双重编码
+            "cta": '{"sentences": [{"idx": 0, "text": "结尾句"}]}',  # 双重编码
+        }
+
+    monkeypatch.setattr("app.skills.script_gen.graph.chat", _fake_chat_double)
+    monkeypatch.setattr("app.skills.script_gen.graph.retrieve_b_cards", _fake_retrieve_no_cards)
+    result = await generate_script(user_id=1, topic={"title": "x", "rationale": "y"},
+                                   profile={}, platform="douyin")
+    assert isinstance(result["hook"], dict)
+    assert isinstance(result["body"], dict)
+    assert isinstance(result["cta"], dict)
+    assert result["body"]["sentences"][0]["text"] == "正文句"
+    assert result["cta"]["sentences"][0]["text"] == "结尾句"
+
+
+@pytest.mark.asyncio
+async def test_malformed_section_string_degrades_to_empty(monkeypatch):
+    """非 JSON 字符串段 → 空 dict，不阻断生成（不 500）。"""
+    async def _fake_chat_bad(*args, **kwargs):
+        return {
+            "hook": "不是合法JSON",
+            "body": {"sentences": [{"idx": 0, "text": "正常段"}]},
+            "cta": "",
+        }
+
+    monkeypatch.setattr("app.skills.script_gen.graph.chat", _fake_chat_bad)
+    monkeypatch.setattr("app.skills.script_gen.graph.retrieve_b_cards", _fake_retrieve_no_cards)
+    result = await generate_script(user_id=1, topic={"title": "x", "rationale": "y"},
+                                   profile={}, platform="douyin")
+    assert result["hook"] == {}, "非 JSON 字符串应降级为空 dict"
+    assert result["cta"] == {}, "空字符串应降级为空 dict"
+    assert result["body"]["sentences"][0]["text"] == "正常段"
+
+
+@pytest.mark.asyncio
 async def test_rewrite_sentence_returns_text(monkeypatch):
     async def _fake_chat(*args, **kwargs):
         return {"text": "换个说法的句子"}
