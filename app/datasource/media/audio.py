@@ -37,8 +37,10 @@ log = logging.getLogger(__name__)
 _SAMPLE_RATE = 16000
 _CHANNELS = 1
 _BYTES_PER_SAMPLE = 2  # s16le
-# FFmpeg 转码超时（秒）：完整转码不截断时长，5min 覆盖长音频；切片 2min。
-_CONVERT_TIMEOUT = 300
+# FFmpeg 转码超时（秒）：完整转码不截断时长；切片 2min。
+# convert 原为 300s——与 transcribe 整条墙钟等长，一次卡死吃光全部预算且错误不点名步骤。
+# 实测（10 条视频，含 66min 长视频）转码纯耗时 max 4.21s / avg 0.81s，120s 留 28x 余量。
+_CONVERT_TIMEOUT = 120
 _SLICE_TIMEOUT = 120
 _FFPROBE_TIMEOUT = 30
 # 切片临时目录前缀，便于排查；须纳入 ``gc_stale_tmp``。

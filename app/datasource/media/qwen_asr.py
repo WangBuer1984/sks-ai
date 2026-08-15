@@ -35,6 +35,12 @@ log = logging.getLogger(__name__)
 MODEL_NAME = "qwen3-asr-flash"
 # 瞬态重试上限（共 3 次尝试）。空文本不在此计数——空被视为不可重试的数据源故障。
 _MAX_ATTEMPTS = 3
+
+# 单次 DashScope 调用墙钟上限。SDK 自带的 socket 超时默认 300s，与 transcribe 整条墙钟
+# 等长——一次卡死就吃光整个预算，且报错只会说「transcribe timed out」不指明卡在 ASR。
+# 实测单次纯识别 max 49.29s / avg 33.31s（10 条视频 31 次调用），120s 留 2.4x 余量。
+# 超时**不重试**：300s 预算容不下第二次 120s，重试只会把失败点推到外层匿名超时。
+_CALL_TIMEOUT = 120.0
 # 重试间隔（秒）：attempt 失败后、下一次前 sleep，避免限流连打。
 _RETRY_BACKOFFS = (0.5, 1.5)
 
@@ -166,6 +172,8 @@ async def recognize_wav(
       - ``ALIYUN_ASR_KEY`` 未配置 → 立即 ``DataSourceError``（防御性二次校验）。
       - 永久（``PermanentAsrError``：欠费/鉴权/模型不存在）：**不重试**，立即
         ``DataSourceError("qwen asr permanent error: …")``。
+      - 单次调用超过 ``_CALL_TIMEOUT`` → **不重试**，立即
+        ``DataSourceError("qwen asr timed out after …")``。
       - 瞬态（其余非 200 / 网络等）：最多 3 次尝试，耗尽 → ``DataSourceError``。
         捕获宽 ``Exception``（含 dashscope/httpx 非 RuntimeError）；``BaseException`` 不重试。
       - 200 但空文本：**不重试**，立即 ``DataSourceError("qwen asr empty text")``。
@@ -185,11 +193,19 @@ async def recognize_wav(
     last_exc: BaseException | None = None
     for attempt in range(_MAX_ATTEMPTS):
         try:
-            text = await asyncio.to_thread(
-                _call_dashscope_sync, wav_path_abs, title, author
+            text = await asyncio.wait_for(
+                asyncio.to_thread(_call_dashscope_sync, wav_path_abs, title, author),
+                timeout=_CALL_TIMEOUT,
             )
             # 成功（含空串）即跳出重试循环；空判定在循环之外执行。
             break
+        except asyncio.TimeoutError as exc:
+            # 注意：wait_for 取消不了已经跑起来的线程，SDK 那次请求会继续跑到它自己的
+            # socket 超时才收摊。这里的收益是把管线让出来、并让错误点名 ASR，不是真杀线程。
+            log.warning("Qwen ASR call timed out after %.0fs, not retrying", _CALL_TIMEOUT)
+            raise DataSourceError(
+                f"qwen asr timed out after {_CALL_TIMEOUT}s"
+            ) from exc
         except PermanentAsrError as exc:
             # 欠费/鉴权/模型不存在：重试不会变好，立即失败并把根因放在首条日志。
             log.warning("Qwen ASR permanent error, not retrying: %s", exc)

@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 
 from app.datasource.media.constants import ACCOUNT_ITEM_CONCURRENCY
@@ -21,6 +22,13 @@ _TOP_N = 10
 
 
 async def main() -> None:
+    # 本脚本不经 app.main，默认没有 logging handler——分步 "step ... done: elapsed" 日志
+    # 会被丢掉。per-step 超时阈值要按这些数字定，所以必须打开。
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(name)s %(message)s",
+        handlers=[logging.StreamHandler()],
+    )
     t0 = time.monotonic()
     videos = await account_top_videos(_ACCOUNT_URL, n=_TOP_N)
     videos = videos[:_TOP_N]

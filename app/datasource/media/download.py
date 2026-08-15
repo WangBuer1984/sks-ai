@@ -39,6 +39,9 @@ log = logging.getLogger(__name__)
 # <1s 永不触 30s；真 stall（0 字节）30s 即 ReadTimeout → DataSourceError，不烧到旧 600s。
 # 实测抖音/视频号 CDN 聚合限速 ~0.7/1.1 MB/s，长视频正常下载 50s+ 能完（块密集，不触 read）。
 _DOWNLOAD_TIMEOUT = httpx.Timeout(600.0, connect=30.0, read=30.0)
+
+# 多节点合计下载上限（见 ``download_urls`` docstring）。实测纯下载 max 50.25s。
+_OVERALL_DOWNLOAD_TIMEOUT = 180.0
 _CHUNK_SIZE = 256 * 1024
 # 临时文件名前缀——``gc_stale_tmp`` 按此前缀匹配清扫，避免误删其他模块的 temp 文件。
 _TMP_PREFIX = "sks_asr_dl_"
@@ -182,13 +185,21 @@ async def download_urls(
     *,
     headers: dict[str, str] | None = None,
     total_timeout: float | None = 120.0,
+    overall_timeout: float | None = _OVERALL_DOWNLOAD_TIMEOUT,
     client: httpx.AsyncClient | None = None,
 ) -> Path:
     """逐个尝试备选直链，成功即返回；全失败抛 ``DataSourceError``。
 
-    抖音 ``play_addr.url_list`` 常含多个 CDN 节点，首个慢流/失败时换下一个，
-    避免单节点卡死耗满 transcribe 墙钟。每个 URL 各享 ``total_timeout``——
-    慢流到点必杀后换节点，而非干等。
+    抖音候选源常含多个 CDN 节点，首个慢流/失败时换下一个，避免单节点卡死耗满
+    transcribe 墙钟。每个 URL 各享 ``total_timeout``——慢流到点必杀后换节点，而非干等。
+
+    ``overall_timeout`` 是**所有节点合计**的上限（LOAD-BEARING）：单靠 per-URL 上限
+    挡不住「节点多 × 每个都慢」——``_asr_source_urls`` 现在最多给出 10 个候选（音频轨
+    + 画质档 + play_addr 各自的多节点），10×120s 远超 transcribe 的 300s 墙钟，结果
+    是外层超时先到、错误只会说「timed out after 300s」而不指明卡在下载。实测下载纯
+    工作耗时 max 50.25s / avg 14.61s，180s 留 3.6x 余量且够换一次节点。
+
+    每个节点实际拿到的是 ``min(total_timeout, 剩余预算)``；预算耗尽即停止尝试。
     """
     seen: list[str] = []
     for u in urls or []:
@@ -198,11 +209,23 @@ async def download_urls(
                 seen.append(s)
     if not seen:
         raise DataSourceError("download_urls: empty url list")
+    deadline = (
+        time.monotonic() + overall_timeout if overall_timeout is not None else None
+    )
     last_err: Exception | None = None
     for i, u in enumerate(seen):
+        budget = total_timeout
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise DataSourceError(
+                    f"download_urls: overall budget {overall_timeout}s exhausted after "
+                    f"{i}/{len(seen)} urls, last: {last_err}"
+                )
+            budget = remaining if budget is None else min(budget, remaining)
         try:
             return await download_url(
-                u, headers=headers, client=client, total_timeout=total_timeout
+                u, headers=headers, client=client, total_timeout=budget
             )
         except DataSourceError as e:
             last_err = e

@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import time
 from types import SimpleNamespace
 from typing import Any
 
@@ -293,3 +294,43 @@ def test_semaphores_lazy_singleton():
     assert dl1._value == 2
     assert cv1._value == 4
     assert dc1._value == 2
+
+
+# ---------------------------------------------------------------------------
+# 4. 单次调用超时：不重试，错误点名 ASR
+# ---------------------------------------------------------------------------
+async def test_recognize_wav_call_timeout_not_retried(monkeypatch):
+    """卡死的调用到点即失败，且只调 1 次。
+
+    SDK 自带 socket 超时默认 300s，与 transcribe 整条墙钟等长——不设本层上限的话，
+    一次卡死吃光全部预算，报错还只会说「transcribe timed out」不指明卡在 ASR。
+    超时不重试：300s 预算容不下第二次 120s。
+    """
+    from app.datasource.media import qwen_asr
+
+    monkeypatch.setattr(settings, "ALIYUN_ASR_KEY", "fake-key")
+    monkeypatch.setattr(qwen_asr, "_CALL_TIMEOUT", 0.05)
+
+    call_count = {"n": 0}
+
+    def hanging_call(**kwargs):
+        call_count["n"] += 1
+        time.sleep(0.5)  # 比 _CALL_TIMEOUT 长
+        return SimpleNamespace(status_code=200, output=None, message="")
+
+    monkeypatch.setattr(qwen_asr.MultiModalConversation, "call", hanging_call)
+
+    with pytest.raises(DataSourceError, match="timed out"):
+        await qwen_asr.recognize_wav("/tmp/x.wav")
+
+    assert call_count["n"] == 1, "超时不得重试"
+
+
+async def test_recognize_wav_call_timeout_budget_leaves_headroom():
+    """阈值锁：实测单次纯识别 max 49.29s，_CALL_TIMEOUT 必须留足余量又短于整条墙钟。"""
+    from app.datasource.media import qwen_asr
+
+    assert qwen_asr._CALL_TIMEOUT >= 100, "低于 2x 实测 max（49.29s）会误杀正常长段"
+    assert qwen_asr._CALL_TIMEOUT < settings.TRANSCRIBE_TIMEOUT, (
+        "不短于外层墙钟就永远轮不到本层触发，错误又会退回匿名的 transcribe timeout"
+    )

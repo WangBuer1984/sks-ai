@@ -21,6 +21,7 @@ import pytest
 
 from app.config import settings
 from app.datasource import DataSourceError
+from app.datasource.media import download as dl
 from app.datasource.media.download import download_url, gc_stale_tmp, _DOWNLOAD_TIMEOUT
 
 
@@ -245,3 +246,90 @@ def test_gc_stale_tmp_ignores_vanished_entries(tmp_path, monkeypatch, caplog):
     with caplog.at_level(logging.WARNING, logger="app.datasource.media.download"):
         assert gc_stale_tmp() == 0
     assert not any("cannot stat/delete" in r.message for r in caplog.records)
+
+
+# ---- download_urls 多节点合计预算 -----------------------------------------
+# per-URL 上限挡不住「节点多 × 每个都慢」：_asr_source_urls 现在最多给 10 个候选，
+# 10×120s 远超 transcribe 的 300s 墙钟 → 外层超时先到，错误不指明卡在下载。
+
+
+async def test_download_urls_stops_when_overall_budget_exhausted(tmp_path, monkeypatch):
+    """预算耗尽即停，不把剩余节点挨个试完。"""
+    monkeypatch.setattr(settings, "ASR_TMP_DIR", str(tmp_path))
+    attempts: list[str] = []
+
+    async def _fake_download(url, *, headers=None, client=None, total_timeout=None):
+        attempts.append(url)
+        # 每次「耗掉」全部预算：模拟慢流跑满 per-URL 上限。
+        clock["t"] += 100.0
+        raise DataSourceError(f"download timed out after {total_timeout}s: {url}")
+
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(dl, "download_url", _fake_download)
+    monkeypatch.setattr(dl.time, "monotonic", lambda: clock["t"])
+
+    with pytest.raises(DataSourceError, match="overall budget"):
+        await dl.download_urls(
+            [f"https://cdn{i}/v.mp4" for i in range(10)], overall_timeout=180.0
+        )
+
+    assert len(attempts) == 2, f"180s 预算最多试 2 个 100s 的节点，实际试了 {len(attempts)}"
+
+
+async def test_download_urls_shrinks_per_url_budget_to_remaining(tmp_path, monkeypatch):
+    """末个节点只能拿到剩余预算，不能再独享完整 per-URL 上限。"""
+    monkeypatch.setattr(settings, "ASR_TMP_DIR", str(tmp_path))
+    budgets: list[float] = []
+    clock = {"t": 0.0}
+
+    async def _fake_download(url, *, headers=None, client=None, total_timeout=None):
+        budgets.append(total_timeout)
+        clock["t"] += 150.0
+        raise DataSourceError("boom")
+
+    monkeypatch.setattr(dl, "download_url", _fake_download)
+    monkeypatch.setattr(dl.time, "monotonic", lambda: clock["t"])
+
+    with pytest.raises(DataSourceError):
+        await dl.download_urls(
+            ["https://a/v.mp4", "https://b/v.mp4"], total_timeout=120.0, overall_timeout=180.0
+        )
+
+    assert budgets == [120.0, 30.0], f"第二个节点应只剩 30s，实际 {budgets}"
+
+
+async def test_download_urls_unbounded_when_overall_none(tmp_path, monkeypatch):
+    """overall_timeout=None → 回到「每个节点各享 per-URL 上限」的老行为。"""
+    monkeypatch.setattr(settings, "ASR_TMP_DIR", str(tmp_path))
+    budgets: list[float] = []
+
+    async def _fake_download(url, *, headers=None, client=None, total_timeout=None):
+        budgets.append(total_timeout)
+        raise DataSourceError("boom")
+
+    monkeypatch.setattr(dl, "download_url", _fake_download)
+
+    with pytest.raises(DataSourceError, match="all 3 urls failed"):
+        await dl.download_urls(
+            ["https://a/1", "https://b/2", "https://c/3"],
+            total_timeout=120.0,
+            overall_timeout=None,
+        )
+
+    assert budgets == [120.0, 120.0, 120.0]
+
+
+async def test_download_urls_succeeds_on_second_node_within_budget(tmp_path, monkeypatch):
+    """预算够时正常降级到下一个节点——别把可用的 fallback 也掐了。"""
+    monkeypatch.setattr(settings, "ASR_TMP_DIR", str(tmp_path))
+    good = tmp_path / "ok.mp4"
+    good.write_bytes(b"ok")
+
+    async def _fake_download(url, *, headers=None, client=None, total_timeout=None):
+        if url.endswith("/1"):
+            raise DataSourceError("first node dead")
+        return good
+
+    monkeypatch.setattr(dl, "download_url", _fake_download)
+
+    assert await dl.download_urls(["https://a/1", "https://b/2"]) == good
