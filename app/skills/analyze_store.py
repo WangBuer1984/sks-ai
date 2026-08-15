@@ -123,6 +123,8 @@ async def insert_benchmark_video(
     collect = collect_count if collect_count is not None else fav_count
     tags_json = json.dumps(list(tags or []), ensure_ascii=False)
     dur = int(duration_sec) if duration_sec is not None and duration_sec > 0 else None
+    # author 列 VARCHAR(100)：TikHub 返回不可控，超长截断而非让整行 INSERT 失败丢掉这条明细
+    author_val = (author or "")[:100]
     pool = await get_pool()
     await pool.execute(
         "INSERT INTO benchmark_video "
@@ -144,6 +146,6 @@ async def insert_benchmark_video(
         share_count,
         collect,
         dur,
-        author or "",
+        author_val,
         video_url,
     )

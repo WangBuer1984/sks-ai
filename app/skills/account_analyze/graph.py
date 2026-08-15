@@ -39,6 +39,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from typing import Any
+from urllib.parse import quote
 
 from app.datasource import DataSourceError
 from app.datasource.media.constants import ACCOUNT_ITEM_CONCURRENCY, HEARTBEAT_INTERVAL
@@ -143,7 +144,8 @@ def _video_url(v: VideoMeta) -> str | None:
     未验证（spec §3.1 backlog）。前端据此让详情态输入框留空，结果区照常。
     """
     if v.platform == "douyin" and v.aweme_id:
-        return f"https://www.douyin.com/video/{v.aweme_id}"
+        # aweme_id 实际是纯数字，但 TikHub 返回不可控：百分编码防 URL 敌对字符拼出畸形/可注入链接
+        return f"https://www.douyin.com/video/{quote(v.aweme_id, safe='')}"
     return None
 
 

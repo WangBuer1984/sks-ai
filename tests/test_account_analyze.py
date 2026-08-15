@@ -554,6 +554,32 @@ async def test_insert_benchmark_video_sql_has_author_and_video_url(monkeypatch):
     assert args2[-1] is None    # video_url 缺省 NULL → 前端不渲染外链
 
 
+def test_video_url_encodes_hostile_aweme_id():
+    """aweme_id 含 URL 敌对字符时百分编码，不拼出畸形/可注入的 URL。"""
+    from app.skills.account_analyze.graph import _video_url
+    from urllib.parse import quote
+
+    v = VideoMeta(title="t", play_count=1, fav_count=1, download_url="https://dl/0.mp4",
+                  platform="douyin", aweme_id="741&foo=bar/中文")
+    expected = "https://www.douyin.com/video/" + quote("741&foo=bar/中文", safe="")
+    assert _video_url(v) == expected
+
+
+@pytest.mark.asyncio
+async def test_insert_benchmark_video_truncates_long_author(monkeypatch):
+    """author 列 VARCHAR(100)：超长截断，不让整行 INSERT 失败丢掉这条明细。"""
+    pool = _FakePool()
+    _patch_pool(monkeypatch, pool)
+
+    from app.skills.analyze_store import insert_benchmark_video
+    await insert_benchmark_video(1, "标题", 100, 20, "转写", {"structure": "s"},
+                                 author="字" * 200)
+
+    _, args = pool.execs[0]
+    assert args[-2] == "字" * 100          # 截到列宽，不丢行
+    assert len(args[-2]) == 100
+
+
 # ---- helper -----------------------------------------------------------------
 
 async def _ret(v):
