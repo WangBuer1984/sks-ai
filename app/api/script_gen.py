@@ -47,7 +47,7 @@ class ScriptGenRequest(BaseModel):
     topic: TopicRequest
     profile: dict[str, Any] = Field(default_factory=dict)
     platform: Literal["douyin", "channels"] = "douyin"
-    duration: str = "45"  # '45'|'90'|'180'（秒）；45=45秒口播 90=90秒 180=3分钟深度
+    duration: str = "45"  # '45'|'90'|'180'|'300'（秒）；45=45秒口播 90=90秒 180=3分钟 300=5分钟
     generation_group_id: int | None = None
     framework: str | None = None
     cited_content_ids: list[int] | None = None

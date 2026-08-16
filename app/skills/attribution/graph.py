@@ -41,6 +41,14 @@ ATTRIBUTION_SINGLE_SCHEMA: dict[str, Any] = {
             "type": "array",
             "items": {"type": "string", "description": "可执行的改进建议（每条一句话）"},
         },
+        "tone_suggestion": {
+            "type": "string",
+            "description": "若诊断认为口吻该改，给出一句可写入档案的新口吻；否则空串",
+        },
+        "redlines_suggestion": {
+            "type": "string",
+            "description": "若诊断认为红线该改，给出一句可写入档案的新红线；否则空串",
+        },
     },
     "required": ["diagnosis", "suggestions"],
 }
@@ -86,6 +94,8 @@ def _build_single_messages(script: str, play_count: int, baseline: float) -> lis
         f"该账号近 30 天均值（baseline）：{baseline}\n"
         f"相对均值倍数：{ratio:.2f}x\n\n"
         "请输出 diagnosis（诊断）+ suggestions（改进建议列表）。"
+        "若口吻或红线需要改，另给 tone_suggestion / redlines_suggestion（可写入档案的短句）；不需要改则留空。"
+        "不得把建议写成已经改过档案。"
     )
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
@@ -142,6 +152,8 @@ async def attribution_single(script: str, play_count: int, baseline: float) -> d
     return {
         "diagnosis": result.get("diagnosis", ""),
         "suggestions": list(result.get("suggestions", []) or []),
+        "tone_suggestion": (result.get("tone_suggestion") or "") or None,
+        "redlines_suggestion": (result.get("redlines_suggestion") or "") or None,
     }
 
 

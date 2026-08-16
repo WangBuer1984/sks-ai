@@ -25,6 +25,8 @@ router = APIRouter(prefix="/ai", tags=["ai"], dependencies=[Depends(verify_servi
 class AttributionSingleResponse(BaseModel):
     diagnosis: str | None = None
     suggestions: list[str] = Field(default_factory=list)
+    tone_suggestion: str | None = None
+    redlines_suggestion: str | None = None
     blocked: bool = False
 
 

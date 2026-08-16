@@ -119,7 +119,7 @@ def _build_messages(state: ScriptGenState) -> list[dict[str, str]]:
     topic = state["topic"]
     profile = state["profile"]
     platform = state["platform"]
-    duration_label = {"45": "45 秒口播", "90": "90 秒", "180": "3 分钟深度"}.get(
+    duration_label = {"45": "45 秒口播", "90": "90 秒", "180": "3 分钟深度", "300": "5 分钟"}.get(
         state.get("duration", "45"), "45 秒口播"
     )
     contents = state.get("contents", [])

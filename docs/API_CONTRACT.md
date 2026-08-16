@@ -105,7 +105,7 @@ Java 每个请求带两个头：
   "topic": { "title": "string", "rationale": "" },// TopicRequest，rationale 默认 ""
   "profile": {},                                  // dict，默认 {}
   "platform": "douyin",                           // Literal["douyin","channels"]，默认 douyin；其余值 422
-  "duration": "45",                               // '45'|'90'|'180' 秒，默认 '45'
+  "duration": "45",                               // '45'|'90'|'180'|'300' 秒，默认 '45'
   "generation_group_id": 42,                      // int|null，默认 null；Java 编排标识，Python 不做组去重/计费
   "framework": "钩子-冲突-反转-收尾",                 // str|null，默认 null；进入写稿 prompt
   "cited_content_ids": [7, 8]                     // list[int]|null，默认 null；非空则跳过检索、按 id 加载（懒生成复用快照）
@@ -328,7 +328,8 @@ Query `url`（视频分享链）。
 
 ```jsonc
 { "script": "string", "play_count": 100, "baseline": 300.0 }   // 入参
-{ "diagnosis": "string", "suggestions": ["string"], "blocked": false }   // 出参（exclude_unset）
+{ "diagnosis": "string", "suggestions": ["string"], "tone_suggestion": "string", "redlines_suggestion": "string", "blocked": false }   // 出参（exclude_unset）
+// tone_suggestion / redlines_suggestion 可空：有值时 Java 存成定位页待确认补丁，不直接写档案。
 ```
 
 `script` 是扁平化的稿件纯文本（hook/body/cta 句子拼接），`baseline` 是 Java 侧算好的近 30 天均值。归因 **FREE 不扣费**，且**不改复盘态**（no AI judges state）。
