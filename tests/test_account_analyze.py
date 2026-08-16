@@ -279,6 +279,10 @@ async def test_analyze_account_passes_channels_decode_key_to_transcribe(monkeypa
     monkeypatch.setattr("app.skills.account_analyze.graph.update_task", _update_task)
     monkeypatch.setattr("app.skills.account_analyze.graph.insert_benchmark_video", _insert_bench)
 
+    # 本模块约定：mock db seam，绝不发真实 DB 请求（CI 无 postgres）。
+    pool = _FakePool()
+    _patch_pool(monkeypatch, pool)
+
     from app.skills.account_analyze.graph import analyze_account
     await analyze_account(task_id=1, url="sphi9BjV8GK0Zsl")
     assert isinstance(captured["media"], MediaRef)

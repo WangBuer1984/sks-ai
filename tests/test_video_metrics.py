@@ -8,6 +8,14 @@ import pytest
 from app.datasource.tikhub import VideoMeta
 
 
+@pytest.fixture(autouse=True)
+def _stub_tikhub_configured(monkeypatch):
+    """本模块全 mock 注入、绝不发真实网络请求——绕过 _is_configured 守卫，
+    让 channels_video_metrics 等入口不因 CI 无 TIKHUB_API_KEY 而提前抛 DataSourceError。"""
+    from app.datasource import tikhub
+    monkeypatch.setattr(tikhub, "_is_configured", lambda: True)
+
+
 @pytest.mark.asyncio
 async def test_video_metrics_douyin(monkeypatch):
     from app.datasource import tikhub
