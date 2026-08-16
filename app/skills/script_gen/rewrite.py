@@ -10,6 +10,7 @@ import json
 from typing import Any
 
 from app.llm.client import glm_client
+from app.skills.profile_fields import render_profile
 
 # 模块级别名——测试 monkeypatch 目标
 chat = glm_client.chat
@@ -30,7 +31,11 @@ def _build_messages(
     full_script: dict[str, Any],
     profile: dict[str, Any],
 ) -> list[dict[str, str]]:
-    """构造重写 prompt：原句 + 所属段 + 整稿 + 定位档案（保持口吻连贯）。"""
+    """构造重写 prompt：原句 + 所属段 + 整稿 + 定位档案（保持口吻连贯）。
+
+    档案的投影方式必须和 script_gen 一致（同一 `render_profile`）：改写读到的口吻/红线要是和生成时不同，
+    用户点一次「换个说法」就会得到一句风格突变的话，而且看不出原因。
+    """
     system = (
         "你是一名口播文案编辑助手。请将给定的句子换个说法，"
         "保持原意但用不同的表达方式。口吻须与整稿和定位档案一致。"
@@ -39,7 +44,7 @@ def _build_messages(
         f"需要重写的句子: {sentence}\n"
         f"所属段落: {section}\n"
         f"完整文案上下文:\n{json.dumps(full_script, ensure_ascii=False, indent=2)}\n"
-        f"定位档案:\n{json.dumps(profile, ensure_ascii=False, indent=2)}\n\n"
+        f"定位档案:\n{render_profile(profile)}\n\n"
         "请重写这句文案，返回一个新的版本。"
     )
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]

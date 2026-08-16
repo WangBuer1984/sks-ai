@@ -133,11 +133,54 @@ async def test_blocked_user_reply_returns_blocked_without_advancing(monkeypatch)
 
 
 
-# ---- summarize 形状 ---------------------------------------------------------
+# ---- summarize schema / 形状 -------------------------------------------------
+
+def test_summarize_schema_declares_seven_canonical_fields_and_faq_candidates():
+    """schema 是与 Java 的实际契约面（D19/D20）：七个规范键 + FAQ 候选，中文键退场。
+
+    这条不驱动状态机、只读 schema——因为线上真正决定 LLM 输出形状的就是它，
+    而形状漂了 Java 那边只会安静地少存几个字段。
+    """
+    profile = SUMMARIZE_SCHEMA["properties"]["profile"]
+    assert tuple(profile["properties"]) == (
+        "persona",
+        "targetAudience",
+        "differentiation",
+        "conversionPath",
+        "tone",
+        "redlines",
+        "contentPillars",
+    )
+    # 七字段**全部** required：「允许为空」由空数组表达，而不是把键变成可省略。
+    # 少一个 required，一份缺 redlines/contentPillars 的响应仍是 schema-valid，Java 侧只会安静地少存字段。
+    assert profile["required"] == [
+        "persona",
+        "targetAudience",
+        "differentiation",
+        "conversionPath",
+        "tone",
+        "redlines",
+        "contentPillars",
+    ]
+    # 多值字段是数组而不是一段文本——Java 侧 redlines/contentPillars 落 string[]
+    assert profile["properties"]["redlines"]["type"] == "array"
+    assert profile["properties"]["contentPillars"]["type"] == "array"
+
+    candidates = SUMMARIZE_SCHEMA["properties"]["faq_candidates"]
+    assert candidates["type"] == "array"
+    assert tuple(candidates["items"]["properties"]) == ("question", "answer")
+    assert candidates["items"]["required"] == ["question"], "答案可空：先记问题、答案后补"
+
+    # 根对象同理：faq_candidates 必给，没有候选就给 []（省略与「一条都没提取到」在下游不可区分）
+    assert SUMMARIZE_SCHEMA["required"] == ["profile", "faq_candidates"]
+
+    # A/B/C 卡片概念已退场（D1/D5）：不再要求 LLM 产 a_cards
+    assert "a_cards" not in SUMMARIZE_SCHEMA["properties"]
+
 
 @pytest.mark.asyncio
 async def test_summarize_shape(monkeypatch):
-    """完整流程到 summarize：产出 {profile:{6 字段}, a_cards:[{card_type,title,content}]}。"""
+    """完整流程到 summarize：产出 {profile:{七字段}, faq_candidates:[{question,answer?}]}。"""
     call_n = {"n": 0}
 
     async def _chat(skill, messages, json_schema=None, **kwargs):
@@ -145,11 +188,17 @@ async def test_summarize_shape(monkeypatch):
         if json_schema is SUMMARIZE_SCHEMA:
             return {
                 "profile": {
-                    "人设": "职场博主", "人群": "25-35白领", "差异化": "反内卷",
-                    "变现": "咨询", "红线": "不谈政治", "支柱配比": "4:2:2:2",
+                    "persona": "职场博主",
+                    "targetAudience": "25-35白领",
+                    "differentiation": "反内卷",
+                    "conversionPath": "咨询",
+                    "tone": "犀利但不刻薄",
+                    "redlines": ["不谈政治"],
+                    "contentPillars": ["职场避坑", "简历门诊"],
                 },
-                "a_cards": [
-                    {"card_type": "定位", "title": "反内卷职场", "content": {"k": "v"}},
+                "faq_candidates": [
+                    {"question": "简历怎么写才有面试邀约", "answer": "先对齐 JD 关键词"},
+                    {"question": "该不该裸辞"},
                 ],
             }
         if call_n["n"] == 1:
@@ -178,10 +227,106 @@ async def test_summarize_shape(monkeypatch):
     assert r["stage"] == "summarize"
     assert r["done"] is True
     pd = r["profile_draft"]
-    assert "profile" in pd and "a_cards" in pd
-    for k in ("人设", "人群", "差异化", "变现", "红线", "支柱配比"):
+    assert "profile" in pd and "faq_candidates" in pd
+    for k in (
+        "persona",
+        "targetAudience",
+        "differentiation",
+        "conversionPath",
+        "tone",
+        "redlines",
+        "contentPillars",
+    ):
         assert k in pd["profile"]
-    assert pd["a_cards"][0]["card_type"] == "定位"
+    assert pd["faq_candidates"][0]["question"] == "简历怎么写才有面试邀约"
+    assert "answer" not in pd["faq_candidates"][1], "只记问题的候选照原样返回"
+
+
+@pytest.mark.asyncio
+async def test_summarize_prompt_asks_for_faq_candidates(monkeypatch):
+    """候选是从访谈里**提取**的，不是凭空生成的——prompt 必须交代这件事。"""
+    from app.skills.interview import graph as g
+
+    messages = g._build_summarize_messages(
+        {"人设": "工厂人"}, "基本对", ["常有人问报价为什么差一倍"]
+    )
+    text = "\n".join(m["content"] for m in messages)
+    assert "高频问答" in text
+    assert "常有人问报价为什么差一倍" in text
+
+
+@pytest.mark.asyncio
+async def test_summarize_never_writes_shared_db(monkeypatch):
+    """候选只回给用户确认，**AI 不写共享库**（D20）：整条 summarize 路径不碰连接池。
+
+    做法是把 `app.db.get_pool` 换成会炸的桩——真有人在这条路上加一句写库，这个测试就红。
+    """
+    async def _boom(*a, **k):
+        raise AssertionError("interview 不得访问共享库")
+
+    monkeypatch.setattr("app.db.get_pool", _boom)
+    monkeypatch.setattr("app.db.init_pool", _boom)
+
+    call_n = {"n": 0}
+
+    async def _chat(skill, messages, json_schema=None, **kwargs):
+        call_n["n"] += 1
+        if json_schema is SUMMARIZE_SCHEMA:
+            return {
+                "profile": {"persona": "p", "targetAudience": "a", "differentiation": "d",
+                            "conversionPath": "c", "tone": "t", "redlines": [], "contentPillars": []},
+                "faq_candidates": [{"question": "报价为什么差一倍"}],
+            }
+        if call_n["n"] == 1:
+            return {"persona": {"人设": "x"}, "question": "对吗？"}
+        return {"question": "q"}
+
+    async def _safe(_t):
+        return True
+
+    monkeypatch.setattr("app.skills.interview.graph.chat", _chat)
+    monkeypatch.setattr("app.skills.interview.graph.check", _safe)
+
+    sid = "nodb-1"
+    await interview_step(user_id=1, session_id=sid, materials="素材")
+    await interview_step(user_id=1, session_id=sid, user_reply="对")
+    from app.skills.interview.graph import MAX_ROUNDS
+    r = None
+    for i in range(MAX_ROUNDS + 2):
+        r = await interview_step(user_id=1, session_id=sid, user_reply=f"答{i}")
+        if r.get("done"):
+            break
+    assert r and r["done"] is True
+    assert r["profile_draft"]["faq_candidates"][0]["question"] == "报价为什么差一倍"
+
+
+@pytest.mark.asyncio
+async def test_fetch_result_passes_through_legacy_profile(monkeypatch):
+    """旧 checkpoint（中文键 + a_cards）原样读出，不报错、不改写。
+
+    映射成规范键的责任在 Java 写档案那一步（`ProfileContent`）——Python 这边硬要"顺手修一下"，
+    就会出现两套映射规则各自演化。
+    """
+    from app.skills.interview import graph as g
+
+    legacy = {
+        "profile": {"人设": "美妆成分党", "人群": "25-35 女性", "支柱配比": "5:3:2"},
+        "a_cards": [{"card_type": "定位", "title": "人设卡", "content": {"x": 1}}],
+    }
+
+    class _SV:
+        values = {"profile": legacy}
+        next = ()
+        tasks = ()
+
+    class _FakeGraph:
+        async def aget_state(self, config):
+            return _SV()
+
+    monkeypatch.setattr(g, "_graph", _FakeGraph())
+
+    r = await fetch_result(thread_id="1:legacy")
+    assert r == legacy, "旧 checkpoint 原样透出（含 a_cards），Java 侧负责投影"
 
 
 

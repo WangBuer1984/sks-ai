@@ -6,8 +6,8 @@
 - 无流式（§5.1 硬不变量）：生成完整 → 一次性返回 JSON。
 - **不调阿里云内容安全**：创作产出交给大模型自身合规；阿里云只审用户输入/录音。
 
-模块级别名 chat / retrieve_b_cards 是测试 monkeypatch 目标
-（app.skills.script_gen.graph.chat / .retrieve_b_cards）。
+模块级别名 chat / retrieve_contents 是测试 monkeypatch 目标
+（app.skills.script_gen.graph.chat / .retrieve_contents）。
 """
 
 from __future__ import annotations
@@ -21,11 +21,14 @@ from langgraph.graph import END, StateGraph
 log = logging.getLogger(__name__)
 
 from app.llm.client import glm_client
-from app.rag.retrieve import retrieve_b_cards as _retrieve_b_cards
+from app.rag.retrieve import load_contents_by_ids as _load_contents_by_ids
+from app.rag.retrieve import retrieve_contents as _retrieve_contents
+from app.skills.profile_fields import render_profile
 
 # 模块级别名——测试 monkeypatch 目标
 chat = glm_client.chat
-retrieve_b_cards = _retrieve_b_cards
+retrieve_contents = _retrieve_contents
+load_contents_by_ids = _load_contents_by_ids
 
 
 # ---- 结构化输出 schema ----------------------------------------------------
@@ -100,7 +103,11 @@ class ScriptGenState(TypedDict, total=False):
     profile: dict[str, Any]
     platform: str
     duration: str
-    cards: list[Any]
+    framework: str | None
+    generation_group_id: int | None
+    preset_cited_ids: list[int]
+    contents: list[Any]
+    cited_content_ids: list[int]
     cited_card_ids: list[int]
     script: dict[str, Any]
 
@@ -115,31 +122,38 @@ def _build_messages(state: ScriptGenState) -> list[dict[str, str]]:
     duration_label = {"45": "45 秒口播", "90": "90 秒", "180": "3 分钟深度"}.get(
         state.get("duration", "45"), "45 秒口播"
     )
-    cards = state.get("cards", [])
+    contents = state.get("contents", [])
+    framework = (state.get("framework") or "").strip()
+    platform_hint = {
+        "douyin": "抖音口播：前 3 秒强钩子，口语短句，适合竖屏停驻。",
+        "channels": "视频号口播：语气更稳，适合微信生态转发，结尾引导更克制。",
+    }.get(platform, "")
 
-    profile_text = json.dumps(profile, ensure_ascii=False, indent=2) if profile else "（无定位档案）"
-    cards_text = ""
-    if cards:
-        cards_text = "\n".join(
-            f"- [{c.card_type}] {c.title}: {json.dumps(c.content, ensure_ascii=False)}"
-            for c in cards
+    profile_text = render_profile(profile)
+    if contents:
+        contents_text = "\n".join(
+            f"- [{c.source}] {c.title}: {(c.body or '')[:400]}"
+            for c in contents
         )
     else:
-        cards_text = "（无 B 层卡命中）"
+        contents_text = "（知识库没有相关内容，本稿只基于定位档案）"
 
+    framework_text = framework or "默认口播结构：钩子 → 冲突/干货 → 收尾引导"
     system = (
-        "你是一名专业口播视频文案创作者。根据选题、定位档案和知识库卡片，"
+        "你是一名专业口播视频文案创作者。根据选题、定位档案和用户自己写过的相关内容，"
         "生成一段口播文案。文案分为三段：hook（开场钩子）、body（正文内容）、cta（结尾引导）。"
         "每段由若干句子组成，每句需有 idx（从 0 开始）和 text（单句文本）。"
-        "内容须符合平台调性，口吻与定位档案一致。"
+        "内容须符合平台调性，口吻与定位档案一致。参考内容按篇使用，不要编造库里没有的事实。"
     )
     user = (
         f"平台: {platform}\n"
+        f"平台要求: {platform_hint}\n"
         f"目标时长: {duration_label}（按此时长控制篇幅与结构）\n"
+        f"结构框架: {framework_text}\n"
         f"选题: {topic.get('title', '')}\n"
         f"选题理由: {topic.get('rationale', '')}\n"
-        f"定位档案（A 层全量）:\n{profile_text}\n"
-        f"知识库 B 层命中卡:\n{cards_text}\n\n"
+        f"定位档案:\n{profile_text}\n"
+        f"知识库里相关的内容（整篇）:\n{contents_text}\n\n"
         "请生成三段文案（hook/body/cta），每段为句子数组。"
     )
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
@@ -148,20 +162,26 @@ def _build_messages(state: ScriptGenState) -> list[dict[str, str]]:
 # ---- LangGraph nodes -------------------------------------------------------
 
 async def _retrieve_node(state: ScriptGenState) -> dict[str, Any]:
-    """召回 B 层 top-5 卡片（user_id 隔离在 retrieve_b_cards SQL 内保证）。
+    """召回整篇内容 top 2–3（user_id 隔离在 retrieve_contents SQL 内保证）。
 
-    RAG 检索是 best-effort：若 embed/DB 不可达（如 GLM API 未配置、DB 未起），
-    返回空列表——稿仍能生成（只是无 cited_card_ids），不阻断生成流程。
+    懒生成传入 preset_cited_ids 时复用首版引用快照，不再检索。
+    RAG 检索是 best-effort：embed/DB 不可达时返回空列表，不阻断生成。
     """
+    preset = [i for i in (state.get("preset_cited_ids") or []) if isinstance(i, int)]
     try:
-        cards = await retrieve_b_cards(
-            state["user_id"],
-            state["topic"].get("title", ""),
-        )
+        if preset:
+            contents = await load_contents_by_ids(state["user_id"], preset)
+        else:
+            contents = await retrieve_contents(
+                state["user_id"],
+                state["topic"].get("title", ""),
+                platform=state.get("platform"),
+                k=3,
+            )
     except Exception:  # noqa: BLE001 — RAG 降级，不阻断生成
-        log.warning("retrieve_b_cards failed, generating without RAG context", exc_info=True)
-        cards = []
-    return {"cards": cards, "cited_card_ids": [c.id for c in cards]}
+        log.warning("retrieve_contents failed, generating without RAG context", exc_info=True)
+        contents = []
+    return {"contents": contents, "cited_content_ids": [c.id for c in contents], "cited_card_ids": []}
 
 
 async def _generate_node(state: ScriptGenState) -> dict[str, Any]:
@@ -194,18 +214,20 @@ async def generate_script(
     profile: dict[str, Any],
     platform: str,
     duration: str = "45",
+    framework: str | None = None,
+    generation_group_id: int | None = None,
+    cited_content_ids: list[int] | None = None,
 ) -> dict[str, Any]:
-    """文案生成入口：retrieve → generate → 返回三段。
-
-    返回: {hook, body, cta, cited_card_ids: [...]}
-    不做阿里云内容安全（创作链路交给大模型自身合规）。
-    """
+    """文案生成入口：retrieve → generate → 返回三段 + cited_content_ids。"""
     initial: ScriptGenState = {
         "user_id": user_id,
         "topic": topic,
         "profile": profile,
         "platform": platform,
         "duration": duration,
+        "framework": framework,
+        "generation_group_id": generation_group_id,
+        "preset_cited_ids": cited_content_ids or [],
     }
     result = await _graph.ainvoke(initial)
     script = result.get("script", {})
@@ -216,5 +238,6 @@ async def generate_script(
         "hook": _normalize_section(script.get("hook", {})),
         "body": _normalize_section(script.get("body", {})),
         "cta": _normalize_section(script.get("cta", {})),
+        "cited_content_ids": result.get("cited_content_ids", []),
         "cited_card_ids": result.get("cited_card_ids", []),
     }

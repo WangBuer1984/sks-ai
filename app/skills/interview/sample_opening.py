@@ -44,10 +44,10 @@ async def sample_opening(thread_id: str, topic: str | None) -> dict[str, Any] | 
     sv = await _graph.aget_state(config)
     if not sv or not sv.values:
         return None
-    raw = sv.values.get("profile")  # {profile:{人设,...}, a_cards:[...]} 整块
+    raw = sv.values.get("profile")  # summarize 整块：{profile:{...}, faq_candidates:[...]}
     if not isinstance(raw, dict):
         return None
-    inner = raw.get("profile")  # {人设,人群,差异化,变现,红线,支柱配比}
+    inner = raw.get("profile")  # 七字段；旧 checkpoint 是中文键（此处只读，不映射）
     if not isinstance(inner, dict) or not inner:
         return None
     t = topic or DEFAULT_TOPIC

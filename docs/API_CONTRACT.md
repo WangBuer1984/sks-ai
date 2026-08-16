@@ -104,20 +104,42 @@ Java 每个请求带两个头：
   "user_id": 1,                                   // int，必填
   "topic": { "title": "string", "rationale": "" },// TopicRequest，rationale 默认 ""
   "profile": {},                                  // dict，默认 {}
-  "platform": "douyin"                            // 默认 "douyin"
+  "platform": "douyin",                           // Literal["douyin","channels"]，默认 douyin；其余值 422
+  "duration": "45",                               // '45'|'90'|'180' 秒，默认 '45'
+  "generation_group_id": 42,                      // int|null，默认 null；Java 编排标识，Python 不做组去重/计费
+  "framework": "钩子-冲突-反转-收尾",                 // str|null，默认 null；进入写稿 prompt
+  "cited_content_ids": [7, 8]                     // list[int]|null，默认 null；非空则跳过检索、按 id 加载（懒生成复用快照）
 }
 // 出参 ScriptGenResponse（exclude_unset）
 {
   "hook": { "sentences": [{ "idx": 0, "text": "..." }] },  // dict|null
   "body": { "sentences": [...] },
   "cta":  { "sentences": [...] },
-  "cited_card_ids": [1, 2],                       // list[int]
+  "cited_content_ids": [7, 8],                    // list[int]，整篇内容参考（新）
+  "cited_card_ids": [1, 2],                       // list[int]，旧 B 卡引用，兼容周期内保留
   "blocked": false
 }
 // blocked 时：{ "blocked": true }
 ```
 
-Java `ScriptGenResult(blocked, hook, body, cta, citedCardIds)`，`hook/body/cta` 用 `JsonNode` 承载后 `toString()` 写 JSONB 列。**Java 不在 AiClient 抛 blocked**——`ScriptService.generate` 先置 failed + 退款再抛 `CONTENT_BLOCKED`（§4.1 refund 必须在任何异常抛出前完成）。
+Java `ScriptGenResult(blocked, hook, body, cta, citedCardIds, citedContentIds)`，`hook/body/cta` 用 `JsonNode` 承载后 `toString()` 写 JSONB 列。**Java 不在 AiClient 抛 blocked**——`ScriptService.generate` 先置 failed + 退款再抛 `CONTENT_BLOCKED`（§4.1 refund 必须在任何异常抛出前完成）。
+
+#### D18–D21：AI 仍是**无状态单平台生成**
+
+一轮生成包含抖音版与视频号版两个独立平台版本（spec `2026-08-15-kb-content-library-design` D21），但**这件事完全在 Java 侧编排**：Java 对同一 `generation_group_id` 各调本端点一次，`platform` 不同。Python 这边不变的部分比变的多，写清以免两侧各自加逻辑：
+
+- **Python 不知道「组」的存在**：`generation_group_id` 不做去重、不缓存、不影响输出。两个版本各自独立生成，正文不是「同一篇换皮」。Java 用它把两次调用绑成一轮。
+- **`framework` 进入写稿 prompt**：拆解页「用这个框架仿写」带入的爆款框架；为 `null` 时用默认口播结构。
+- **`cited_content_ids` 非空时跳过检索**：懒生成视频号版时 Java 传入首版引用快照，Python 按 id + `user_id` 加载整篇，保证同组两个版本参考同一批内容。
+- **计费与幂等全在 Java**：一轮扣 1 条，幂等键是 `generation_group_id`；视频号版懒生成（首次切页签才调）**不另扣费**。Python 不参与、也不需要知道扣没扣。
+- **`platform` 是 `Literal["douyin", "channels"]`**：退役值（`kuaishou` / `xiaohongshu`）直接 422，脏平台进不了 prompt。Java 侧在扣额度前已经拒过一次（4005），这里是第二道。**注意与 `app.datasource` 那套 `douyin` / `wechat_channels` 不是同一命名空间**——那是抓数平台标识，别互相赋值。
+- `framework` 是拆解页「用这个框架仿写」带入的爆款框架；为 `null` 时用默认口播结构。
+- `profile` 用定位档案的**七个规范键**（`persona` / `targetAudience` / `differentiation` / `conversionPath` / `tone` / `redlines` / `contentPillars`，见 sks-server `docs/REST_CONTRACT.md`）。历史上访谈 summarize 产出的是中文键，映射到这七个键的责任在 Java 侧写档案时完成。
+- **进 prompt 前只投影这七个键**（`app/skills/profile_fields.py::render_profile`，`script_gen` 与 `rewrite_sentence` 共用同一函数）：旧中文键映射过来，其余键（FAQ、`_interview_turns`、任何将来多塞的字段）**丢弃**而非透传。整块 dump 档案等于让「档案里多一个字段」悄悄改掉写稿风格，且没有一处会报错。改写与生成必须用同一投影，否则用户点一次「换个说法」就会拿到风格突变的句子。
+- **FAQ 不进 `script_gen`**：高频问答是选题来源（用户点「生成选题」建 `source=faq` 的选题），不是写稿素材；直接注入会让每篇稿子都莫名带上问答腔。
+- `cited_content_ids` 取代 `cited_card_ids`：检索粒度是**整篇内容**（`kb_content`，不切片），Java 据此写 `content_reference` 并在右栏渲染「本稿参考了你的这些内容」。检索命中同一 `generation_group_id` 的两个平台版本时**最多取一个**（优先与当前 `platform` 一致者），避免近重复内容占满 top-k。
+- 知识库为空 / 无命中时照常生成（`cited_content_ids` 为空数组），**不报错**——前端如实显示「本稿只基于你的定位档案」。
+- 检索从 `kb_content` 整篇召回 2–3 篇：overfetch 后按 `generation_group_id` 去重，优先当前 `platform`，接近时爆款优先。SQL 必须带 `user_id`。
 
 ### POST /ai/rewrite_sentence
 
@@ -157,6 +179,32 @@ Java `ScriptGenResult(blocked, hook, body, cta, citedCardIds)`，`hook/body/cta`
 
 首轮带 `materials` + `user_reply=null`；后续轮反之。LangGraph checkpoint 的 `thread_id` 由 Python 内部构造为 `f"{user_id}:{session_id}"`。
 
+`stage=summarize`（`done=true`）时 `profile_draft` 是 summarize 的原样产出，形状见下节。Java 把它当 `JsonNode` 整块透传给前端（`ProfileController.InterviewStepView.profileDraft`），**不重排、不裁剪**——前端据此渲染七字段草稿与 FAQ 候选勾选框。
+
+#### summarize 产出形状（D19/D20）
+
+```jsonc
+{
+  "profile": {
+    "persona": "string",          // 人设
+    "targetAudience": "string",   // 目标人群
+    "differentiation": "string",  // 差异化
+    "conversionPath": "string",   // 转化路径
+    "tone": "string",             // 口吻
+    "redlines": ["string"],       // 红线（清单，可空数组）
+    "contentPillars": ["string"]  // 内容支柱（清单，可空数组）
+  },
+  "faq_candidates": [             // 高频问答候选，最多 5 条；可空数组
+    { "question": "string", "answer": "string" }   // answer 可缺省
+  ]
+}
+```
+
+- **七个规范键是跨仓共享的键名**（与 sks-server `ProfileFields` / `docs/REST_CONTRACT.md` 同名同序）。历史上 summarize 产的是中文键（`人设`/`人群`/…）且带 `a_cards`，**那批 checkpoint 仍在库里**：读侧兼容映射在 Java `com.sks.profile.ProfileContent`（写档案时）与本仓 `app/skills/profile_fields.py`（进 prompt 时），**产出侧只写规范键**。
+- **形状是固定的：七字段与 `faq_candidates` 全部 `required`**。「可以为空」由**空数组**表达（`redlines: []`、`faq_candidates: []`），不是把键变成可省略——一份缺键的响应若也算合法，Java 侧只会安静地少存字段，事后分不清是「用户没有红线」还是「模型忘了输出」。
+- **`faq_candidates` 只回给用户勾选，AI 不写共享库**：prompt 要求「只提取用户真的说过的问题，不要按行业常识编造」。落库发生在用户确认之后——前端把勾中的几条放进 `POST /api/profile/confirm` 的 `faqs`，由 Java 与档案同事务写 `profile_faq`。
+- **`a_cards` 已从 schema 移除**（A/B/C 卡片概念退场，D1/D5/D19）：`confirm` 不再建 A 卡。
+
 ### GET /ai/interview/result
 
 Query 参数 `thread_id`（必填）。Java 侧须自行拼 `"userId:sessionId"`，与上面的构造规则对齐。
@@ -167,7 +215,9 @@ Query 参数 `thread_id`（必填）。Java 侧须自行拼 `"userId:sessionId"`
 // 无 checkpoint 时：{ "found": false }
 ```
 
-> **弱契约提醒**：Python 侧 `a_cards` 声明为 `list[dict[str, Any]]`，形状不受 pydantic 约束；Java 侧按 `CardGenCard {card_type, title, content}` 反序列化。两边靠约定而非类型对齐，改 `summarize` 产出形状时必须同步 Java。
+`profile` 是 summarize 产出**原样透传**（`fetch_result` 不做任何加工）：新 checkpoint 是上节的七字段，旧 checkpoint 是中文键 + `a_cards`。两种都可能被 `confirm` 读到，**规范化的责任在 Java 写档案时**（`ProfileContent.canonical`）——Python 这边有意不映射，免得两处规则各自演化。
+
+> `a_cards` 是 **DEPRECATED 的读侧残留**：新 schema 不再产它，仅旧 checkpoint 里有；Java `confirm` 已不读（D19 起不建 A 卡）。字段保留只为不破坏既有反序列化，兼容周期后随 `kb_card` 一起去掉。
 
 `found=false` 由 `ProfileService.confirm` 翻译为 `PARAM_INVALID`（4005）。
 
@@ -298,9 +348,38 @@ Query `url`（视频分享链）。
 
 ## 5. 共享表契约
 
-两张表由 **sks-server 的 Flyway 建**（`src/main/resources/db/migration/V1__core_schema.sql`）。sks-ai **不做迁移**——唯一例外是 LangGraph checkpointer 的私有表，由 `app/main.py::_init_checkpointer` 自行 `saver.setup()`。
+下面三张表全部由 **sks-server 的 Flyway 建**：`kb_card` 与 `analyze_task` 来自 `V1__core_schema.sql`，
+`kb_content` 来自 `V10__kb_content_library.sql`。sks-ai **不做迁移**——唯一例外是 LangGraph checkpointer
+的私有表，由 `app/main.py::_init_checkpointer` 自行 `saver.setup()`。
 
-### `kb_card` — sks-ai **只读**
+### `kb_content` — sks-ai **只读**（D18–D21 新增，取代 `kb_card` 的检索角色）
+
+由 sks-server 的 Flyway `V10__kb_content_library.sql` 建。**内容底仓**：一行 = 一篇内容（用户手建/粘贴的 Markdown，或点「采用当前平台版」后入库的平台生成稿）。
+
+```sql
+id                  BIGSERIAL PRIMARY KEY
+user_id             BIGINT NOT NULL REFERENCES app_user(id)
+title               VARCHAR(200) NOT NULL
+body                TEXT NOT NULL             -- Markdown 正文（不是 JSONB）
+source              VARCHAR(20) NOT NULL      -- manual/platform_generated（CHECK 钉死）
+platform            VARCHAR(20)               -- douyin/channels；手建未登记时 NULL（CHECK 钉死）
+generation_group_id BIGINT                    -- 同一轮生成的两个平台版本共享；手建为 NULL
+script_id           BIGINT                    -- 平台生成稿的来源稿；手建为 NULL
+embedding           vector(1024)              -- 整篇一个向量（不切片）；算失败留 NULL，暂不参与检索
+deleted             BOOLEAN NOT NULL DEFAULT false
+created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+updated_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+```
+
+- **检索粒度是整篇**：口播稿几百字，一篇一个向量足够；引用按「篇」展示，用户看得懂。不做段落切片。
+- **写全部在 sks-server**（保存 / 采用时调 `/ai/embed` 拿向量后自己落库）；sks-ai 只读，且**与 `kb_card` 同一条数据泄漏防线：SQL 必须带 `user_id = $1` 过滤，并且必须带 `deleted = false`**。
+- 检索去重：同一 `generation_group_id` 的两个平台版本最多命中一个，优先与当前目标 `platform` 一致者。
+- `embedding` 为 NULL 的行（回填的存量内容、算向量失败的内容）自然不会被向量检索命中——**不要**把 NULL 当错误处理。
+
+### `kb_card` — sks-ai **只读**（**DEPRECATED**，保留一个兼容周期）
+
+> A/B/C 三层卡片概念已退场（spec D1/D5）：新链路检索 `kb_content`。存量 B 卡**不迁移**（基本是测试数据）。
+> 兼容周期内本表与 `app/rag/retrieve.py` 的 B 层召回保持可用，不再新增能力。
 
 ```sql
 id          BIGSERIAL PRIMARY KEY

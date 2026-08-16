@@ -24,5 +24,6 @@ class InterviewState(TypedDict, total=False):
     current_safe: bool          # 本轮问题是否过审（生成节点写，应答节点读）
     feedback: str               # 用户对人设的确认/调整
     answers: list[str]          # ask 阶段累积的回答
-    profile: dict[str, Any]     # summarize 产出 {profile:{...}, a_cards:[...]}
+    profile: dict[str, Any]     # summarize 产出 {profile:{七字段}, faq_candidates:[...]}
+                                # （旧 checkpoint 是 {profile:{中文键}, a_cards:[...]}，只读兼容）
     blocked: bool               # LLM 产出命中安全（summarize 阶段）

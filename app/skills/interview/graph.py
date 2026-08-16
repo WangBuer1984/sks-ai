@@ -74,32 +74,61 @@ SUMMARIZE_SCHEMA: dict[str, Any] = {
     "title": "summarize_profile",
     "type": "object",
     "properties": {
+        # 七个规范键（D19，与 sks-server ProfileFields / REST_CONTRACT 同名同序）。
+        # 早期版本产的是中文键，那批 checkpoint 与档案仍在库里——读侧兼容在 Java
+        # （ProfileContent）与本仓 skills/profile_fields.py，**产出侧只用规范键**。
         "profile": {
             "type": "object",
             "properties": {
-                "人设": {"type": "string"},
-                "人群": {"type": "string"},
-                "差异化": {"type": "string"},
-                "变现": {"type": "string"},
-                "红线": {"type": "string"},
-                "支柱配比": {"type": "string"},
+                "persona": {"type": "string", "description": "人设：我是谁、以什么身份说话"},
+                "targetAudience": {"type": "string", "description": "目标人群"},
+                "differentiation": {"type": "string", "description": "差异化：与同行不同的那一点"},
+                "conversionPath": {
+                    "type": "string",
+                    "description": "转化路径：看完之后希望观众做什么",
+                },
+                "tone": {"type": "string", "description": "口吻：怎么说话（用词、语气、节奏）"},
+                "redlines": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "红线：不能说的话，一条一项",
+                },
+                "contentPillars": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "内容支柱：常写的几类内容，一类一项",
+                },
             },
-            "required": ["人设", "人群", "差异化", "变现", "红线", "支柱配比"],
+            # 七字段全部必填。红线 / 内容支柱确实可以为空（有人说不出红线），但那用**空数组**表达
+            # ——把键变成可省略是另一回事：一份缺 redlines 的响应仍然 schema-valid，
+            # Java 侧只会安静地少存一个字段，没人会知道是「用户没有红线」还是「模型忘了输出」。
+            "required": [
+                "persona",
+                "targetAudience",
+                "differentiation",
+                "conversionPath",
+                "tone",
+                "redlines",
+                "contentPillars",
+            ],
         },
-        "a_cards": {
+        # 高频问答候选（D20）：从访谈里**提取**观众常问的问题，只回给用户勾选，
+        # AI 不写共享库、也不自动生成选题。answer 可空——先记问题、答案后补是常态。
+        "faq_candidates": {
             "type": "array",
             "items": {
                 "type": "object",
                 "properties": {
-                    "card_type": {"type": "string", "description": "A 层卡片分类（定位/人设）"},
-                    "title": {"type": "string"},
-                    "content": {"type": "object", "additionalProperties": True},
+                    "question": {"type": "string", "description": "观众/客户常问的一个问题"},
+                    "answer": {"type": "string", "description": "访谈里已说清的答案；没说清就省略"},
                 },
-                "required": ["card_type", "title", "content"],
+                "required": ["question"],
             },
+            "description": "从访谈内容里提取的高频问答候选，最多 5 条；没有就给空数组",
         },
     },
-    "required": ["profile", "a_cards"],
+    # 候选也必给：一条都没提取到时给 []，与「模型没输出这个键」在下游是两回事，但下游区分不了。
+    "required": ["profile", "faq_candidates"],
 }
 
 
@@ -136,15 +165,19 @@ def _build_summarize_messages(
     persona: dict[str, Any], feedback: str, answers: list[str]
 ) -> list[dict[str, str]]:
     system = (
-        "你是一名口播视频定位归纳师。基于人设草稿、用户反馈与访谈回答，归纳最终定位档案 "
-        "（人设/人群/差异化/变现/红线/支柱配比）+ A 层卡草稿（定位/人设）。"
+        "你是一名口播视频定位归纳师。基于人设草稿、用户反馈与访谈回答，做两件事：\n"
+        "1) 归纳最终定位档案：人设、目标人群、差异化、转化路径、口吻、红线（清单）、内容支柱（清单）。"
+        "七个字段都要输出；清单类没有内容就给空数组，不要省略字段。\n"
+        "2) 提取高频问答候选：访谈里用户提到过的「观众/客户常问的问题」，最多 5 条。"
+        "只提取用户真的说过或明确暗示过的问题，不要按行业常识编造；"
+        "答案只在访谈里说清了才填，没说清就省略答案。没有可提取的就给空数组。\n"
         "不得包含违禁内容。"
     )
     ans_text = "\n".join(f"- {a}" for a in answers) if answers else "（无回答）"
     user = (
         f"人设草稿：{json.dumps(persona, ensure_ascii=False)}\n"
         f"用户反馈：{feedback or '（无）'}\n"
-        f"访谈回答：\n{ans_text}\n\n请归纳档案 + A 层卡草稿。"
+        f"访谈回答：\n{ans_text}\n\n请归纳定位档案（七字段），并提取高频问答候选。"
     )
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
@@ -192,7 +225,7 @@ async def _ask_answer(state: InterviewState) -> dict[str, Any]:
 
 
 async def _summarize(state: InterviewState) -> dict[str, Any]:
-    """归纳最终档案 + A 层卡草稿。不做阿里云过审。"""
+    """归纳最终定位档案（七字段）+ 提取高频问答候选。不做阿里云过审。"""
     messages = _build_summarize_messages(
         state.get("persona", {}), state.get("feedback", ""), state.get("answers", [])
     )

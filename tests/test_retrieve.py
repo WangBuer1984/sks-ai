@@ -321,3 +321,57 @@ async def test_k_limits_results(db_pool, monkeypatch):
 
     cards = await retrieve_b_cards(user_id=1, query="some query", k=3)
     assert len(cards) == 3
+
+
+# ---- kb_content 整篇召回 ---------------------------------------------------
+
+from app.rag.retrieve import ContentHit, _dedupe_group, retrieve_contents
+
+_CONTENT_SOURCE = inspect.getsource(retrieve_contents)
+
+
+def test_content_sql_contains_user_id_and_deleted():
+    assert "user_id = $1" in _CONTENT_SOURCE
+    assert "kb_content" in _CONTENT_SOURCE
+    assert "deleted = false" in _CONTENT_SOURCE
+
+
+def test_content_sql_uses_cosine_distance_le():
+    assert "<=>" in _CONTENT_SOURCE
+    assert "(c.embedding <=> $2) <= $3" in _CONTENT_SOURCE
+    assert "ORDER BY c.embedding <=> $2" in _CONTENT_SOURCE
+    assert "LIMIT $4" in _CONTENT_SOURCE
+
+
+def test_content_sql_mentions_generation_group():
+    assert "generation_group_id" in _CONTENT_SOURCE
+
+
+def _hit(**over) -> ContentHit:
+    base = dict(
+        id=1, title="t", body="b", source="manual", platform="douyin",
+        generation_group_id=None, hot=False,
+    )
+    base.update(over)
+    return ContentHit(**base)
+
+
+def test_dedupe_group_keeps_one_per_group_preferring_platform():
+    hits = [
+        _hit(id=1, generation_group_id=9, platform="douyin"),
+        _hit(id=2, generation_group_id=9, platform="channels"),
+        _hit(id=3, generation_group_id=None, platform="douyin"),
+    ]
+    out = _dedupe_group(hits, "channels", k=3)
+    ids = [h.id for h in out]
+    assert ids == [2, 3]
+    assert 1 not in ids
+
+
+def test_dedupe_group_prefers_hot_when_platform_tied():
+    hits = [
+        _hit(id=1, generation_group_id=9, platform="douyin", hot=False),
+        _hit(id=2, generation_group_id=9, platform="douyin", hot=True),
+    ]
+    out = _dedupe_group(hits, "douyin", k=3)
+    assert [h.id for h in out] == [2]
